@@ -384,8 +384,13 @@ class FAQAgent:
 
         policy_text = "\n\n".join(relevant_chunks)
 
+        # temperature=0: answering from retrieved policy text is a grounding task, not a
+        # creative one, and default sampling occasionally produced a false "we don't have
+        # that policy" refusal even when the right chunk was in context (e.g. hedging on
+        # "over $1000" vs. a policy's literal "over $999" threshold).
         response = openai.chat.completions.create(
             model="gpt-3.5-turbo",
+            temperature=0,
             messages=[
                 {"role": "system", "content": "You are a helpful shopping assistant. Answer the customer's question using only the store policies provided below. If none of the policies address the question, say so honestly rather than guessing."},
                 {"role": "user", "content": f"Store policies:\n{policy_text}\n\nCustomer question: {query.query}"},
