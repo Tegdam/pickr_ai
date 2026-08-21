@@ -9,3 +9,6 @@ streamlit
 langchain
 pytest
 chromadb
+ragas
+langchain_openai
+langchain-community==0.3.30  # ragas 0.4.3 hard-imports langchain_community.chat_models.vertexai, dropped in 0.4.x
