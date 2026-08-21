@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Local, machine-specific Claude Code settings
+.claude/settings.local.json
+
+# Virtual environment
+env/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated RAG index (rebuildable from data/store_policies.csv)
+data/chroma_db/

@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+openai
+pandas
+python-dotenv
+motor           # For MongoDB connection with FastAPI
+streamlit
+langchain
+pytest
+chromadb

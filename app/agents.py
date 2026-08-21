@@ -1,0 +1,387 @@
+# Import Required Libraries needed for AI processing and data retrieval
+
+import chromadb  # Persistent vector store used for the FAQ agent's retrieval step.
+import hashlib  # Used to detect when the policy index is stale and needs rebuilding.
+import openai  # This library allows us to use OpenAI's API for AI-generated responses.
+import os  # The os module helps us access environment variables securely.
+import re  # Used to pull price constraints (e.g. "under $800") out of free-text queries.
+
+# Import functions to load product details, customer reviews, and store policies from CSV files.
+from .db import load_products, load_reviews, load_store_policies
+
+# Import the UserQuery model, which defines the structure of a user query.
+from .models import UserQuery
+
+
+# Initialize OpenAI API Key (required to make requests to the language model)
+openai.api_key = os.getenv("OPENAI_API_KEY")  # Retrieve the API key from environment variables.
+
+
+# Define the CoordinatorAgent Class
+# This class is responsible for processing user queries and routing them to the appropriate specialized agent.
+# It acts as the central control unit for handling different types of customer inquiries.
+
+class CoordinatorAgent:
+    def __init__(self):
+        """
+        Initialize the CoordinatorAgent by loading product, review, and policy data.
+        Ensure that the 'load_products', 'load_reviews', and 'load_store_policies' functions
+        correctly read data from the respective CSV files.
+        """
+        self.products = load_products()  # Load product information
+        self.reviews = load_reviews()  # Load customer reviews
+        self.policies = load_store_policies()  # Load store policies
+
+    def handle_query(self, query: UserQuery):
+        """
+        Process the user query and determine the appropriate specialized agent.
+        The query parameter should be an instance of UserQuery.
+        The function should check the content of the query and route it accordingly.
+        """
+        if "review" in query.query.lower():
+            return ReviewSummarizationAgent().analyze_reviews(query)
+        elif "cheaper" in query.query.lower() or (
+            "price" in query.query.lower()
+            and any(w in query.query.lower() for w in ["compare", "difference", "cost"])
+        ):
+            return PriceComparisonAgent().compare_products(query)
+        elif "compare" in query.query.lower():
+            return ProductComparisonAgent().compare_products(query)
+        elif self._is_policy_query(query.query.lower()):
+            result = StorePolicyAgent().get_policy_info(query)
+            if result["response"] == StorePolicyAgent.NO_MATCH_MESSAGE:
+                return FAQAgent().get_policy_info(query)
+            return result
+        else:
+            return ProductRecommendationAgent().recommend_product(query)
+
+    def _is_policy_query(self, query_lower: str) -> bool:
+        """
+        True if the query is about "policy" or mentions a known policy_type keyword
+        (e.g. "refund"), even if the literal word "policy" never appears.
+        """
+        if "policy" in query_lower:
+            return True
+        return any(
+            p.policy_type and any(word in query_lower for word in p.policy_type.lower().split())
+            for p in self.policies
+        )
+
+
+# Implement Specialized Agents to handle specific types of queries.
+# Each agent is responsible for a particular function such as summarizing reviews, comparing products, or retrieving store policies.
+
+# Review Summarization Agent
+class ReviewSummarizationAgent:
+    def __init__(self):
+        self.products = load_products()
+        self.reviews = load_reviews()
+
+    def analyze_reviews(self, query: UserQuery):
+        """
+
+        This agent is responsible for analyzing and summarizing customer reviews for a given product using OpenAI's API.
+
+        """
+        # Find the product mentioned in the query
+        query_lower = query.query.lower()
+        matched_product = next(
+            (p for p in self.products if p.name and p.name.lower() in query_lower), None
+        )
+
+        if not matched_product:
+            return {"response": "I couldn't find a product matching your query. Please include a product name."}
+
+        # Retrieve reviews for that product
+        product_reviews = [r for r in self.reviews if r.product_id == matched_product.id]
+
+        if not product_reviews:
+            return {"response": f"No reviews found for {matched_product.name}."}
+
+        # Format reviews and ask OpenAI to summarize them
+        reviews_text = "\n".join([
+            f"- Rating: {r.rating}/5 | {r.text}"
+            for r in product_reviews
+        ])
+
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful shopping assistant. Summarize customer reviews concisely, highlighting common praise and complaints."},
+                {"role": "user", "content": f"Summarize these reviews for {matched_product.name}:\n{reviews_text}"},
+            ],
+        )
+
+        # Return the summary
+        return {"response": response.choices[0].message.content}
+
+
+# Implement the Product Recommendation Agent
+class ProductRecommendationAgent:
+    def __init__(self):
+        self.products = load_products()
+
+    def recommend_product(self, query: UserQuery):
+        """
+        Provide personalized product recommendations based on query.
+
+        Parses optional category/brand/price-ceiling constraints out of the query,
+        filters the in-stock catalog against them, and asks OpenAI to phrase a
+        recommendation from that shortlist (never from the full catalog, so it
+        can't recommend something outside the filtered results).
+        """
+        query_lower = query.query.lower()
+
+        category = self._match_category(query_lower)
+        brand = self._match_brand(query_lower)
+        max_price = self._match_price_ceiling(query_lower)
+
+        candidates = [p for p in self.products if p.stock and p.stock > 0]
+        if category:
+            candidates = [p for p in candidates if p.category and p.category.lower() == category]
+        if brand:
+            candidates = [p for p in candidates if p.brand and p.brand.lower() == brand]
+        if max_price is not None:
+            candidates = [p for p in candidates if p.price is not None and p.price <= max_price]
+
+        if not candidates:
+            return {"response": "I couldn't find any in-stock products matching your request. Try adjusting the category, brand, or price range."}
+
+        # Highest-rated matches first; cap the shortlist so the prompt stays small.
+        shortlist = sorted(candidates, key=lambda p: p.rating or 0, reverse=True)[:5]
+
+        product_details = "\n".join([
+            f"- {p.name} (Brand: {p.brand}, Category: {p.category}, Price: ${p.price}, Rating: {p.rating}/5): {p.description}"
+            for p in shortlist
+        ])
+
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful shopping assistant. Recommend products only from the provided shortlist, and briefly explain why each recommended product fits the customer's request."},
+                {"role": "user", "content": f"Customer request: {query.query}\n\nShortlist of matching products:\n{product_details}"},
+            ],
+        )
+        return {"response": response.choices[0].message.content}
+
+    def _match_category(self, query_lower: str):
+        """Return a catalog category (e.g. 'smart_tv') if it's referenced in the query."""
+        categories = {p.category.lower() for p in self.products if p.category}
+        return next(
+            (c for c in categories if c in query_lower or c.replace("_", " ") in query_lower),
+            None,
+        )
+
+    def _match_brand(self, query_lower: str):
+        """Return a catalog brand (e.g. 'techco') if it's referenced in the query."""
+        brands = {p.brand.lower() for p in self.products if p.brand}
+        return next((b for b in brands if b in query_lower), None)
+
+    def _match_price_ceiling(self, query_lower: str):
+        """Extract a price ceiling from phrasing like 'under $800' or 'less than 500'."""
+        match = re.search(r"(?:under|below|less than|cheaper than)\s*\$?\s*(\d+(?:\.\d+)?)", query_lower)
+        return float(match.group(1)) if match else None
+
+
+# Product Comparison Agent
+class ProductComparisonAgent:
+    def __init__(self):
+        self.products = load_products()
+
+    def compare_products(self, query: UserQuery):
+        """
+        This agent compares multiple products based on key attributes like price, features, and ratings.
+
+        """
+        # Find products whose names appear in the query
+        query_lower = query.query.lower()
+        matched = [p for p in self.products if p.name and p.name.lower() in query_lower]
+
+        if len(matched) < 2:
+            return {"response": "Please mention at least two product names to compare."}
+
+        # Build a summary of each product's key attributes
+        product_details = "\n".join([
+            f"- {p.name} (Brand: {p.brand}, Price: ${p.price}, Rating: {p.rating}/5): {p.description}"
+            for p in matched
+        ])
+
+        # Ask OpenAI to produce a clear, structured comparison
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful shopping assistant. Compare products clearly and concisely."},
+                {"role": "user", "content": f"Compare these products:\n{product_details}"},
+            ],
+        )
+        return {"response": response.choices[0].message.content}
+
+
+# Price Comparison Agent
+class PriceComparisonAgent:
+    def __init__(self):
+        self.products = load_products()
+
+    def compare_products(self, query: UserQuery):
+        """
+        Compare products and return price differences.
+
+        Deterministic (no LLM call): matches named products against the query,
+        then reports their prices, which is cheapest, and the $ / % difference.
+        """
+        query_lower = query.query.lower()
+        matched = [
+            p for p in self.products
+            if p.name and p.name.lower() in query_lower and p.price is not None
+        ]
+
+        if len(matched) < 2:
+            return {"response": "Please mention at least two product names (with known prices) to compare."}
+
+        matched.sort(key=lambda p: p.price)
+        cheapest, priciest = matched[0], matched[-1]
+
+        lines = [f"- {p.name}: ${p.price:.2f}" for p in matched]
+
+        if len(matched) == 2:
+            diff = priciest.price - cheapest.price
+            pct = (diff / priciest.price * 100) if priciest.price else 0
+            lines.append(
+                f"{cheapest.name} is cheaper than {priciest.name} by ${diff:.2f} ({pct:.1f}% less)."
+            )
+        else:
+            spread = priciest.price - cheapest.price
+            lines.append(
+                f"Cheapest: {cheapest.name} (${cheapest.price:.2f}) | "
+                f"Most expensive: {priciest.name} (${priciest.price:.2f}) | "
+                f"Spread: ${spread:.2f}"
+            )
+
+        return {"response": "\n".join(lines)}
+
+
+# Store Policy Agent
+class StorePolicyAgent:
+    NO_MATCH_MESSAGE = "I couldn't find a matching policy. Try asking about return, refund, shipping, or warranty policies."
+
+    def __init__(self):
+        self.policies = load_store_policies()
+
+    def get_policy_info(self, query: UserQuery):
+        """
+        This agent fetches store policies based on customer queries (e.g., refund, return, shipping policies).
+
+        """
+        # Find policies whose type keyword appears in the query
+        query_lower = query.query.lower()
+        matched = [
+            p for p in self.policies
+            if p.policy_type and any(word in query_lower for word in p.policy_type.lower().split())
+        ]
+
+        # Format and return the matching policy details
+        if not matched:
+            return {"response": self.NO_MATCH_MESSAGE}
+
+        policy_text = "\n\n".join([
+            f"{p.policy_type}\n{p.description}\nConditions: {p.conditions}\nTimeframe: {p.timeframe}"
+            for p in matched
+        ])
+        return {"response": policy_text}
+
+
+# Retrieval index over store policies, backed by Chroma. Embeds each policy once
+# (persisted to disk so restarts don't re-pay the embedding cost) and retrieves the
+# most relevant chunks for a query, instead of stuffing every policy into the prompt.
+class PolicyIndex:
+    EMBEDDING_MODEL = "text-embedding-3-small"
+    CHUNK_TEMPLATE = "{policy_type}\n{description}\nConditions: {conditions}\nTimeframe: {timeframe}"
+
+    def __init__(self, policies, persist_path="data/chroma_db", collection_name="store_policies"):
+        self.policies = policies
+        self._client = chromadb.PersistentClient(path=persist_path)
+        self._collection_name = collection_name
+        self.collection = self._client.get_or_create_collection(collection_name)
+
+        # A count check alone misses in-place edits (same number of rows, changed
+        # content), so compare a content hash instead: any added, removed, or
+        # edited row changes the hash and triggers a full rebuild.
+        current_hash = self._content_hash()
+        stored_hash = (self.collection.metadata or {}).get("content_hash")
+        if stored_hash != current_hash:
+            self._rebuild_index(current_hash)
+
+    def _chunk_text(self, policy):
+        return self.CHUNK_TEMPLATE.format(
+            policy_type=policy.policy_type,
+            description=policy.description,
+            conditions=policy.conditions,
+            timeframe=policy.timeframe,
+        )
+
+    def _content_hash(self):
+        chunk_texts = sorted(self._chunk_text(p) for p in self.policies)
+        return hashlib.sha256("\n".join(chunk_texts).encode()).hexdigest()
+
+    def _embed(self, texts):
+        response = openai.embeddings.create(model=self.EMBEDDING_MODEL, input=texts)
+        return [item.embedding for item in response.data]
+
+    def _rebuild_index(self, content_hash):
+        # Delete-and-recreate rather than a partial upsert: a partial upsert keyed
+        # by list index would leave orphaned entries behind if the policy count
+        # ever shrinks, on top of not handling in-place edits at all.
+        self._client.delete_collection(self._collection_name)
+        self.collection = self._client.get_or_create_collection(self._collection_name)
+
+        chunks = [self._chunk_text(p) for p in self.policies]
+        if chunks:
+            ids = [f"policy-{i}" for i in range(len(chunks))]
+            self.collection.upsert(ids=ids, embeddings=self._embed(chunks), documents=chunks)
+
+        self.collection.modify(metadata={"content_hash": content_hash})
+
+    def search(self, query_text: str, k: int = 3):
+        """Return the top-k policy chunks most relevant to the query text."""
+        if self.collection.count() == 0:
+            return []
+        query_embedding = self._embed([query_text])[0]
+        results = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=min(k, self.collection.count()),
+        )
+        return results["documents"][0]
+
+
+# Implement the FAQ & Store Policy Handling Agent
+class FAQAgent:
+    NO_MATCH_MESSAGE = "I couldn't find anything in our store policies relevant to that question."
+
+    def __init__(self):
+        self.policies = load_store_policies()
+        self.index = PolicyIndex(self.policies)
+
+    def get_policy_info(self, query: UserQuery):
+        """
+        Fetch and return relevant store policy information via retrieval-augmented generation.
+
+        Fallback for when StorePolicyAgent's keyword match finds nothing: retrieves the
+        most relevant policy chunks with PolicyIndex and lets OpenAI answer from just those,
+        instead of requiring an exact policy_type word in the query or stuffing every policy
+        into the prompt.
+        """
+        relevant_chunks = self.index.search(query.query, k=3)
+
+        if not relevant_chunks:
+            return {"response": self.NO_MATCH_MESSAGE}
+
+        policy_text = "\n\n".join(relevant_chunks)
+
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful shopping assistant. Answer the customer's question using only the store policies provided below. If none of the policies address the question, say so honestly rather than guessing."},
+                {"role": "user", "content": f"Store policies:\n{policy_text}\n\nCustomer question: {query.query}"},
+            ],
+        )
+        return {"response": response.choices[0].message.content}
