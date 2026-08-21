@@ -33,7 +33,7 @@ def load_reviews():
 # Load Store Policies from CSV
 def load_store_policies():
     """Loads store policy data from CSV and returns a list of StorePolicy objects."""
-    df = pd.read_csv('data/store_policies.csv')
+    df = pd.read_csv('data/store_policies.csv', dtype={'timeframe': str})
     policies = []
 
     # Convert DataFrame rows into a list of StorePolicy objects
