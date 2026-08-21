@@ -264,6 +264,13 @@ class PriceComparisonAgent:
 class StorePolicyAgent:
     NO_MATCH_MESSAGE = "I couldn't find a matching policy. Try asking about return, refund, shipping, or warranty policies."
 
+    # Customers often mention "warranty" only to say it's lapsed (e.g. "no longer
+    # under warranty", "out of warranty") while actually asking about something
+    # else, like repairs. Without stripping that phrasing first, the keyword match
+    # below would treat it as a warranty question and never fall through to
+    # FAQAgent's semantic search, which is what should handle these.
+    EXPIRED_WARRANTY_PATTERN = re.compile(r"(no longer|out of|outside of|expired|past).{0,15}warranty")
+
     def __init__(self):
         self.policies = load_store_policies()
 
@@ -273,7 +280,7 @@ class StorePolicyAgent:
 
         """
         # Find policies whose type keyword appears in the query
-        query_lower = query.query.lower()
+        query_lower = self.EXPIRED_WARRANTY_PATTERN.sub("", query.query.lower())
         matched = [
             p for p in self.policies
             if p.policy_type and any(word in query_lower for word in p.policy_type.lower().split())

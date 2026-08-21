@@ -256,6 +256,20 @@ class TestStorePolicyAndFAQ:
         result = agent.get_policy_info(UserQuery(query="do you sell gift cards"))
         assert result["response"] == agents.StorePolicyAgent.NO_MATCH_MESSAGE
 
+    def test_expired_warranty_phrasing_does_not_match_warranty_keyword(self, patched_data):
+        """
+        "no longer under warranty" should not be treated as a warranty question --
+        the customer is asking about something else (e.g. repairs) and only
+        mentions warranty to say it's lapsed. Regression test for a bug where this
+        phrasing spuriously matched "warranty" and returned the wrong policy
+        instead of falling through to FAQAgent's semantic search.
+        """
+        agent = agents.StorePolicyAgent()
+        result = agent.get_policy_info(
+            UserQuery(query="my laptop is no longer under warranty, can you fix it?")
+        )
+        assert result["response"] == agents.StorePolicyAgent.NO_MATCH_MESSAGE
+
     def test_faq_agent_retrieves_relevant_chunks_only(
         self, patched_data, mock_embeddings, in_memory_chroma, mock_openai
     ):
@@ -322,6 +336,20 @@ class TestCoordinatorRouting:
     ):
         coordinator = agents.CoordinatorAgent()
         result = coordinator.handle_query(UserQuery(query="what is your policy on gift cards"))
+
+        mock_openai.assert_called_once()
+        assert result == {"response": "mocked LLM response"}
+
+    def test_expired_warranty_query_falls_back_to_faq(
+        self, patched_data, mock_embeddings, in_memory_chroma, mock_openai
+    ):
+        """Regression test: a repair question phrased around a lapsed warranty
+        must not get answered with warranty policy text -- it should fall
+        through to FAQAgent's semantic search instead."""
+        coordinator = agents.CoordinatorAgent()
+        result = coordinator.handle_query(
+            UserQuery(query="my laptop is no longer under warranty, can you fix it?")
+        )
 
         mock_openai.assert_called_once()
         assert result == {"response": "mocked LLM response"}
