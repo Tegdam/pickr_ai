@@ -1,0 +1,38 @@
+[
+  {
+    "user_input": "What is your policy for sending back a laptop I'm not happy with?",
+    "reference": "You can return a laptop within 14 days. It must be unopened or like-new, include all original accessories and documentation, and have intact original packaging, and you'll need to request a return label through your online account."
+  },
+  {
+    "user_input": "What's your policy on covering manufacturing defects on a new smartphone?",
+    "reference": "The standard smartphone warranty covers manufacturing defects and software issues for 365 days from purchase, based on proof of purchase from your online account. It excludes water damage."
+  },
+  {
+    "user_input": "What is your policy on getting free delivery on an order?",
+    "reference": "Orders of at least $50 (before taxes) qualify for free standard shipping to contiguous U.S. addresses. Orders under $50 pay standard shipping rates, and large TVs over 50 inches are excluded from free shipping."
+  },
+  {
+    "user_input": "What is your policy on matching a lower price from Best Buy?",
+    "reference": "Online price matching is available for major retailers including Amazon, Best Buy, Walmart, and Target. The competitor's current online price must be shown, the product must be in stock, and it can't be combined with coupon codes."
+  },
+  {
+    "user_input": "What is your policy if I want to exchange my phone for a different model?",
+    "reference": "You can exchange a smartphone for a different model within 30 days of delivery. The phone must be undamaged and factory reset, and you'll pay the price difference if you're upgrading to a pricier model."
+  },
+  {
+    "user_input": "What is your policy for fixing a device that's no longer under warranty?",
+    "reference": "A standard out-of-warranty repair carries a $49 diagnostic fee. You'll need to approve the repair before it's done, unlock or remove the passcode from the device, and mail it in to an authorized repair center."
+  },
+  {
+    "user_input": "What is your policy on payment plans for a purchase over $1000?",
+    "reference": "Purchases over $999 qualify for 24-month financing with equal monthly payments. Auto-pay enrollment is recommended, and there's no early payoff penalty."
+  },
+  {
+    "user_input": "What is your policy on getting a new product on its release day if I pre-order it?",
+    "reference": "Guaranteed launch day delivery requires full payment at the time of pre-order, an address within the contiguous U.S., ordering at least 7 days before release, and no address changes allowed after the order is confirmed."
+  },
+  {
+    "user_input": "What is your returns policy for speakers?",
+    "reference": "Speakers can be returned within 15 days. They must show no physical damage and be in original packaging or near-new condition, and you'll need to request a return label through your online account."
+  }
+]
