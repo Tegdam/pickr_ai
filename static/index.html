@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartShop AI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #F7F5EF;
+    --ink: #1F2421;
+    --ink-muted: #6B6F64;
+    --accent: #D6304A;
+    --line: #D8D2C4;
+    --hole: #F7F5EF;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Space Grotesk", sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 4rem 1.25rem;
+  }
+
+  main {
+    width: 100%;
+    max-width: 32rem;
+    animation: rise 0.4s ease-out;
+  }
+
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .wordmark {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-size: 1.9rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0 0 0.5rem;
+  }
+
+  .wordmark svg { flex: none; }
+
+  .tagline {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.85rem;
+    color: var(--ink-muted);
+    line-height: 1.5;
+    margin: 0 0 2.5rem;
+  }
+
+  form.tag {
+    position: relative;
+    background: var(--paper);
+    border: 1.5px solid var(--ink);
+    border-radius: 4px;
+    padding: 1.25rem 1.5rem 1.5rem 2.75rem;
+  }
+
+  .tag::before {
+    content: "";
+    position: absolute;
+    top: 1.35rem;
+    left: 1.25rem;
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: var(--hole);
+    border: 1.5px solid var(--ink);
+  }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    color: var(--ink-muted);
+    display: block;
+    margin-bottom: 0.6rem;
+  }
+
+  .tag-row {
+    display: flex;
+    gap: 0.6rem;
+  }
+
+  input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.95rem;
+    color: var(--ink);
+    background: transparent;
+    border: none;
+    border-bottom: 1.5px solid var(--line);
+    padding: 0.4rem 0.1rem;
+  }
+
+  input[type="text"]:focus {
+    outline: none;
+    border-bottom-color: var(--accent);
+  }
+
+  input[type="text"]::placeholder {
+    color: var(--ink-muted);
+    opacity: 0.7;
+  }
+
+  button {
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--paper);
+    background: var(--ink);
+    border: none;
+    padding: 0.5rem 1.1rem;
+    cursor: pointer;
+    transition: background 0.15s ease, transform 0.1s ease;
+  }
+
+  button:hover:not(:disabled) { background: var(--accent); }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .receipt {
+    margin-top: 1.75rem;
+    padding: 1.25rem 0;
+    border-top: 2px dashed var(--line);
+    border-bottom: 2px dashed var(--line);
+    display: none;
+  }
+
+  .receipt.visible { display: block; }
+
+  .receipt .eyebrow { color: var(--accent); }
+
+  .receipt-body {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.9rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    margin: 0;
+  }
+
+  .receipt-body.error { color: var(--accent); }
+
+  .printing {
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 1; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    main { animation: none; }
+    .printing { animation: none; }
+  }
+
+  @media (max-width: 30rem) {
+    body { padding: 2.5rem 1rem; }
+    .wordmark { font-size: 1.6rem; }
+    .tag-row { flex-direction: column; align-items: stretch; }
+    button { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1 class="wordmark">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M20.59 13.41 13.41 20.59a2 2 0 0 1-2.82 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82Z" fill="#D6304A"/>
+      <circle cx="7" cy="7" r="1.6" fill="#F7F5EF"/>
+    </svg>
+    SmartShop AI
+  </h1>
+  <p class="tagline">ask about products, reviews, or store policy — get a straight answer.</p>
+
+  <form class="tag" id="query-form">
+    <span class="eyebrow">QUERY</span>
+    <div class="tag-row">
+      <input
+        type="text"
+        id="query-input"
+        placeholder="e.g. is the Alpha Laptop worth it?"
+        aria-label="Ask SmartShop AI a question"
+        autocomplete="off"
+        required
+      >
+      <button type="submit" id="ask-button">Ask</button>
+    </div>
+  </form>
+
+  <section class="receipt" id="receipt" aria-live="polite">
+    <span class="eyebrow">RESPONSE</span>
+    <p class="receipt-body" id="receipt-body"></p>
+  </section>
+</main>
+
+<script>
+  const form = document.getElementById("query-form");
+  const input = document.getElementById("query-input");
+  const button = document.getElementById("ask-button");
+  const receipt = document.getElementById("receipt");
+  const receiptBody = document.getElementById("receipt-body");
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  let typewriterTimer = null;
+
+  function showPrinting() {
+    receipt.classList.add("visible");
+    receiptBody.classList.remove("error");
+    receiptBody.textContent = "printing…";
+    receiptBody.classList.add("printing");
+  }
+
+  function typeOut(text) {
+    receiptBody.classList.remove("printing");
+    clearInterval(typewriterTimer);
+
+    if (reducedMotion) {
+      receiptBody.textContent = text;
+      return;
+    }
+
+    receiptBody.textContent = "";
+    let i = 0;
+    typewriterTimer = setInterval(() => {
+      receiptBody.textContent += text[i];
+      i += 1;
+      if (i >= text.length) clearInterval(typewriterTimer);
+    }, 12);
+  }
+
+  function showError(message) {
+    receipt.classList.add("visible");
+    receiptBody.classList.remove("printing");
+    receiptBody.classList.add("error");
+    receiptBody.textContent = message;
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const query = input.value.trim();
+    if (!query) return;
+
+    button.disabled = true;
+    showPrinting();
+
+    try {
+      const res = await fetch("/api/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(detail && detail.detail ? detail.detail : `Request failed (${res.status})`);
+      }
+
+      const data = await res.json();
+      typeOut(data.response ?? "No response returned.");
+    } catch (err) {
+      showError(`Couldn't print a response — ${err.message}. Try asking again.`);
+    } finally {
+      button.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
