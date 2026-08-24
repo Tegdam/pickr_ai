@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Virtual environment
+env/
+venv/
+
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated RAG index (rebuilt on first run inside the container)
+data/chroma_db/
+
+# Local tooling
+.claude/
