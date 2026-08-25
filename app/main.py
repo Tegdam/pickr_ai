@@ -7,6 +7,6 @@ from fastapi.staticfiles import StaticFiles
 
 from .api import router
 
-app = FastAPI(title="SmartShop AI")
+app = FastAPI(title="Pickr AI")
 app.include_router(router, prefix="/api")
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
