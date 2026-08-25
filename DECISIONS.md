@@ -140,3 +140,72 @@ within one process — so two tests naively creating "fresh" in-memory clients
 still shared the same `"store_policies"` collection and leaked data between
 tests. Fixed by explicitly `delete_collection`-ing before each test that uses
 the `in_memory_chroma` fixture.
+
+## API layer: api.py / main.py
+
+**Decision:** `api.py`'s `handle_query` takes `app.models.UserQuery` directly
+instead of a separate `QueryInput` model — same shape, no reason to keep two.
+
+**Bug fixed:** every agent method already returns `{"response": ...}`, but
+`handle_query` re-wrapped that result in another `{"response": ...}`, so
+callers received a doubly-nested payload. Fixed by returning the agent's
+result directly.
+
+**Decision:** `main.py` (previously empty) is the actual FastAPI entrypoint —
+it includes the `api.py` router under `/api`, then mounts `static/` at `/`
+via `StaticFiles(html=True)` last, so the mount acts as a catch-all for the
+frontend without shadowing `/api/*` (routes registered first win). Dropped
+the old `GET /` JSON welcome route from `api.py` since the static frontend
+now serves the homepage.
+
+**Decision:** `load_dotenv()` runs in `main.py` before `.api`/`.agents` are
+imported, since `agents.py` reads `OPENAI_API_KEY` at import time. Mirrors
+the pattern already used in `evals/eval_agents.py`.
+
+## Frontend: static/index.html
+
+**Decision:** Price-tag / receipt-printer visual concept (query card styled
+as a physical price tag with a punch hole; answers "print" onto a torn-edge
+receipt strip with a typewriter reveal) instead of a generic chat-bubble UI —
+grounded in the retail domain the assistant actually serves. Plain HTML/CSS/JS,
+no framework or build step, since the page is a single static file served
+as-is.
+
+**Decision:** Typewriter reveal is skipped under `prefers-reduced-motion`;
+focus states are visible; the response region uses `aria-live="polite"`.
+
+**Fixed during implementation:** the wordmark's icon initially used a
+house-icon SVG path pasted by mistake instead of a price tag; corrected to
+an actual tag-shaped path with a punched-hole circle. The query card's corner
+also originally used a `clip-path` polygon to cut a notch, but the border
+didn't render along the cut diagonal edge and the punch-hole element
+overlapped it oddly — replaced with a plain punch-hole circle on the card's
+left edge, which renders correctly in every browser without clip-path
+artifacts. Caught by loading the page in a real browser rather than just
+reading the CSS.
+
+## API testing: tests/test_api.py
+
+**Decision:** Tests use `fastapi.testclient.TestClient` against the real
+`app`, mocking `app.api.agent.handle_query` directly rather than the
+OpenAI/CSV layer underneath it — agent logic is already covered by
+`test_agents.py`, so these tests stay focused on the HTTP wrapper: request
+validation (422 on a missing `query` field), the success response shape, and
+the try/except → 500 path.
+
+## Docker / deployment
+
+**Decision:** `python:3.11-slim` base image running `uvicorn` on port 7860,
+matching Hugging Face Spaces' Docker SDK default port.
+
+**Decision:** Added `.dockerignore` (missing from the initial Dockerfile) to
+keep `.env` and the `env/` virtualenv out of the build context — without it,
+`COPY . .` would have baked `OPENAI_API_KEY` directly into an image layer.
+The key is expected to be injected at runtime instead (e.g. a Space secret),
+which `os.getenv` already picks up with no code changes. Also excludes
+`data/chroma_db/` (the RAG index), rebuilt fresh on first run in the
+container.
+
+Verified with a local `docker build` + `docker run`: `.env` and `env/` are
+absent from the built image, and `/` and `/api/query` both respond
+correctly with the key passed in as a runtime environment variable.
