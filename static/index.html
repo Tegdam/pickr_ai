@@ -223,6 +223,10 @@
   const receipt = document.getElementById("receipt");
   const receiptBody = document.getElementById("receipt-body");
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // One id per page load, sent with every query so the backend can load/persist
+  // this conversation's history. Not persisted across reloads -- a fresh visit
+  // starts a fresh conversation.
+  const conversationId = crypto.randomUUID();
 
   let typewriterTimer = null;
 
@@ -270,7 +274,7 @@
       const res = await fetch("/api/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, conversation_id: conversationId }),
       });
 
       if (!res.ok) {

@@ -10,6 +10,9 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from .api import router
+from .conversation import init_db
+
+init_db()
 
 app = FastAPI(title="Pickr AI")
 app.include_router(router, prefix="/api")

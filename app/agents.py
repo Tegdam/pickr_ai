@@ -62,6 +62,13 @@ class CoordinatorAgent:
             ):
                 agent_name = "PriceComparisonAgent"
                 result = PriceComparisonAgent().compare_products(query)
+                if result["response"] == PriceComparisonAgent.NOT_ENOUGH_PRODUCTS_MESSAGE:
+                    # "cheaper"/"price" alone doesn't always mean "compare these two
+                    # named products" -- e.g. "recommend something cheaper" has no
+                    # second product to compare against. Fall back to recommendations
+                    # rather than surfacing a dead-end "mention two products" reply.
+                    agent_name = "ProductRecommendationAgent"
+                    result = ProductRecommendationAgent().recommend_product(query)
             elif "compare" in query_lower:
                 agent_name = "ProductComparisonAgent"
                 result = ProductComparisonAgent().compare_products(query)
@@ -261,6 +268,8 @@ class ProductComparisonAgent:
 
 # Price Comparison Agent
 class PriceComparisonAgent:
+    NOT_ENOUGH_PRODUCTS_MESSAGE = "Please mention at least two product names (with known prices) to compare."
+
     def __init__(self):
         self.products = load_products()
 
@@ -278,7 +287,7 @@ class PriceComparisonAgent:
         ]
 
         if len(matched) < 2:
-            return {"response": "Please mention at least two product names (with known prices) to compare."}
+            return {"response": self.NOT_ENOUGH_PRODUCTS_MESSAGE}
 
         matched.sort(key=lambda p: p.price)
         cheapest, priciest = matched[0], matched[-1]

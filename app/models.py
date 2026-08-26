@@ -8,6 +8,13 @@ from typing import Optional  # For optional model attributes
 class UserQuery(BaseModel):
     query: str  # Define a string field for storing user queries
 
+
+# Define the ChatQuery Model (the /api/query request body: a query plus which
+# conversation it belongs to, so app/conversation.py can load/persist history)
+class ChatQuery(BaseModel):
+    query: str
+    conversation_id: str
+
 # Define the Product Model
 class Product(BaseModel):
     id: Optional[str]  # Unique product identifier

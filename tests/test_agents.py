@@ -413,6 +413,7 @@ def routing_spies(monkeypatch):
     """Replace every specialized agent class with a spy that records whether
     it was constructed/called, decoupled from that agent's real behavior."""
     real_no_match_message = agents.StorePolicyAgent.NO_MATCH_MESSAGE
+    real_not_enough_products_message = agents.PriceComparisonAgent.NOT_ENOUGH_PRODUCTS_MESSAGE
 
     spies = {}
     for key, (class_name, method_name) in ROUTES.items():
@@ -421,6 +422,8 @@ def routing_spies(monkeypatch):
         spy_cls = MagicMock(return_value=instance)
         if class_name == "StorePolicyAgent":
             spy_cls.NO_MATCH_MESSAGE = real_no_match_message
+        if class_name == "PriceComparisonAgent":
+            spy_cls.NOT_ENOUGH_PRODUCTS_MESSAGE = real_not_enough_products_message
         monkeypatch.setattr(agents, class_name, spy_cls)
         spies[key] = spy_cls
     return spies
@@ -467,6 +470,34 @@ class TestCoordinatorRoutingAccuracy:
         coordinator = agents.CoordinatorAgent()
         coordinator.handle_query(UserQuery(query="reviews on your return policy"))
         assert_routed_to(routing_spies, "review")
+
+    def test_price_comparison_not_enough_products_falls_through_to_recommend(self, patched_data, routing_spies):
+        """
+        Regression coverage: query condensation for chat history (app/conversation.py)
+        can rewrite a follow-up like "what about something cheaper" into a standalone
+        question that still contains "cheaper" but names zero or one product -- that
+        should fall back to a recommendation, not dead-end on PriceComparisonAgent's
+        "mention two products" message.
+        """
+        routing_spies["price"].return_value.compare_products.return_value = {
+            "response": routing_spies["price"].NOT_ENOUGH_PRODUCTS_MESSAGE
+        }
+        coordinator = agents.CoordinatorAgent()
+        result = coordinator.handle_query(UserQuery(query="what about something cheaper"))
+
+        routing_spies["price"].assert_called_once()
+        routing_spies["recommend"].assert_called_once()
+        assert result == {"response": "ProductRecommendationAgent handled it"}
+
+    def test_price_comparison_match_does_not_fall_through_to_recommend(self, patched_data, routing_spies):
+        coordinator = agents.CoordinatorAgent()
+        result = coordinator.handle_query(
+            UserQuery(query="which is cheaper, Alpha Laptop or Beta Laptop")
+        )
+
+        routing_spies["price"].assert_called_once()
+        routing_spies["recommend"].assert_not_called()
+        assert result == {"response": "PriceComparisonAgent handled it"}
 
     def test_policy_no_match_falls_through_to_faq(self, patched_data, routing_spies):
         routing_spies["policy"].return_value.get_policy_info.return_value = {

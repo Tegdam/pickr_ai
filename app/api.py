@@ -1,13 +1,12 @@
 from fastapi import APIRouter, HTTPException
-from .agents import CoordinatorAgent
-from .models import UserQuery
+from . import conversation
+from .models import ChatQuery
 
 router = APIRouter()
-agent = CoordinatorAgent()
 
 @router.post("/query")
-async def handle_query(input: UserQuery):
+async def handle_query(input: ChatQuery):
     try:
-        return agent.handle_query(input)
+        return conversation.handle_conversational_query(input.conversation_id, input.query)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

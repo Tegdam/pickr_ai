@@ -70,6 +70,34 @@ narrative (which already mentions price but doesn't compute deltas). Routes on
 `"cheaper"`, or `"price"` paired with `"compare"/"difference"/"cost"`, checked
 *before* the plain `"compare"` branch so it isn't shadowed.
 
+**Decision (added with chat history):** if `PriceComparisonAgent` can't find
+two named products (`NOT_ENOUGH_PRODUCTS_MESSAGE`), `CoordinatorAgent` falls
+through to `ProductRecommendationAgent` instead of surfacing the "mention two
+products" dead end — same fallback shape as `StorePolicyAgent` → `FAQAgent`
+below. Found via live testing of query condensation (see "Chat history"
+section): a follow-up like "what about something cheaper" condenses into a
+standalone question that still contains "cheaper" but names zero or one
+product, since there's nothing to compare *against* — it's a relative
+recommendation request, not a two-product comparison, even though it hits
+the same keyword. This was a pre-existing routing-heuristic edge case
+(the same failure happens today for "recommend something cheaper than the
+X" typed as a first message, no history involved) that chat history just
+made far more likely to surface, since condensed follow-ups naturally reuse
+comparison words.
+
+**Known limitation (accepted for now):** the fallback fixes the dead end,
+but not full correctness — the condensed query above doesn't carry over an
+explicit price number (the condensation model wrote "costs less", not
+"under $399"), and `ProductRecommendationAgent._match_price_ceiling` only
+extracts constraints from literal "under $X"/"less than $X" phrasing. It
+can't reason "cheaper than the specific price I mentioned last turn," so it
+falls back to top-rated-in-stock with no price filter, which can resurface
+the *same* product rather than a genuinely cheaper one. Fixing this would
+need either the condensation prompt to resolve relative price references
+into explicit numbers, or `ProductRecommendationAgent` to accept a numeric
+anchor from context — deferred as a follow-up, not in scope of chat history
+itself.
+
 ## StorePolicyAgent / FAQAgent split
 
 **Decision:** `StorePolicyAgent` keeps its original exact-keyword match
@@ -239,6 +267,113 @@ otherwise be a circular import. Existing tests that do
 `monkeypatch.setattr(agents.client, "chat", ...)` kept working unchanged,
 since they patch attributes on the shared client object itself, not the
 module-level name binding.
+
+## Chat history: app/conversation.py
+
+**Decision:** Persisted to RDS MySQL (already provisioned) rather than
+either client-carried history (no server storage, simplest, considered
+first) or a from-scratch session store. Using existing infrastructure beat
+building throwaway session-scoped plumbing that a later persona feature
+would likely need to redo anyway with real persistence.
+
+**Decision:** `CoordinatorAgent` and all six specialized agents in
+`agents.py` stay completely unaware history exists. `app/conversation.py`
+owns everything conversation-related — loading/persisting turns and
+condensing follow-ups — behind one orchestration function,
+`handle_conversational_query(conversation_id, raw_query)`, which:
+load history → condense the raw query against it (no-op if there's no
+history yet) → route the resolved, self-contained query through
+`CoordinatorAgent.handle_query` unchanged → persist the exchange → return.
+This kept the blast radius of the whole feature to one new module plus a
+one-line change each in `api.py`/`main.py`.
+
+**Decision:** Follow-ups are resolved via query condensation — one LLM call
+that rewrites e.g. "what about something cheaper" into a standalone
+"what's a cheaper alternative to the Alpha Laptop" using the last
+`HISTORY_WINDOW` (6) turns — rather than passing raw history into each of
+the four LLM-calling agents' own prompts. Condensing once, before routing,
+means routing and all six agents work identically whether or not history is
+involved, and it's the only approach that also fixes reference resolution
+for the *deterministic* agents (`PriceComparisonAgent`,
+`StorePolicyAgent`'s keyword path), which don't call an LLM at all and
+would otherwise have no way to resolve "it" or an omitted product name.
+Skipped entirely when there's no history yet (a conversation's first
+message), so no added latency/cost on that turn.
+
+**Decision:** `check_input` (guardrails) still runs on the *raw* incoming
+message, before condensation — deliberately, so prompt-injection detection
+always sees literal user input rather than a version an LLM has already
+rewritten.
+
+**Decision:** `ChatQuery` (`app/models.py`) is a distinct model from
+`UserQuery`, not a `conversation_id` field bolted onto `UserQuery` — despite
+an earlier decision (see API layer section below) to avoid keeping two
+models of the *same* shape. These aren't the same shape: `ChatQuery` is the
+API request boundary and needs `conversation_id`; `UserQuery` is what
+`CoordinatorAgent`/the six agents consume internally and has no reason to
+know about conversations at all. `conversation.py` constructs a fresh
+`UserQuery(query=resolved_query)` after condensation, so nothing downstream
+of the orchestration function ever sees a `conversation_id`.
+
+**Decision:** Schema is one table, `chat_turns` (`id`, `conversation_id`,
+`role`, `content`, `created_at`), created via
+`Base.metadata.create_all()` at app startup rather than a migration
+framework (Alembic) — no reason to version a single table at this scale,
+consistent with how `PolicyIndex` just rebuilds its Chroma collection rather
+than migrating it. `id` is a plain auto-incrementing `Integer`, not
+`BigInteger` as first drafted — `BigInteger` primary keys don't get
+SQLite's autoincrement-rowid special-casing, which broke the in-memory
+SQLite tests; `Integer`/`auto_increment` is standard for this scale on
+MySQL too, so this wasn't a real tradeoff.
+
+**Decision:** `load_history` orders by `id` (insertion order), not
+`created_at`. A user/assistant pair saved in the same `save_exchange` call
+can land in the same second, and MySQL's default `DATETIME` resolution is
+1-second — ordering by `created_at` alone risked ties putting the assistant
+turn before the user turn it was replying to.
+
+**Decision:** `save_exchange` writes both the user message and the final
+(post-guardrail) assistant response in one commit, rather than two separate
+`save_turn` calls — atomic (both rows land or neither does), and one fewer
+round trip per turn on top of the ones chat history already adds.
+
+**Decision:** Fails open on any DB error (unreachable host, bad
+credentials, table not yet created) in both `load_history` (returns `[]`)
+and `save_exchange` (silently drops the write) — same philosophy as
+guardrails' infra-error handling. Losing chat history isn't a safety issue,
+so a DB hiccup degrades a turn to "no history" rather than failing
+`/api/query` entirely. `init_db()` (called once at startup) follows the
+same rule: a failed `create_all()` is logged and swallowed so the app still
+starts even if RDS isn't reachable yet.
+
+**Decision:** Connection config is five env vars (`DB_HOST`, `DB_PORT`,
+`DB_NAME`, `DB_USER`, `DB_PASSWORD`), assembled into a
+`mysql+pymysql://...` URL — not committed anywhere, including this file, to
+avoid repeating the earlier incident where a real key ended up printed into
+a session transcript.
+
+**Decision:** `conversationId` is a `crypto.randomUUID()` generated once per
+page load in `static/index.html` and sent with every request — not
+persisted (e.g. via `localStorage`), so a page reload starts a fresh
+conversation. Acceptable for a within-conversation feature; persistent
+identity across reloads/devices is exactly the kind of thing the deferred
+persona feature would need to solve properly (see the parked proposal in
+the ReviewSummarizationAgent section above for the same "defer until
+actually needed" reasoning).
+
+*(See the PriceComparisonAgent section above for a routing-heuristic bug
+this feature's live testing surfaced and fixed, plus a related known
+limitation left unfixed.)*
+
+**Decision (testing):** `load_history`/`save_exchange` are tested against a
+real in-memory SQLite engine (`tests/test_conversation.py`'s `sqlite_db`
+fixture swaps `conversation.SessionLocal`), not mocks — SQLAlchemy makes the
+dialect swap trivial, and this exercises real SQL (schema, filtering,
+ordering) rather than asserting on a mock's call args. `condense_query` and
+the `handle_conversational_query` orchestration *are* mocked at their own
+boundaries (LLM client; `load_history`/`condense_query`/`coordinator`/
+`save_exchange` respectively), same layered approach as the guardrails
+tests. No test needs real RDS credentials to run.
 
 ## Testing
 
