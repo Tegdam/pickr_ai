@@ -108,6 +108,39 @@ which asserts the embedding call count directly: 1 call on first build, still
 1 after reconstructing with identical content, 2 after reconstructing with an
 edited (but same-count) policy list.
 
+## Observability: structured logging + LangSmith tracing
+
+**Decision:** `CoordinatorAgent.handle_query` logs one line per query
+(`agent`, `status`, `elapsed_ms`, `query`) via stdlib `logging`, in `logfmt`
+style — key=value pairs baked directly into the message string — rather than
+passing fields through `extra=`. `extra=` would need a custom root formatter
+to render those fields, and that formatter would then apply to every other
+logger in the process (uvicorn, httpx, etc.) whose records don't carry them.
+Baking the fields into the message sidesteps that while staying greppable.
+
+**Decision:** The log call sits in one `try/finally` wrapped around the whole
+routing dispatch, with `agent_name`/`status` tracked as locals updated per
+branch, rather than a duplicated log call in each branch. One line always
+fires — including on exceptions, where `status` stays `"error"` — without
+swallowing the exception itself (it still propagates to `api.py`'s existing
+try/except → 500 handler).
+
+**Decision:** Switched `app/agents.py` off the bare `openai` module singleton
+(`openai.chat.completions.create(...)`) onto an explicit
+`client = wrap_openai(OpenAI(api_key=...))` instance, because LangSmith's
+`wrap_openai` patches a client instance, not the module-level proxy. Every
+chat/embeddings call in the app is now automatically traced to LangSmith once
+tracing env vars are set (`LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`,
+`LANGSMITH_PROJECT`) — with them unset, `wrap_openai` is a no-op passthrough,
+so shipping this required no LangSmith account.
+
+**Decision:** Falls back to a placeholder key
+(`os.getenv("OPENAI_API_KEY") or "not-set"`) rather than passing `None`
+through — `OpenAI()` raises immediately at construction if no key is
+resolvable anywhere, which would break test collection (tests monkeypatch
+`client.chat`/`client.embeddings` before any real call and never need a real
+key to run).
+
 ## Testing
 
 **Decision:** Isolated in-memory fixtures (`monkeypatch`-ed
@@ -117,11 +150,11 @@ regardless of what's in the CSVs, and can use round numbers for easy
 assertions.
 
 **Decision:** `pytest` with `unittest.mock.MagicMock`, mocking
-`openai.chat`/`openai.embeddings` at the module level rather than reaching
-into the real client objects — `openai.chat`/`openai.embeddings` are lazy
-proxies that would otherwise attempt to build a real client (and need
-`OPENAI_API_KEY`) the moment an attribute like `.completions` is accessed on
-them.
+`client.chat`/`client.embeddings` (the module-level `wrap_openai(OpenAI(...))`
+instance in `agents.py`) rather than issuing real requests — no test needs a
+real `OPENAI_API_KEY`, since the module falls back to a placeholder key at
+construction time (see Observability section above) and every real call site
+is swapped out before it runs.
 
 **Decision:** `conftest.py` (empty, at repo root) and `pytest.ini` (with
 `testpaths = tests`) were added because this project has no packaging/`src`

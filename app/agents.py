@@ -2,9 +2,13 @@
 
 import chromadb  # Persistent vector store used for the FAQ agent's retrieval step.
 import hashlib  # Used to detect when the policy index is stale and needs rebuilding.
-import openai  # This library allows us to use OpenAI's API for AI-generated responses.
+import logging  # Structured logging of CoordinatorAgent's routing decisions.
 import os  # The os module helps us access environment variables securely.
 import re  # Used to pull price constraints (e.g. "under $800") out of free-text queries.
+import time  # Used to time how long each routed agent takes to handle a query.
+
+from openai import OpenAI
+from langsmith.wrappers import wrap_openai
 
 # Import functions to load product details, customer reviews, and store policies from CSV files.
 from .db import load_products, load_reviews, load_store_policies
@@ -13,8 +17,18 @@ from .db import load_products, load_reviews, load_store_policies
 from .models import UserQuery
 
 
-# Initialize OpenAI API Key (required to make requests to the language model)
-openai.api_key = os.getenv("OPENAI_API_KEY")  # Retrieve the API key from environment variables.
+logger = logging.getLogger(__name__)
+
+# wrap_openai traces every call this client makes to LangSmith once tracing is
+# enabled (LANGSMITH_TRACING=true, plus LANGSMITH_API_KEY/LANGSMITH_PROJECT).
+# With those env vars unset it's a no-op passthrough, so wrapping unconditionally
+# is safe -- no LangSmith account needed for the app to work.
+#
+# Fall back to a placeholder key rather than erroring at import time: OpenAI()
+# raises immediately if no key is available anywhere, which would break test
+# collection (tests monkeypatch client.chat/client.embeddings and never make a
+# real call, so no real key is needed for them to run).
+client = wrap_openai(OpenAI(api_key=os.getenv("OPENAI_API_KEY") or "not-set"))
 
 
 # Define the CoordinatorAgent Class
@@ -38,22 +52,42 @@ class CoordinatorAgent:
         The query parameter should be an instance of UserQuery.
         The function should check the content of the query and route it accordingly.
         """
-        if "review" in query.query.lower():
-            return ReviewSummarizationAgent().analyze_reviews(query)
-        elif "cheaper" in query.query.lower() or (
-            "price" in query.query.lower()
-            and any(w in query.query.lower() for w in ["compare", "difference", "cost"])
-        ):
-            return PriceComparisonAgent().compare_products(query)
-        elif "compare" in query.query.lower():
-            return ProductComparisonAgent().compare_products(query)
-        elif self._is_policy_query(query.query.lower()):
-            result = StorePolicyAgent().get_policy_info(query)
-            if result["response"] == StorePolicyAgent.NO_MATCH_MESSAGE:
-                return FAQAgent().get_policy_info(query)
+        query_lower = query.query.lower()
+        start = time.monotonic()
+        agent_name = "unknown"
+        status = "error"
+        try:
+            if "review" in query_lower:
+                agent_name = "ReviewSummarizationAgent"
+                result = ReviewSummarizationAgent().analyze_reviews(query)
+            elif "cheaper" in query_lower or (
+                "price" in query_lower
+                and any(w in query_lower for w in ["compare", "difference", "cost"])
+            ):
+                agent_name = "PriceComparisonAgent"
+                result = PriceComparisonAgent().compare_products(query)
+            elif "compare" in query_lower:
+                agent_name = "ProductComparisonAgent"
+                result = ProductComparisonAgent().compare_products(query)
+            elif self._is_policy_query(query_lower):
+                agent_name = "StorePolicyAgent"
+                result = StorePolicyAgent().get_policy_info(query)
+                if result["response"] == StorePolicyAgent.NO_MATCH_MESSAGE:
+                    agent_name = "FAQAgent"
+                    result = FAQAgent().get_policy_info(query)
+            else:
+                agent_name = "ProductRecommendationAgent"
+                result = ProductRecommendationAgent().recommend_product(query)
+            status = "ok"
             return result
-        else:
-            return ProductRecommendationAgent().recommend_product(query)
+        finally:
+            # logfmt-style (key=value) rather than a JSON formatter: keeps this
+            # readable in plain console output while still being greppable/parseable,
+            # without coupling the root logging config to this logger's fields.
+            logger.info(
+                "coordinator_route agent=%s status=%s elapsed_ms=%.1f query=%r",
+                agent_name, status, (time.monotonic() - start) * 1000, query.query,
+            )
 
     def _is_policy_query(self, query_lower: str) -> bool:
         """
@@ -104,7 +138,7 @@ class ReviewSummarizationAgent:
             for r in product_reviews
         ])
 
-        response = openai.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are a helpful shopping assistant. Summarize customer reviews concisely, highlighting common praise and complaints."},
@@ -155,7 +189,7 @@ class ProductRecommendationAgent:
             for p in shortlist
         ])
 
-        response = openai.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are a helpful shopping assistant. Recommend products only from the provided shortlist, and briefly explain why each recommended product fits the customer's request."},
@@ -207,7 +241,7 @@ class ProductComparisonAgent:
         ])
 
         # Ask OpenAI to produce a clear, structured comparison
-        response = openai.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "You are a helpful shopping assistant. Compare products clearly and concisely."},
@@ -331,7 +365,7 @@ class PolicyIndex:
         return hashlib.sha256("\n".join(chunk_texts).encode()).hexdigest()
 
     def _embed(self, texts):
-        response = openai.embeddings.create(model=self.EMBEDDING_MODEL, input=texts)
+        response = client.embeddings.create(model=self.EMBEDDING_MODEL, input=texts)
         return [item.embedding for item in response.data]
 
     def _rebuild_index(self, content_hash):
@@ -388,7 +422,7 @@ class FAQAgent:
         # creative one, and default sampling occasionally produced a false "we don't have
         # that policy" refusal even when the right chunk was in context (e.g. hedging on
         # "over $1000" vs. a policy's literal "over $999" threshold).
-        response = openai.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             temperature=0,
             messages=[

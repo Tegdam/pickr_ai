@@ -65,27 +65,27 @@ def patched_data(monkeypatch):
 
 @pytest.fixture
 def mock_openai(monkeypatch):
-    """Replace the module-level openai.chat proxy so no real API call is made."""
+    """Replace the module-level client.chat proxy so no real API call is made."""
     fake_message = MagicMock(content="mocked LLM response")
     fake_choice = MagicMock(message=fake_message)
     fake_response = MagicMock(choices=[fake_choice])
     mock_create = MagicMock(return_value=fake_response)
     fake_chat = MagicMock()
     fake_chat.completions.create = mock_create
-    monkeypatch.setattr(agents.openai, "chat", fake_chat)
+    monkeypatch.setattr(agents.client, "chat", fake_chat)
     return mock_create
 
 
 @pytest.fixture
 def mock_embeddings(monkeypatch):
-    """Replace the module-level openai.embeddings proxy with a deterministic stub."""
+    """Replace the module-level client.embeddings proxy with a deterministic stub."""
     def fake_create(model, input):
         data = [MagicMock(embedding=fake_embed_one(text)) for text in input]
         return MagicMock(data=data)
 
     fake_embeddings_obj = MagicMock()
     fake_embeddings_obj.create = MagicMock(side_effect=fake_create)
-    monkeypatch.setattr(agents.openai, "embeddings", fake_embeddings_obj)
+    monkeypatch.setattr(agents.client, "embeddings", fake_embeddings_obj)
     return fake_embeddings_obj.create
 
 
