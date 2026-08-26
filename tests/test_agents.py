@@ -362,3 +362,153 @@ class TestCoordinatorRouting:
         sent = sent_messages(mock_openai)
         assert "Alpha Laptop" in sent
         assert result == {"response": "mocked LLM response"}
+
+
+# ---------------------------------------------------------------------------
+# CoordinatorAgent routing accuracy
+#
+# The tests above verify routing indirectly, by checking whether an LLM call
+# happened and what the final response contains. That conflates two things:
+# whether the coordinator picked the right agent, and whether that agent
+# behaved correctly. These tests isolate the first question: every
+# specialized agent is replaced with a spy, so each case asserts exactly
+# which agent handled the query -- no LLM calls, no data lookups, no
+# ambiguity from a downstream agent's own logic.
+# ---------------------------------------------------------------------------
+
+ROUTES = {
+    "review": ("ReviewSummarizationAgent", "analyze_reviews"),
+    "price": ("PriceComparisonAgent", "compare_products"),
+    "compare": ("ProductComparisonAgent", "compare_products"),
+    "policy": ("StorePolicyAgent", "get_policy_info"),
+    "faq": ("FAQAgent", "get_policy_info"),
+    "recommend": ("ProductRecommendationAgent", "recommend_product"),
+}
+
+
+@pytest.fixture
+def routing_spies(monkeypatch):
+    """Replace every specialized agent class with a spy that records whether
+    it was constructed/called, decoupled from that agent's real behavior."""
+    real_no_match_message = agents.StorePolicyAgent.NO_MATCH_MESSAGE
+
+    spies = {}
+    for key, (class_name, method_name) in ROUTES.items():
+        instance = MagicMock()
+        getattr(instance, method_name).return_value = {"response": f"{class_name} handled it"}
+        spy_cls = MagicMock(return_value=instance)
+        if class_name == "StorePolicyAgent":
+            spy_cls.NO_MATCH_MESSAGE = real_no_match_message
+        monkeypatch.setattr(agents, class_name, spy_cls)
+        spies[key] = spy_cls
+    return spies
+
+
+def assert_routed_to(spies, expected_key):
+    """Exactly the expected agent was constructed; every other agent was untouched."""
+    for key, spy_cls in spies.items():
+        if key == expected_key:
+            spy_cls.assert_called_once()
+        else:
+            spy_cls.assert_not_called()
+
+
+class TestCoordinatorRoutingAccuracy:
+    @pytest.mark.parametrize("query, expected_route", [
+        ("reviews for Alpha Laptop", "review"),
+        ("what do people think of Beta Laptop", "recommend"),  # no "review" keyword -> default
+        ("which is cheaper, Alpha Laptop or Beta Laptop", "price"),
+        ("what's the price difference between Alpha Laptop and Beta Laptop", "price"),
+        ("what's the price of Alpha Laptop", "recommend"),  # "price" alone, no compare/diff/cost
+        ("compare Alpha Laptop and Beta Laptop", "compare"),
+        ("what is your return policy", "policy"),
+        ("what is your warranty duration", "policy"),  # policy_type keyword without the word "policy"
+        ("my laptop is broken, is it still under warranty?", "policy"),
+        ("I need a laptop under $600", "recommend"),
+        ("recommend a smart tv", "recommend"),
+    ])
+    def test_routes_to_expected_agent(self, patched_data, routing_spies, query, expected_route):
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(UserQuery(query=query))
+        assert_routed_to(routing_spies, expected_route)
+
+    def test_cheaper_takes_precedence_over_generic_compare(self, patched_data, routing_spies):
+        """Both "cheaper" and "compare" appear; the price-comparison branch is
+        checked first in CoordinatorAgent.handle_query, so it should win."""
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(
+            UserQuery(query="compare these laptops and tell me which is cheaper")
+        )
+        assert_routed_to(routing_spies, "price")
+
+    def test_review_takes_precedence_over_policy(self, patched_data, routing_spies):
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(UserQuery(query="reviews on your return policy"))
+        assert_routed_to(routing_spies, "review")
+
+    def test_policy_no_match_falls_through_to_faq(self, patched_data, routing_spies):
+        routing_spies["policy"].return_value.get_policy_info.return_value = {
+            "response": routing_spies["policy"].NO_MATCH_MESSAGE
+        }
+        coordinator = agents.CoordinatorAgent()
+        result = coordinator.handle_query(UserQuery(query="what is your policy on gift cards"))
+
+        routing_spies["policy"].assert_called_once()
+        routing_spies["faq"].assert_called_once()
+        assert result == {"response": "FAQAgent handled it"}
+
+    def test_policy_match_does_not_fall_through_to_faq(self, patched_data, routing_spies):
+        coordinator = agents.CoordinatorAgent()
+        result = coordinator.handle_query(UserQuery(query="what is your return policy"))
+
+        routing_spies["policy"].assert_called_once()
+        routing_spies["faq"].assert_not_called()
+        assert result == {"response": "StorePolicyAgent handled it"}
+
+    def test_expired_warranty_phrasing_routes_through_policy_to_faq(self, patched_data, routing_spies):
+        """Regression coverage at the routing level: an expired-warranty query
+        still enters the policy branch (it's about warranty), but StorePolicyAgent
+        itself should report no match so the coordinator falls through to FAQAgent."""
+        routing_spies["policy"].return_value.get_policy_info.return_value = {
+            "response": routing_spies["policy"].NO_MATCH_MESSAGE
+        }
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(
+            UserQuery(query="my laptop is no longer under warranty, can you fix it?")
+        )
+        routing_spies["policy"].assert_called_once()
+        routing_spies["faq"].assert_called_once()
+
+    def test_routing_accuracy_across_labeled_dataset(self, patched_data, routing_spies):
+        """
+        A small labeled (query -> expected agent) dataset scored as a batch,
+        mirroring how routing accuracy would be reported for a real eval: run
+        every case, then assert on the aggregate accuracy rather than
+        stopping at the first mismatch, so a regression's full blast radius
+        is visible in one run.
+        """
+        labeled_queries = [
+            ("reviews for Alpha Laptop", "review"),
+            ("which is cheaper, Alpha Laptop or Beta Laptop", "price"),
+            ("compare Alpha Laptop and Beta Laptop", "compare"),
+            ("what is your return policy", "policy"),
+            ("I need a laptop under $600", "recommend"),
+        ]
+
+        correct = 0
+        misrouted = []
+        for query, expected_route in labeled_queries:
+            for spy_cls in routing_spies.values():
+                spy_cls.reset_mock()
+
+            coordinator = agents.CoordinatorAgent()
+            coordinator.handle_query(UserQuery(query=query))
+
+            actual_routes = [key for key, spy_cls in routing_spies.items() if spy_cls.called]
+            if actual_routes == [expected_route]:
+                correct += 1
+            else:
+                misrouted.append((query, expected_route, actual_routes))
+
+        accuracy = correct / len(labeled_queries)
+        assert accuracy == 1.0, f"routing accuracy {accuracy:.0%}, misrouted: {misrouted}"
