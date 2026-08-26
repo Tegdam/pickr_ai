@@ -141,6 +141,78 @@ resolvable anywhere, which would break test collection (tests monkeypatch
 `client.chat`/`client.embeddings` before any real call and never need a real
 key to run).
 
+*(Update: `client` construction itself was later moved out to
+`app/openai_client.py` — see the Guardrails section below for why.)*
+
+## Guardrails: input/output checks
+
+**Decision:** `app/guardrails.py` runs two checks: `check_input`
+(prompt-injection detection, off-topic detection, and OpenAI's Moderation
+API) on the raw query before `CoordinatorAgent.handle_query` routes it to
+any agent, and `check_output` (a hallucination/faithfulness classifier plus
+Moderation) inside each of the four LLM-generating agents
+(`ReviewSummarizationAgent`, `ProductRecommendationAgent`,
+`ProductComparisonAgent`, `FAQAgent`), checked against whatever context that
+agent already built for its own prompt (review text, product shortlist,
+matched products, or retrieved policy chunks respectively).
+`StorePolicyAgent`'s keyword-hit path and `PriceComparisonAgent` are
+untouched — both are fully deterministic with no LLM call, so there's
+nothing to hallucinate.
+
+**Decision:** Injection + off-topic detection is one combined LLM classifier
+call (JSON response, `{"is_injection": bool, "is_off_topic": bool}`) rather
+than two separate calls or regex heuristics. Regex was rejected as too easy
+to bypass for injection (trivially defeated by rephrasing) and too
+unreliable for open-ended topicality in a shopping domain; combining the two
+into one call avoids paying for two round-trips where one already covers
+both questions.
+
+**Decision:** Moderation (`client.moderations.create`) runs as its own
+separate call on both input and output, in addition to the classifiers,
+rather than folding "is this toxic" into the same classifier prompt as a
+third JSON field. The dedicated Moderation endpoint uses a purpose-built,
+specifically-trained model; asking a general chat model to self-judge harm
+categories in the same breath as injection/off-topic/hallucination was
+rejected as measurably less reliable, even though it would have cut the call
+count from 5 to 3 per query.
+
+**Known cost, accepted deliberately:** an LLM-routed query now makes up to 5
+OpenAI calls where it made 1 before — input classifier, input moderation,
+the agent's real generation call, output classifier, output moderation.
+(`FAQAgent` adds a 6th: its pre-existing retrieval embedding call.)
+Correctness/coverage was prioritized over latency/cost for this pass. The
+two moderation calls are much cheaper than the two classifier calls (no
+token generation, a small dedicated model) — the real cost driver is the
+classifier pair, not the raw call count.
+
+**Decision:** Fail-open on infrastructure errors, fail-closed on detected
+violations — these are different failure modes. If a classifier or
+moderation call itself throws (timeout, malformed JSON, API outage),
+`check_input`/`check_output` log a warning and return `blocked: False`, so a
+guardrail-service hiccup doesn't take down `/api/query` entirely. If a check
+runs successfully and flags something, the response is always replaced — no
+bypass on a successful detection.
+
+**Decision:** Block messages deliberately don't reveal *why* for injection
+or input-moderation hits — both use the same generic `"I'm not able to help
+with that request."` — to avoid coaching an attacker toward a bypass by
+telling them which detector tripped. Off-topic queries get a distinct, more
+helpful message (`"I can only help with questions about our products,
+reviews, and store policies..."`) since that's a benign steering case, not
+adversarial. The *specific* reason (`injection` / `off_topic` /
+`moderation_input` / `hallucination` / `moderation_output`) is still
+recorded in the `coordinator_route` structured log line either way, so
+there's no loss of operational visibility.
+
+**Decision:** `app/openai_client.py` was split out of `app/agents.py` (which
+previously constructed `client` directly — see the Observability section
+above) specifically to support this: `guardrails.py` needs the same
+`client`, and `agents.py` needs to call into `guardrails.py`, which would
+otherwise be a circular import. Existing tests that do
+`monkeypatch.setattr(agents.client, "chat", ...)` kept working unchanged,
+since they patch attributes on the shared client object itself, not the
+module-level name binding.
+
 ## Testing
 
 **Decision:** Isolated in-memory fixtures (`monkeypatch`-ed
@@ -155,6 +227,19 @@ instance in `agents.py`) rather than issuing real requests — no test needs a
 real `OPENAI_API_KEY`, since the module falls back to a placeholder key at
 construction time (see Observability section above) and every real call site
 is swapped out before it runs.
+
+**Decision:** An autouse `bypass_guardrails` fixture in `test_agents.py`
+patches `agents.check_input`/`agents.check_output` to always pass through,
+for every test in that file by default. Without it, adding guardrails would
+have broken every pre-existing test that asserts an exact LLM call count
+(`mock_openai.assert_called_once()` etc.), since `check_input`/`check_output`
+add their own calls to the same mocked client — and those tests aren't about
+guardrails anyway. Guardrails' own logic is tested in isolation in
+`test_guardrails.py`; the wiring (that `CoordinatorAgent` actually calls
+`check_input` and honors a block, that each LLM agent actually calls
+`check_output` with its own context) is tested explicitly in
+`TestCoordinatorGuardrails`/`TestAgentOutputGuardrails`, which override the
+autouse bypass per-test via a second `monkeypatch.setattr` call.
 
 **Decision:** `conftest.py` (empty, at repo root) and `pytest.ini` (with
 `testpaths = tests`) were added because this project has no packaging/`src`

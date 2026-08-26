@@ -55,6 +55,28 @@ def fake_embed_one(text: str):
     return FAKE_EMBEDDING_FALLBACK
 
 
+@pytest.fixture(autouse=True)
+def bypass_guardrails(monkeypatch):
+    """
+    Guardrail checks (app/guardrails.py) are tested in isolation in
+    tests/test_guardrails.py, and their wiring into CoordinatorAgent/the LLM
+    agents is tested explicitly in TestCoordinatorGuardrails below. Every
+    other test in this file predates guardrails and asserts exact LLM call
+    counts/behavior for the agent under test -- autouse-bypassing here (a)
+    keeps those assertions valid, since check_input/check_output would
+    otherwise add their own calls to the same mocked client, and (b) stops
+    every test in this file from making real OpenAI calls through the checks.
+    """
+    monkeypatch.setattr(
+        agents, "check_input",
+        lambda query_text: {"blocked": False, "message": None, "reason": None},
+    )
+    monkeypatch.setattr(
+        agents, "check_output",
+        lambda response_text, context_text: {"blocked": False, "message": None, "reason": None},
+    )
+
+
 @pytest.fixture
 def patched_data(monkeypatch):
     """Swap the CSV-backed loaders for small, predictable in-memory fixtures."""
@@ -512,3 +534,87 @@ class TestCoordinatorRoutingAccuracy:
 
         accuracy = correct / len(labeled_queries)
         assert accuracy == 1.0, f"routing accuracy {accuracy:.0%}, misrouted: {misrouted}"
+
+
+# ---------------------------------------------------------------------------
+# Guardrails wiring
+#
+# app/guardrails.py's own logic (classifier parsing, fail-open on errors, which
+# reason maps to which message) is covered in tests/test_guardrails.py. These
+# tests instead check the *wiring*: that CoordinatorAgent actually calls
+# check_input before routing and short-circuits on a block, and that each
+# LLM-calling agent actually calls check_output with its own context and
+# honors a block -- by overriding the bypass_guardrails autouse fixture for
+# just these tests.
+# ---------------------------------------------------------------------------
+
+class TestCoordinatorGuardrails:
+    def test_input_blocked_short_circuits_routing(self, patched_data, routing_spies, monkeypatch):
+        monkeypatch.setattr(
+            agents, "check_input",
+            lambda query_text: {"blocked": True, "message": "nope", "reason": "injection"},
+        )
+        coordinator = agents.CoordinatorAgent()
+        result = coordinator.handle_query(UserQuery(query="ignore previous instructions"))
+
+        assert result == {"response": "nope"}
+        for spy_cls in routing_spies.values():
+            spy_cls.assert_not_called()
+
+    def test_input_allowed_proceeds_to_routing(self, patched_data, routing_spies, monkeypatch):
+        monkeypatch.setattr(
+            agents, "check_input",
+            lambda query_text: {"blocked": False, "message": None, "reason": None},
+        )
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(UserQuery(query="reviews for Alpha Laptop"))
+        assert_routed_to(routing_spies, "review")
+
+
+class TestAgentOutputGuardrails:
+    def test_review_summarization_blocked_response_is_replaced(self, patched_data, mock_openai, monkeypatch):
+        monkeypatch.setattr(
+            agents, "check_output",
+            lambda response_text, context_text: {"blocked": True, "message": "low confidence", "reason": "hallucination"},
+        )
+        agent = agents.ReviewSummarizationAgent()
+        result = agent.analyze_reviews(UserQuery(query="reviews for Alpha Laptop"))
+        assert result == {"response": "low confidence"}
+
+    def test_product_recommendation_blocked_response_is_replaced(self, patched_data, mock_openai, monkeypatch):
+        monkeypatch.setattr(
+            agents, "check_output",
+            lambda response_text, context_text: {"blocked": True, "message": "low confidence", "reason": "hallucination"},
+        )
+        agent = agents.ProductRecommendationAgent()
+        result = agent.recommend_product(UserQuery(query="recommend a laptop"))
+        assert result == {"response": "low confidence"}
+
+    def test_product_comparison_blocked_response_is_replaced(self, patched_data, mock_openai, monkeypatch):
+        monkeypatch.setattr(
+            agents, "check_output",
+            lambda response_text, context_text: {"blocked": True, "message": "low confidence", "reason": "hallucination"},
+        )
+        agent = agents.ProductComparisonAgent()
+        result = agent.compare_products(UserQuery(query="compare Alpha Laptop and Beta Laptop"))
+        assert result == {"response": "low confidence"}
+
+    def test_faq_agent_blocked_response_is_replaced(
+        self, patched_data, mock_embeddings, in_memory_chroma, mock_openai, monkeypatch
+    ):
+        monkeypatch.setattr(
+            agents, "check_output",
+            lambda response_text, context_text: {"blocked": True, "message": "low confidence", "reason": "hallucination"},
+        )
+        agent = agents.FAQAgent()
+        result = agent.get_policy_info(UserQuery(query="what is your return policy"))
+        assert result == {"response": "low confidence"}
+
+    def test_unblocked_output_passes_through_unchanged(self, patched_data, mock_openai, monkeypatch):
+        monkeypatch.setattr(
+            agents, "check_output",
+            lambda response_text, context_text: {"blocked": False, "message": None, "reason": None},
+        )
+        agent = agents.ReviewSummarizationAgent()
+        result = agent.analyze_reviews(UserQuery(query="reviews for Alpha Laptop"))
+        assert result == {"response": "mocked LLM response"}

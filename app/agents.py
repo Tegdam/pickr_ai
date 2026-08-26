@@ -3,12 +3,11 @@
 import chromadb  # Persistent vector store used for the FAQ agent's retrieval step.
 import hashlib  # Used to detect when the policy index is stale and needs rebuilding.
 import logging  # Structured logging of CoordinatorAgent's routing decisions.
-import os  # The os module helps us access environment variables securely.
 import re  # Used to pull price constraints (e.g. "under $800") out of free-text queries.
 import time  # Used to time how long each routed agent takes to handle a query.
 
-from openai import OpenAI
-from langsmith.wrappers import wrap_openai
+from .openai_client import client
+from .guardrails import check_input, check_output
 
 # Import functions to load product details, customer reviews, and store policies from CSV files.
 from .db import load_products, load_reviews, load_store_policies
@@ -18,17 +17,6 @@ from .models import UserQuery
 
 
 logger = logging.getLogger(__name__)
-
-# wrap_openai traces every call this client makes to LangSmith once tracing is
-# enabled (LANGSMITH_TRACING=true, plus LANGSMITH_API_KEY/LANGSMITH_PROJECT).
-# With those env vars unset it's a no-op passthrough, so wrapping unconditionally
-# is safe -- no LangSmith account needed for the app to work.
-#
-# Fall back to a placeholder key rather than erroring at import time: OpenAI()
-# raises immediately if no key is available anywhere, which would break test
-# collection (tests monkeypatch client.chat/client.embeddings and never make a
-# real call, so no real key is needed for them to run).
-client = wrap_openai(OpenAI(api_key=os.getenv("OPENAI_API_KEY") or "not-set"))
 
 
 # Define the CoordinatorAgent Class
@@ -56,7 +44,15 @@ class CoordinatorAgent:
         start = time.monotonic()
         agent_name = "unknown"
         status = "error"
+        block_reason = None
         try:
+            input_check = check_input(query.query)
+            if input_check["blocked"]:
+                agent_name = "guardrails_input"
+                status = "blocked"
+                block_reason = input_check["reason"]
+                return {"response": input_check["message"]}
+
             if "review" in query_lower:
                 agent_name = "ReviewSummarizationAgent"
                 result = ReviewSummarizationAgent().analyze_reviews(query)
@@ -85,8 +81,8 @@ class CoordinatorAgent:
             # readable in plain console output while still being greppable/parseable,
             # without coupling the root logging config to this logger's fields.
             logger.info(
-                "coordinator_route agent=%s status=%s elapsed_ms=%.1f query=%r",
-                agent_name, status, (time.monotonic() - start) * 1000, query.query,
+                "coordinator_route agent=%s status=%s reason=%s elapsed_ms=%.1f query=%r",
+                agent_name, status, block_reason, (time.monotonic() - start) * 1000, query.query,
             )
 
     def _is_policy_query(self, query_lower: str) -> bool:
@@ -146,8 +142,12 @@ class ReviewSummarizationAgent:
             ],
         )
 
-        # Return the summary
-        return {"response": response.choices[0].message.content}
+        # Return the summary, unless the faithfulness/moderation guardrail flags it.
+        response_text = response.choices[0].message.content
+        output_check = check_output(response_text, reviews_text)
+        if output_check["blocked"]:
+            return {"response": output_check["message"]}
+        return {"response": response_text}
 
 
 # Implement the Product Recommendation Agent
@@ -196,7 +196,11 @@ class ProductRecommendationAgent:
                 {"role": "user", "content": f"Customer request: {query.query}\n\nShortlist of matching products:\n{product_details}"},
             ],
         )
-        return {"response": response.choices[0].message.content}
+        response_text = response.choices[0].message.content
+        output_check = check_output(response_text, product_details)
+        if output_check["blocked"]:
+            return {"response": output_check["message"]}
+        return {"response": response_text}
 
     def _match_category(self, query_lower: str):
         """Return a catalog category (e.g. 'smart_tv') if it's referenced in the query."""
@@ -248,7 +252,11 @@ class ProductComparisonAgent:
                 {"role": "user", "content": f"Compare these products:\n{product_details}"},
             ],
         )
-        return {"response": response.choices[0].message.content}
+        response_text = response.choices[0].message.content
+        output_check = check_output(response_text, product_details)
+        if output_check["blocked"]:
+            return {"response": output_check["message"]}
+        return {"response": response_text}
 
 
 # Price Comparison Agent
@@ -430,4 +438,8 @@ class FAQAgent:
                 {"role": "user", "content": f"Store policies:\n{policy_text}\n\nCustomer question: {query.query}"},
             ],
         )
-        return {"response": response.choices[0].message.content}
+        response_text = response.choices[0].message.content
+        output_check = check_output(response_text, policy_text)
+        if output_check["blocked"]:
+            return {"response": output_check["message"]}
+        return {"response": response_text}
