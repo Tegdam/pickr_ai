@@ -17,6 +17,33 @@ matching. Rejected for now — keyword matching is free, deterministic, and easy
 to test; revisit if query phrasing in practice turns out too varied for
 substring checks to keep up with.
 
+## ReviewSummarizationAgent
+
+**Open question (not yet implemented):** the capstone brief calls for
+sentiment-based review summarization; today `analyze_reviews` has no
+explicit sentiment step — it hands raw review text (with star ratings) to
+an LLM summarization prompt and relies on the model to implicitly infer
+"praise vs. complaints" sentiment from that.
+
+**Proposal under consideration:** train a supervised sentiment classifier
+(TF-IDF + Logistic Regression or Naive Bayes) on `data/reviews.csv` (4,000
+rows), deriving labels from the existing `rating` column (e.g. ≥4 positive,
+≤2.5 negative, else neutral), and use it to classify each review's sentiment
+before the LLM summarizes — real feature engineering / train-eval split /
+accuracy-F1 reporting, rather than calling a pretrained lexicon tool (e.g.
+VADER), which was considered and set aside as feeling more like a library
+call than an ML exercise for this project's goals. Also doubles as the
+project's one deliberate traditional-ML component alongside the LLM-heavy
+rest of the app.
+
+**Known wrinkle:** `rating` is heavily skewed positive (409 reviews at 5.0,
+1353 at 4.0, versus only 6 at 2.0 and 47 at 2.5) — negative is a thin slice
+of the data, so class imbalance will need explicit handling (class
+weighting, resampling, or just honest reporting of the limitation) rather
+than being glossed over.
+
+**Status:** parked — pending further thought before committing to a design.
+
 ## ProductRecommendationAgent
 
 **Decision:** Became the coordinator's default fallback (anything not caught
