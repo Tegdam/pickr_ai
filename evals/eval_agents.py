@@ -70,26 +70,3 @@ async def main(eval_dataset_path: str):
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main("evals/data/store_policies_evals.json"))
-
-# ===========================
-# Instructions for Learners:
-# ===========================
-# How to create `store_policies_evals.json`:
-# - This file should contain a list of test cases.
-# - Each test case should have two keys:
-#   1. `user_input`: The customer’s query.
-#   2. `reference`: The correct or expected answer.
-#
-# Example JSON Structure:
-# [
-#     {
-#         "user_input": "What is the minimum amount I have to spend to get free shipping?",
-#         "reference": "The minimum amount you have to spend to get free shipping is $50."
-#     },
-#     {
-#         "user_input": "Do you offer international shipping?",
-#         "reference": "We currently only ship to addresses within the United States."
-#     }
-# ]
-#
-# This dataset will be used for evaluating the AI responses' factual correctness.
