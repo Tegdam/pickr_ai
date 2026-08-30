@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Internal self-assessment, never published
+project_grading.md
+
 # Local, machine-specific Claude Code settings
 .claude/settings.local.json
 

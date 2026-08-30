@@ -9,6 +9,7 @@
 
 import logging
 import os
+from pathlib import Path
 
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, func
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -25,11 +26,28 @@ DB_NAME = os.getenv("DB_NAME", "")
 DB_USER = os.getenv("DB_USER", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
+# RDS enforces TLS; this is AWS's public global CA bundle (not a secret --
+# safe to commit), matching `mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=...`.
+DB_SSL_CA = os.getenv(
+    "DB_SSL_CA", str(Path(__file__).resolve().parent.parent / "certs" / "rds-global-bundle.pem")
+)
+
 DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # pool_pre_ping: RDS can drop idle connections; this checks a connection is
 # still alive before handing it out rather than failing on a stale one.
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# ssl_verify_cert + ssl_verify_identity: verifies both the server's certificate
+# chain and that the hostname matches -- equivalent to the RDS console's
+# `--ssl-mode=VERIFY_IDENTITY`, not just "encrypted but unauthenticated" TLS.
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args={
+        "ssl_ca": DB_SSL_CA,
+        "ssl_verify_cert": True,
+        "ssl_verify_identity": True,
+    },
+)
 SessionLocal = sessionmaker(bind=engine)
 
 Base = declarative_base()
