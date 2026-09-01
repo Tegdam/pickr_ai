@@ -30,10 +30,96 @@
     padding: 4rem 1.25rem;
   }
 
+  .layout {
+    width: 100%;
+    max-width: 54rem;
+    display: flex;
+    gap: 2.5rem;
+    align-items: flex-start;
+  }
+
   main {
     width: 100%;
     max-width: 32rem;
     animation: rise 0.4s ease-out;
+  }
+
+  .sidebar {
+    width: 16rem;
+    flex: none;
+    border: 1.5px solid var(--ink);
+    border-radius: 4px;
+    padding: 1.25rem 1.25rem 1.5rem;
+    animation: rise 0.4s ease-out;
+  }
+
+  .sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.75rem;
+  }
+
+  .sidebar-header .eyebrow { margin-bottom: 0; }
+
+  .sidebar-header button {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--ink);
+    background: transparent;
+    border: 1.5px solid var(--ink);
+    border-radius: 3px;
+    padding: 0.25rem 0.55rem;
+  }
+
+  .sidebar-header button:hover { background: var(--ink); color: var(--paper); }
+
+  .session-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    max-height: 32rem;
+    overflow-y: auto;
+  }
+
+  .session-item {
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+    padding: 0.5rem 0.6rem;
+    cursor: pointer;
+    font-family: "IBM Plex Mono", monospace;
+  }
+
+  .session-item:hover { background: rgba(31, 36, 33, 0.06); }
+  .session-item.active { background: var(--ink); }
+  .session-item.active .session-preview,
+  .session-item.active .session-time { color: var(--paper); }
+
+  .session-preview {
+    font-size: 0.8rem;
+    color: var(--ink);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .session-time {
+    font-size: 0.65rem;
+    color: var(--ink-muted);
+    margin-top: 0.15rem;
+  }
+
+  .session-empty {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
   }
 
   @keyframes rise {
@@ -181,6 +267,12 @@
     .printing { animation: none; }
   }
 
+  @media (max-width: 48rem) {
+    .layout { flex-direction: column; }
+    .sidebar { width: 100%; }
+    .session-list { max-height: 14rem; }
+  }
+
   @media (max-width: 30rem) {
     body { padding: 2.5rem 1rem; }
     .wordmark { font-size: 1.6rem; }
@@ -190,6 +282,7 @@
 </style>
 </head>
 <body>
+<div class="layout">
 <main>
   <h1 class="wordmark">
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -220,21 +313,32 @@
   </section>
 </main>
 
+<aside class="sidebar" aria-label="Conversation history">
+  <div class="sidebar-header">
+    <span class="eyebrow">SESSIONS</span>
+    <button type="button" id="new-session-button" aria-label="Start a new session">New</button>
+  </div>
+  <ul class="session-list" id="session-list"></ul>
+</aside>
+</div>
+
 <script>
   const form = document.getElementById("query-form");
   const input = document.getElementById("query-input");
   const button = document.getElementById("ask-button");
   const receipt = document.getElementById("receipt");
   const entries = document.getElementById("entries");
+  const sessionList = document.getElementById("session-list");
+  const newSessionButton = document.getElementById("new-session-button");
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  // One id per page load, sent with every query so the backend can load/persist
-  // this conversation's history. Not persisted across reloads -- a fresh visit
-  // starts a fresh conversation.
-  const conversationId = crypto.randomUUID();
+  // Sent with every query so the backend can load/persist this conversation's
+  // history. Reassigned when the user opens a past session or starts a new
+  // one -- not tied to page load the way it used to be.
+  let conversationId = crypto.randomUUID();
 
   let typewriterTimer = null;
 
-  function addEntry(query) {
+  function addEntry(query, { scroll = true } = {}) {
     receipt.classList.add("visible");
 
     const entry = document.createElement("div");
@@ -248,10 +352,104 @@
     const [itemBody, responseBody] = entry.querySelectorAll("p.receipt-body");
     itemBody.textContent = query;
     entries.appendChild(entry);
-    entry.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "end" });
+    if (scroll) entry.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "end" });
 
     return responseBody;
   }
+
+  function renderHistoryEntries(turns) {
+    entries.innerHTML = "";
+    for (let i = 0; i < turns.length; i += 2) {
+      const userTurn = turns[i];
+      const assistantTurn = turns[i + 1];
+      if (!userTurn) continue;
+      const responseBody = addEntry(userTurn.content, { scroll: false });
+      responseBody.classList.remove("printing");
+      responseBody.textContent = assistantTurn ? assistantTurn.content : "";
+    }
+    if (turns.length > 0) receipt.classList.add("visible");
+    entries.lastElementChild?.scrollIntoView({ behavior: "auto", block: "end" });
+  }
+
+  function formatTimestamp(isoString) {
+    if (!isoString) return "";
+    const date = new Date(isoString.endsWith("Z") ? isoString : `${isoString}Z`);
+    if (Number.isNaN(date.getTime())) return "";
+    return date.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+
+  function highlightActiveSession() {
+    sessionList.querySelectorAll(".session-item").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.conversationId === conversationId);
+    });
+  }
+
+  function renderSessions(sessions) {
+    sessionList.innerHTML = "";
+
+    if (sessions.length === 0) {
+      const empty = document.createElement("li");
+      empty.className = "session-empty";
+      empty.textContent = "No past sessions yet.";
+      sessionList.appendChild(empty);
+      return;
+    }
+
+    for (const s of sessions) {
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "session-item";
+      btn.dataset.conversationId = s.conversation_id;
+      btn.innerHTML = `
+        <div class="session-preview"></div>
+        <div class="session-time"></div>
+      `;
+      btn.querySelector(".session-preview").textContent = s.preview || "(no message)";
+      btn.querySelector(".session-time").textContent = formatTimestamp(s.last_activity);
+      btn.addEventListener("click", () => openSession(s.conversation_id));
+      li.appendChild(btn);
+      sessionList.appendChild(li);
+    }
+
+    highlightActiveSession();
+  }
+
+  async function loadSessions() {
+    try {
+      const res = await fetch("/api/sessions");
+      if (!res.ok) return;
+      renderSessions(await res.json());
+    } catch (err) {
+      // sidebar is a convenience; leave it as-is if the fetch fails
+    }
+  }
+
+  async function openSession(id) {
+    conversationId = id;
+    input.value = "";
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
+      renderHistoryEntries(res.ok ? await res.json() : []);
+    } catch (err) {
+      renderHistoryEntries([]);
+    }
+    highlightActiveSession();
+    input.focus();
+  }
+
+  newSessionButton.addEventListener("click", () => {
+    conversationId = crypto.randomUUID();
+    entries.innerHTML = "";
+    receipt.classList.remove("visible");
+    highlightActiveSession();
+    input.focus();
+  });
 
   function typeOut(responseBody, text) {
     responseBody.classList.remove("printing");
@@ -300,12 +498,15 @@
 
       const data = await res.json();
       typeOut(responseBody, data.response ?? "No response returned.");
+      loadSessions();
     } catch (err) {
       showError(responseBody, `Couldn't print a response — ${err.message}. Try asking again.`);
     } finally {
       button.disabled = false;
     }
   });
+
+  loadSessions();
 </script>
 </body>
 </html>
