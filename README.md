@@ -16,20 +16,37 @@ flowchart LR
     C -->|default| PRA
 ```
 
-Guardrails (prompt-injection, off-topic, moderation, hallucination checks) wrap every routed call, and conversation history persists to RDS MySQL so follow-ups resolve correctly. The reasoning behind each of these choices — including the two fallback chains above — is in [`DECISIONS.md`](DECISIONS.md).
+Guardrails (prompt-injection, off-topic, moderation, hallucination checks) wrap every routed call, and conversation history persists to a MySQL database so follow-ups resolve correctly.
 
-## Run it (demo)
+## Run it
 
-Assumes the virtual environment is already set up with `requirements.txt` installed and `.env` is already populated (`OPENAI_API_KEY`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`).
+Requires Python 3.11+ and an [OpenAI API key](https://platform.openai.com/api-keys).
 
 ```bash
-# from the repo root, with the venv activated
+git clone https://github.com/Tegdam/pickr_ai.git
+cd pickr_ai
+python -m venv env
+source env/bin/activate      # Windows: env\Scripts\activate
+pip install -r requirements.txt
+```
+
+Create a `.env` file in the repo root with your key:
+
+```
+OPENAI_API_KEY=sk-...
+```
+
+Start the server:
+
+```bash
 python -m uvicorn app.main:app --reload
 ```
 
-(Use `python -m uvicorn`, not bare `uvicorn` — on some setups `uvicorn` resolves to a stray user-level install outside the venv and fails with `ModuleNotFoundError: No module named 'dotenv'`. If that still happens, run `pip install -r requirements.txt` first to make sure everything is installed *inside* the active venv.)
+(Use `python -m uvicorn`, not bare `uvicorn` — on some setups `uvicorn` resolves to a stray install outside the venv and fails with `ModuleNotFoundError: No module named 'dotenv'`.)
 
-Then open **http://localhost:8000** and ask a question. `Ctrl+C` to stop.
+Open **http://localhost:8000** and ask a question. `Ctrl+C` to stop.
+
+Chat history (remembering earlier turns in a conversation) is optional — the app runs fine without it. To enable it, also add `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` for a MySQL database to `.env`.
 
 ## Stack
 
@@ -48,7 +65,7 @@ Then open **http://localhost:8000** and ask a question. `Ctrl+C` to stop.
 app/
   main.py             FastAPI entrypoint
   api.py              /api/query, /api/sessions routes
-  conversation.py     chat history (RDS) + query condensation
+  conversation.py     chat history (MySQL) + query condensation
   agents.py           CoordinatorAgent + the 6 specialized agents
   guardrails.py       input/output safety checks
   db.py               CSV loading (cached)
@@ -58,7 +75,6 @@ static/index.html     frontend (single file, no build step)
 data/                 products.csv, reviews.csv, store_policies.csv
 tests/                pytest suite
 evals/                ragas evals against live OpenAI
-DECISIONS.md          design-decision log
 ```
 
 ## Deployment
