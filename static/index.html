@@ -260,6 +260,29 @@
   .meta-label { letter-spacing: 0.08em; margin-right: 0.35rem; }
   .meta-value { color: var(--ink); }
 
+  .receipt-footer {
+    margin-top: 1.5rem;
+    padding-top: 1.1rem;
+    border-top: 1px dashed var(--line);
+    text-align: center;
+    font-family: "IBM Plex Mono", monospace;
+  }
+
+  .footer-label {
+    display: block;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    color: var(--ink-muted);
+    margin-bottom: 0.4rem;
+  }
+
+  .footer-thanks {
+    display: block;
+    font-size: 0.85rem;
+    color: var(--ink);
+  }
+
   .entries { display: flex; flex-direction: column; }
 
   .entry + .entry { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px dashed var(--line); }
@@ -339,6 +362,10 @@
       <span class="receipt-meta"><span class="meta-label">DATE</span><span class="meta-value" id="meta-date"></span></span>
     </div>
     <div class="entries" id="entries"></div>
+    <div class="receipt-footer">
+      <span class="footer-label">CUSTOMER COPY</span>
+      <span class="footer-thanks">Thank you for the conversation!</span>
+    </div>
   </section>
 </main>
 
