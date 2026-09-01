@@ -226,10 +226,19 @@
   }
 
   .receipt {
-    margin-top: 1.75rem;
-    padding: 1.25rem 0;
-    border-top: 2px dashed var(--line);
-    border-bottom: 2px dashed var(--line);
+    position: relative;
+    margin-top: 2rem;
+    padding: 2rem 1.5rem 2.25rem;
+    background-color: #FFFDF6;
+    background-image:
+      linear-gradient(-45deg, var(--paper) 6px, transparent 0),
+      linear-gradient(45deg, var(--paper) 6px, transparent 0),
+      linear-gradient(135deg, var(--paper) 6px, transparent 0),
+      linear-gradient(-135deg, var(--paper) 6px, transparent 0);
+    background-position: left bottom, left bottom, left top, left top;
+    background-size: 12px 12px;
+    background-repeat: repeat-x;
+    box-shadow: 0 14px 28px -10px rgba(31, 36, 33, 0.22), 0 3px 8px rgba(31, 36, 33, 0.08);
     display: none;
   }
 
