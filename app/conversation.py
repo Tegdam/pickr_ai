@@ -106,6 +106,76 @@ def load_history(conversation_id: str) -> list:
         return []
 
 
+def list_sessions(limit: int = 50) -> list:
+    """Return the most recently active conversations, each with a preview
+    (its first user message) for the sessions sidebar. Unlike load_history,
+    this is not scoped to one conversation_id -- it's a cross-conversation
+    summary, so it's a separate query rather than reusing load_history.
+    """
+    try:
+        with SessionLocal() as session:
+            activity = (
+                session.query(ChatTurn.conversation_id, func.max(ChatTurn.created_at).label("last_activity"))
+                .group_by(ChatTurn.conversation_id)
+                .order_by(func.max(ChatTurn.created_at).desc())
+                .limit(limit)
+                .all()
+            )
+            if not activity:
+                return []
+
+            conversation_ids = [row.conversation_id for row in activity]
+            first_user_ids = (
+                session.query(func.min(ChatTurn.id))
+                .filter(ChatTurn.role == "user", ChatTurn.conversation_id.in_(conversation_ids))
+                .group_by(ChatTurn.conversation_id)
+            )
+            previews = {
+                row.conversation_id: row.content
+                for row in session.query(ChatTurn).filter(ChatTurn.id.in_(first_user_ids))
+            }
+
+            return [
+                {
+                    "conversation_id": row.conversation_id,
+                    "preview": previews.get(row.conversation_id, ""),
+                    "last_activity": row.last_activity.isoformat() if row.last_activity else None,
+                }
+                for row in activity
+            ]
+    except Exception:
+        logger.warning("failed to list chat sessions", exc_info=True)
+        return []
+
+
+def load_full_history(conversation_id: str) -> list:
+    """Return every turn for a conversation, oldest first -- for display in
+    the sessions sidebar (unlike load_history, not window-limited, since this
+    is for showing a full past conversation rather than feeding condensation).
+    Includes created_at so the UI can show the conversation's start time in
+    its receipt header.
+    """
+    try:
+        with SessionLocal() as session:
+            rows = (
+                session.query(ChatTurn)
+                .filter(ChatTurn.conversation_id == conversation_id)
+                .order_by(ChatTurn.id.asc())
+                .all()
+            )
+        return [
+            {
+                "role": row.role,
+                "content": row.content,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
+        ]
+    except Exception:
+        logger.warning("failed to load full session history", exc_info=True)
+        return []
+
+
 def save_exchange(conversation_id: str, user_message: str, assistant_message: str) -> None:
     """Persist one user+assistant pair in a single commit."""
     try:
