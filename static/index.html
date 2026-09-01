@@ -149,6 +149,10 @@
 
   .receipt.visible { display: block; }
 
+  .entries { display: flex; flex-direction: column; }
+
+  .entry + .entry { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px dashed var(--line); }
+
   .receipt .eyebrow { color: var(--accent); }
   .receipt .eyebrow:not(:first-child) { margin-top: 0.9rem; display: block; }
 
@@ -212,10 +216,7 @@
   </form>
 
   <section class="receipt" id="receipt" aria-live="polite">
-    <span class="eyebrow">ITEM</span>
-    <p class="receipt-body" id="receipt-query"></p>
-    <span class="eyebrow">RESPONSE</span>
-    <p class="receipt-body" id="receipt-body"></p>
+    <div class="entries" id="entries"></div>
   </section>
 </main>
 
@@ -224,8 +225,7 @@
   const input = document.getElementById("query-input");
   const button = document.getElementById("ask-button");
   const receipt = document.getElementById("receipt");
-  const receiptQuery = document.getElementById("receipt-query");
-  const receiptBody = document.getElementById("receipt-body");
+  const entries = document.getElementById("entries");
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   // One id per page load, sent with every query so the backend can load/persist
   // this conversation's history. Not persisted across reloads -- a fresh visit
@@ -234,37 +234,47 @@
 
   let typewriterTimer = null;
 
-  function showPrinting(query) {
+  function addEntry(query) {
     receipt.classList.add("visible");
-    receiptQuery.textContent = query;
-    receiptBody.classList.remove("error");
-    receiptBody.textContent = "printing…";
-    receiptBody.classList.add("printing");
+
+    const entry = document.createElement("div");
+    entry.className = "entry";
+    entry.innerHTML = `
+      <span class="eyebrow">ITEM</span>
+      <p class="receipt-body"></p>
+      <span class="eyebrow">RESPONSE</span>
+      <p class="receipt-body printing">printing…</p>
+    `;
+    const [itemBody, responseBody] = entry.querySelectorAll("p.receipt-body");
+    itemBody.textContent = query;
+    entries.appendChild(entry);
+    entry.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "end" });
+
+    return responseBody;
   }
 
-  function typeOut(text) {
-    receiptBody.classList.remove("printing");
+  function typeOut(responseBody, text) {
+    responseBody.classList.remove("printing");
     clearInterval(typewriterTimer);
 
     if (reducedMotion) {
-      receiptBody.textContent = text;
+      responseBody.textContent = text;
       return;
     }
 
-    receiptBody.textContent = "";
+    responseBody.textContent = "";
     let i = 0;
     typewriterTimer = setInterval(() => {
-      receiptBody.textContent += text[i];
+      responseBody.textContent += text[i];
       i += 1;
       if (i >= text.length) clearInterval(typewriterTimer);
     }, 12);
   }
 
-  function showError(message) {
-    receipt.classList.add("visible");
-    receiptBody.classList.remove("printing");
-    receiptBody.classList.add("error");
-    receiptBody.textContent = message;
+  function showError(responseBody, message) {
+    responseBody.classList.remove("printing");
+    responseBody.classList.add("error");
+    responseBody.textContent = message;
   }
 
   form.addEventListener("submit", async (event) => {
@@ -272,8 +282,9 @@
     const query = input.value.trim();
     if (!query) return;
 
+    input.value = "";
     button.disabled = true;
-    showPrinting(query);
+    const responseBody = addEntry(query);
 
     try {
       const res = await fetch("/api/query", {
@@ -288,9 +299,9 @@
       }
 
       const data = await res.json();
-      typeOut(data.response ?? "No response returned.");
+      typeOut(responseBody, data.response ?? "No response returned.");
     } catch (err) {
-      showError(`Couldn't print a response — ${err.message}. Try asking again.`);
+      showError(responseBody, `Couldn't print a response — ${err.message}. Try asking again.`);
     } finally {
       button.disabled = false;
     }
