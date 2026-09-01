@@ -375,6 +375,69 @@ boundaries (LLM client; `load_history`/`condense_query`/`coordinator`/
 `save_exchange` respectively), same layered approach as the guardrails
 tests. No test needs real RDS credentials to run.
 
+## CSV data: cleaning and in-process caching (app/data_cleaning.py, app/db.py)
+
+**Decision:** `app/data_cleaning.py` cleans each catalog DataFrame right
+after `pd.read_csv` in `db.py`, before rows are converted into Pydantic
+models: `drop_duplicates()` on full rows and (for products) on `id`,
+`dropna()` on essential columns (treating whitespace-only fields as missing
+too), `.clip()` to valid numeric ranges (price > 0, stock >= 0, rating in
+[0, 5]), and `pd.to_datetime(errors="coerce")` to drop reviews with an
+unparseable date. `data/*.csv` turned out to already be clean (2000/4000/22
+rows in, same counts out) — the cleaning still stays in place as a
+correctness guarantee for whoever edits these CSVs by hand later, verified
+separately against synthetic dirty rows (duplicate ids, blank fields,
+negative prices, out-of-range ratings, bad dates).
+
+**Considered: doing this cleaning offline instead (a preprocessing script
+writing already-clean CSVs to disk).** Rejected — cleaning ~2,000-4,000 rows
+with vectorized pandas calls (`drop_duplicates`/`dropna`/`clip`) is cheap
+even at this scale, and an offline step adds a build stage that can silently
+drift out of sync if the raw CSV is edited without rerunning it. The actual
+scaling problem was somewhere else entirely (see below), and fixing that
+made "clean at load time" fully fine to keep.
+
+**Decision: cache each `load_*()` function's result in-process
+(`functools.lru_cache(maxsize=1)`), returning a tuple instead of a list.**
+This is what actually addresses the performance-branch TODO first flagged in
+`project_grading.md`: every specialized agent in `agents.py` calls
+`load_products()`/`load_reviews()`/`load_store_policies()` in its own
+`__init__`, and those agents are re-instantiated on *every request* by
+`CoordinatorAgent.handle_query` — so without caching, each query was
+re-reading, re-parsing, *and* re-cleaning the CSVs from disk, even though
+the data never changes between requests. `lru_cache` makes that work happen
+exactly once per process; every subsequent call (from however many
+freshly-instantiated agents) returns the same in-memory object instantly.
+Returning a `tuple` rather than a `list` was a deliberate pairing with the
+cache: since the same object is now shared across every request/agent
+instance, an accidental in-place mutation (e.g. some future `self.products.
+sort(...)` instead of `sorted(self.products, ...)`) would silently corrupt
+state for every other request sharing that cache entry. A tuple makes that
+fail loudly (`AttributeError`) instead.
+
+**Alternative considered:** moving the load+cache to app startup (e.g. in
+`main.py`, alongside `init_db()`) and injecting the data into agents via
+constructor arguments instead of each agent calling `load_*()` itself.
+Rejected for now as a larger refactor than the problem needed — it would
+touch every agent's `__init__` and `CoordinatorAgent`'s instantiation calls,
+whereas `lru_cache` gets the same effective result (one real load per
+process) by changing only three functions in `db.py`, with zero changes to
+`agents.py`. Revisit if per-request agent instantiation itself (object
+churn, not the data loading) ever shows up as a measurable cost.
+
+**Verified:** cache hit count and object identity across repeated calls
+(`load_products() is load_products()` after the first call, `cache_info()`
+showing a hit), full test suite still green — tests monkeypatch
+`agents.load_products`/etc. directly (replacing the name binding in
+`agents.py`'s namespace), which bypasses `db.py`'s cache entirely and needed
+no changes.
+
+**Known limitation, accepted:** the cache lives for the process's lifetime
+— editing a CSV on disk has no effect until the process restarts. Acceptable
+for this project's static reference data; the same "restart to pick up
+changes" tradeoff already applies to `PolicyIndex`'s Chroma rebuild logic
+and the lack of a migration framework for `chat_turns`.
+
 ## Testing
 
 **Decision:** Isolated in-memory fixtures (`monkeypatch`-ed
