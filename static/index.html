@@ -244,6 +244,22 @@
 
   .receipt.visible { display: block; }
 
+  .receipt-header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 0.5rem 1rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    color: var(--ink-muted);
+    padding-bottom: 1.1rem;
+    margin-bottom: 1.5rem;
+    border-bottom: 1px dashed var(--line);
+  }
+
+  .meta-label { letter-spacing: 0.08em; margin-right: 0.35rem; }
+  .meta-value { color: var(--ink); }
+
   .entries { display: flex; flex-direction: column; }
 
   .entry + .entry { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px dashed var(--line); }
@@ -318,6 +334,10 @@
   </form>
 
   <section class="receipt" id="receipt" aria-live="polite">
+    <div class="receipt-header">
+      <span class="receipt-meta"><span class="meta-label">CONV ID</span><span class="meta-value" id="meta-conv-id"></span></span>
+      <span class="receipt-meta"><span class="meta-label">DATE</span><span class="meta-value" id="meta-date"></span></span>
+    </div>
     <div class="entries" id="entries"></div>
   </section>
 </main>
@@ -339,6 +359,8 @@
   const entries = document.getElementById("entries");
   const sessionList = document.getElementById("session-list");
   const newSessionButton = document.getElementById("new-session-button");
+  const metaConvId = document.getElementById("meta-conv-id");
+  const metaDate = document.getElementById("meta-date");
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   // Sent with every query so the backend can load/persist this conversation's
   // history. Reassigned when the user opens a past session or starts a new
@@ -378,6 +400,11 @@
     }
     if (turns.length > 0) receipt.classList.add("visible");
     entries.lastElementChild?.scrollIntoView({ behavior: "auto", block: "end" });
+  }
+
+  function setReceiptHeader(id, startedAtIso) {
+    metaConvId.textContent = id.slice(0, 8);
+    metaDate.textContent = formatTimestamp(startedAtIso || new Date().toISOString());
   }
 
   function formatTimestamp(isoString) {
@@ -444,9 +471,12 @@
     input.value = "";
     try {
       const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
-      renderHistoryEntries(res.ok ? await res.json() : []);
+      const turns = res.ok ? await res.json() : [];
+      renderHistoryEntries(turns);
+      setReceiptHeader(id, turns[0]?.created_at);
     } catch (err) {
       renderHistoryEntries([]);
+      setReceiptHeader(id);
     }
     highlightActiveSession();
     input.focus();
@@ -456,6 +486,7 @@
     conversationId = crypto.randomUUID();
     entries.innerHTML = "";
     receipt.classList.remove("visible");
+    setReceiptHeader(conversationId);
     highlightActiveSession();
     input.focus();
   });
@@ -515,6 +546,7 @@
     }
   });
 
+  setReceiptHeader(conversationId);
   loadSessions();
 </script>
 </body>
