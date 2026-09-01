@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pickr AI</title>
+<title>Pickr</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
@@ -150,6 +150,7 @@
   .receipt.visible { display: block; }
 
   .receipt .eyebrow { color: var(--accent); }
+  .receipt .eyebrow:not(:first-child) { margin-top: 0.9rem; display: block; }
 
   .receipt-body {
     font-family: "IBM Plex Mono", monospace;
@@ -191,7 +192,7 @@
       <path d="M20.59 13.41 13.41 20.59a2 2 0 0 1-2.82 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82Z" fill="#D6304A"/>
       <circle cx="7" cy="7" r="1.6" fill="#F7F5EF"/>
     </svg>
-    Pickr AI
+    Pickr
   </h1>
   <p class="tagline">ask about products, reviews, or store policy — get a straight answer.</p>
 
@@ -211,6 +212,8 @@
   </form>
 
   <section class="receipt" id="receipt" aria-live="polite">
+    <span class="eyebrow">ITEM</span>
+    <p class="receipt-body" id="receipt-query"></p>
     <span class="eyebrow">RESPONSE</span>
     <p class="receipt-body" id="receipt-body"></p>
   </section>
@@ -221,6 +224,7 @@
   const input = document.getElementById("query-input");
   const button = document.getElementById("ask-button");
   const receipt = document.getElementById("receipt");
+  const receiptQuery = document.getElementById("receipt-query");
   const receiptBody = document.getElementById("receipt-body");
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   // One id per page load, sent with every query so the backend can load/persist
@@ -230,8 +234,9 @@
 
   let typewriterTimer = null;
 
-  function showPrinting() {
+  function showPrinting(query) {
     receipt.classList.add("visible");
+    receiptQuery.textContent = query;
     receiptBody.classList.remove("error");
     receiptBody.textContent = "printing…";
     receiptBody.classList.add("printing");
@@ -268,7 +273,7 @@
     if (!query) return;
 
     button.disabled = true;
-    showPrinting();
+    showPrinting(query);
 
     try {
       const res = await fetch("/api/query", {
