@@ -120,6 +120,9 @@ class TestHandleConversationalQuery:
         conversation.coordinator.handle_query.assert_called_once()
         routed_query = conversation.coordinator.handle_query.call_args[0][0]
         assert routed_query.query == "resolved query"
+        # Guardrail input-checking must see the literal customer text, not the
+        # condensed version -- see CoordinatorAgent.handle_query's raw_query fallback.
+        assert routed_query.raw_query == "raw follow up"
         mock_save.assert_called_once_with("conv-1", "raw follow up", "final answer")
 
     def test_first_message_has_no_history_to_condense(self, monkeypatch):

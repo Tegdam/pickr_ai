@@ -58,7 +58,7 @@ class CoordinatorAgent:
         status = "error"
         block_reason = None
         try:
-            input_check = check_input(query.query)
+            input_check = check_input(query.raw_query or query.query)
             if input_check["blocked"]:
                 agent_name = "guardrails_input"
                 status = "blocked"

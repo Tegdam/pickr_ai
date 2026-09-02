@@ -235,7 +235,7 @@ def handle_conversational_query(conversation_id: str, raw_query: str) -> dict:
     history = load_history(conversation_id)
     resolved_query = condense_query(history, raw_query)
 
-    result = coordinator.handle_query(UserQuery(query=resolved_query))
+    result = coordinator.handle_query(UserQuery(query=resolved_query, raw_query=raw_query))
 
     save_exchange(conversation_id, raw_query, result["response"])
 

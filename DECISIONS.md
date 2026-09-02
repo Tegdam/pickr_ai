@@ -300,10 +300,28 @@ would otherwise have no way to resolve "it" or an omitted product name.
 Skipped entirely when there's no history yet (a conversation's first
 message), so no added latency/cost on that turn.
 
-**Decision:** `check_input` (guardrails) still runs on the *raw* incoming
-message, before condensation — deliberately, so prompt-injection detection
-always sees literal user input rather than a version an LLM has already
-rewritten.
+**Decision:** `check_input` (guardrails) must see the *raw* incoming message,
+not the condensed one — deliberately, so prompt-injection detection always
+sees literal user input rather than a version an LLM has already rewritten.
+`UserQuery` carries an optional `raw_query` field for this; `CoordinatorAgent.
+handle_query` checks `query.raw_query or query.query`, so direct callers that
+only ever set `query` (every existing test, eval script) are unaffected, while
+`conversation.py` sets both — `query` to the condensed, self-contained text
+used for routing/generation, `raw_query` to the literal customer text used
+only for the input guardrail.
+
+**Bug caught while writing project documentation, fixed same day:** this
+routing was originally intended but not actually wired up —
+`handle_conversational_query` passed only the condensed `resolved_query` into
+`CoordinatorAgent.handle_query`, so `check_input` was checking an
+LLM-rewritten version of every follow-up message, not what the customer
+literally typed. The first message in a conversation was unaffected
+(condensation is a no-op there). Caught by re-tracing this exact code path to
+describe it accurately in `docs/decision-log.md`; fixed via the `raw_query`
+field above rather than a second `check_input` call, to avoid doubling the
+guardrail's OpenAI/moderation call count. Covered by
+`tests/test_agents.py::TestCoordinatorGuardrails::test_input_check_prefers_raw_query_over_condensed_query`
+and an assertion in `tests/test_conversation.py`.
 
 **Decision:** `ChatQuery` (`app/models.py`) is a distinct model from
 `UserQuery`, not a `conversation_id` field bolted onto `UserQuery` — despite

@@ -7,6 +7,12 @@ from typing import Optional  # For optional model attributes
 # Define the UserQuery Model
 class UserQuery(BaseModel):
     query: str  # Define a string field for storing user queries
+    # The literal customer text, when it differs from `query` (e.g. `query` has
+    # been condensed from a follow-up). Guardrail input checks use this over
+    # `query` when present, so injection detection sees what the customer
+    # actually typed rather than an LLM-rewritten version. Defaults to None so
+    # every existing caller that passes only `query` is unaffected.
+    raw_query: Optional[str] = None
 
 
 # Define the ChatQuery Model (the /api/query request body: a query plus which

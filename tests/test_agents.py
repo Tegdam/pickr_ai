@@ -601,6 +601,24 @@ class TestCoordinatorGuardrails:
         coordinator.handle_query(UserQuery(query="reviews for Alpha Laptop"))
         assert_routed_to(routing_spies, "review")
 
+    def test_input_check_prefers_raw_query_over_condensed_query(self, patched_data, routing_spies, monkeypatch):
+        """When a condensed follow-up (`query`) differs from what the customer
+        actually typed (`raw_query`), the guardrail must see the literal text --
+        not an LLM-rewritten version that could smuggle an injection past it."""
+        checked_text = {}
+
+        def fake_check_input(query_text):
+            checked_text["value"] = query_text
+            return {"blocked": False, "message": None, "reason": None}
+
+        monkeypatch.setattr(agents, "check_input", fake_check_input)
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(
+            UserQuery(query="what's a cheaper alternative to the Alpha Laptop", raw_query="what about something cheaper")
+        )
+
+        assert checked_text["value"] == "what about something cheaper"
+
 
 class TestAgentOutputGuardrails:
     def test_review_summarization_blocked_response_is_replaced(self, patched_data, mock_openai, monkeypatch):
