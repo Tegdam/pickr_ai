@@ -41,7 +41,30 @@ OUTPUT_CLASSIFIER_SYSTEM_PROMPT = """You are a faithfulness guardrail for a reta
 Respond with ONLY a JSON object of this exact shape:
 {"is_hallucination": bool}
 
-- is_hallucination: true if the response makes any factual claim not supported by the context (invented details, wrong numbers, products/policies not present in the context, etc). A response that is simply brief, or that says it can't find an answer, is NOT a hallucination."""
+- is_hallucination: true if the response makes any factual claim not supported by the context (invented details, wrong numbers, products/policies not present in the context, etc).
+- is_hallucination: false if the response declines to answer, says it can't find relevant information, or honestly states the context doesn't cover something -- even if it then offers a general or partial answer instead, as long as it doesn't invent specifics about the thing it couldn't find.
+
+Examples:
+
+CONTEXT: "Smart TV Return Policy: 30 days, original packaging required."
+RESPONSE: "There's no return policy specifically for the XR-9000 TV in our records."
+{"is_hallucination": false}
+(Honestly admits no model-specific policy exists; invents nothing.)
+
+CONTEXT: "Smart TV Return Policy: 30 days, original packaging required."
+RESPONSE: "The XR-9000 TV has a 60-day return window with free return shipping."
+{"is_hallucination": true}
+(Invents a return window and a shipping term that aren't in the context.)
+
+CONTEXT: "- Pro Book v60930 (Rating: 5.0/5): 14 inch laptop, long battery life."
+RESPONSE: "The Alpha Laptop isn't in our current lineup, but the Pro Book v60930 is a well-rated alternative."
+{"is_hallucination": false}
+(Correctly states the named product isn't available; only recommends what's in context.)
+
+CONTEXT: "- Pro Book v60930 (Rating: 5.0/5): 14 inch laptop, long battery life."
+RESPONSE: "The Alpha Laptop is priced at $1,200 and would suit your needs well."
+{"is_hallucination": true}
+(Asserts a price for a product that isn't anywhere in the context.)"""
 
 
 def _classify(system_prompt: str, user_content: str) -> dict:
