@@ -552,3 +552,102 @@ container.
 Verified with a local `docker build` + `docker run`: `.env` and `env/` are
 absent from the built image, and `/` and `/api/query` both respond
 correctly with the key passed in as a runtime environment variable.
+
+## Dependency cleanup: requirements.txt
+
+**Decision:** Removed `motor`, `streamlit`, and bare `langchain` — confirmed
+via a repo-wide grep for `import motor` / `import streamlit` / `import
+langchain` (excluding `langchain_openai`/`langchain_community`, which are
+genuinely used) that none of the three were imported anywhere. `motor` (async
+MongoDB driver) and `streamlit` were leftovers from an earlier direction that
+was never built; the project uses SQLAlchemy/PyMySQL for persistence and a
+static HTML frontend instead. Verified with a fresh venv + `pip install -r
+requirements.txt` + full test suite after removal.
+
+## Code reuse: agents.py output-guardrail helper
+
+**Decision:** Factored the `output_check = check_output(...); if blocked:
+return ...; return {"response": ...}` pattern — previously copy-pasted
+verbatim in `ReviewSummarizationAgent`, `ProductRecommendationAgent`,
+`ProductComparisonAgent`, and `FAQAgent` — into one module-level
+`_guarded_response(response_text, context_text)` helper. Pure extraction, no
+behavior change: each call site now just calls
+`return _guarded_response(response_text, context)` after building its own
+context. Verified behavior-preserving via the full test suite (unchanged
+pass count) rather than only by inspection.
+
+**Related decision:** while doing this, also extracted
+`ProductRecommendationAgent.shortlist_context(category, brand, max_price)`
+and `ProductComparisonAgent.matched_products`/`product_context` out of
+`recommend_product`/`compare_products` respectively. This wasn't purely a
+reuse cleanup — it was needed so `evals/eval_recommendation.py` and
+`evals/eval_comparison.py` (see below) could retrieve the exact same context
+the LLM call actually saw, mirroring how `FAQAgent.index.search()` already
+let `eval_agents.py` do this for the FAQ agent. Without it, an eval script
+would have had to re-derive the shortlist/match logic independently, which
+would silently drift out of sync if the real logic ever changed.
+
+## Reliability: OpenAI retries and error responses
+
+**Decision:** `app/openai_client.py`'s shared `client` now sets
+`max_retries=3` explicitly (up from the SDK's own default of 2), rather than
+hand-rolling retry/backoff with a library like `tenacity`. The `openai`
+Python SDK already retries retryable errors (connection failures, timeouts,
+429, 5xx) with exponential backoff internally — wrapping every call site
+with an external retry decorator would have meant either double-retrying
+(SDK retry nested inside a `tenacity` retry) or disabling the SDK's own
+retry to avoid that, for no real benefit. Raising the ceiling by one line is
+the more idiomatic fix for this SDK, and touches zero call sites in
+`agents.py`/`guardrails.py`.
+
+**Decision:** `api.py`'s catch-all exception handler no longer returns
+`str(e)` as the HTTP `detail` — replaced with a fixed
+`GENERIC_ERROR_MESSAGE`, with the real exception now logged server-side via
+`logger.exception(...)` before the generic response is raised. The raw
+exception text could carry internal details (stack trace fragments, DB
+connection info, file paths) that shouldn't reach the client. Updated
+`tests/test_api.py::test_query_agent_exception_returns_500` accordingly — it
+was asserting on the leaked message (`{"detail": "boom"}`), which was
+testing the exact behavior being removed; it now asserts the generic message
+and that the raw exception text is absent from the response.
+
+## CI: .github/workflows/tests.yml
+
+**Decision:** GitHub Actions workflow running `pip install -r
+requirements.txt` + `pytest` on every push and pull request. No lint step,
+no matrix of Python versions, no coverage gate — the project has one
+maintainer and one supported Python version; a minimal workflow that
+actually runs is better than a elaborate one that's more to maintain.
+Verified the test suite passes with zero secrets/`.env` present (a fresh
+clone, fresh venv, no credentials at all) before adding this, since that's
+exactly the environment GitHub Actions runs in.
+
+## Eval coverage: evals/eval_recommendation.py, evals/eval_comparison.py
+
+**Decision:** Extended the `ragas` eval pattern from `eval_agents.py`
+(FAQAgent-only) to `ProductRecommendationAgent` and `ProductComparisonAgent`,
+using the same three metrics (correctness, faithfulness, relevancy) and the
+same structure (`SingleTurnSample` per test case, averaged at the end) for
+consistency, in two separate files rather than one shared eval script per
+agent, matching the existing one-file-per-agent-under-eval pattern.
+
+**Decision:** Eval datasets (`evals/data/recommendation_evals.json`,
+`evals/data/comparison_evals.json`) were built by querying the real
+`data/products.csv` catalog for actual shortlists/products (not fabricated),
+since `data/*.csv` itself was out of scope to modify — the datasets
+reference real product names, prices, and ratings pulled live from
+`load_products()`. Recommendation references describe the correct answer
+*space* (any of the actual top-rated matches for that category/brand/price
+constraint) rather than pinning one exact product, since ties on rating mean
+several different shortlist picks are all genuinely correct.
+
+**Verified, not just written:** both scripts were run end-to-end against the
+real agents and real OpenAI/ragas calls before being considered done.
+Results were informative, not just "passing": `ProductComparisonAgent`
+scored perfect faithfulness (1.00) across all 3 cases — it sticks to literal
+catalog facts. `ProductRecommendationAgent` scored lower (0.41 avg) because
+it elaborates with interpretive phrasing (e.g. "easy to carry around" from a
+"lightweight design" description) that ragas' faithfulness metric doesn't
+count as directly supported by context, even though it's not a fabrication
+— consistent with the same paraphrase-vs-verbatim strictness pattern found
+earlier in the output guardrail's own hallucination classifier.
