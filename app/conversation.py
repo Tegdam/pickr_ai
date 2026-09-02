@@ -11,6 +11,7 @@ import logging
 import os
 from pathlib import Path
 
+from langsmith import traceable
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -219,6 +220,12 @@ def condense_query(history: list, raw_query: str) -> str:
 coordinator = CoordinatorAgent()
 
 
+# @traceable groups every OpenAI call made during one query -- condensation,
+# guardrails, generation -- under a single LangSmith trace for this function
+# call, instead of each showing up as its own disconnected trace. A no-op
+# when tracing is disabled (LANGSMITH_TRACING unset), same as wrap_openai in
+# openai_client.py -- no LangSmith account needed for the app to work.
+@traceable(name="handle_conversational_query")
 def handle_conversational_query(conversation_id: str, raw_query: str) -> dict:
     """Orchestrates one turn: load history, condense the raw query against it
     if there is any, route the resolved query through CoordinatorAgent
