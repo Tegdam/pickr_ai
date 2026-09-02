@@ -1,15 +1,26 @@
+import logging
+
 from fastapi import APIRouter, HTTPException
 from . import conversation
 from .models import ChatQuery
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+# Generic message rather than str(e): the raw exception can carry internal
+# details (stack traces, DB connection strings, file paths) that shouldn't
+# reach the client. The real exception is still logged server-side.
+GENERIC_ERROR_MESSAGE = "Something went wrong processing your request. Please try again."
+
 
 @router.post("/query")
 async def handle_query(input: ChatQuery):
     try:
         return conversation.handle_conversational_query(input.conversation_id, input.query)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("unhandled error in /api/query")
+        raise HTTPException(status_code=500, detail=GENERIC_ERROR_MESSAGE)
 
 
 @router.get("/sessions")

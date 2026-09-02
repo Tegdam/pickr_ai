@@ -39,7 +39,9 @@ def test_query_agent_exception_returns_500(client, monkeypatch):
     )
     res = client.post("/api/query", json={"query": "anything", "conversation_id": "abc-123"})
     assert res.status_code == 500
-    assert res.json() == {"detail": "boom"}
+    # Generic message, not the raw exception text -- see api.GENERIC_ERROR_MESSAGE.
+    assert res.json() == {"detail": api.GENERIC_ERROR_MESSAGE}
+    assert "boom" not in res.text
 
 
 def test_root_serves_index_html(client):
