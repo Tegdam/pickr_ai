@@ -19,6 +19,18 @@ from .models import UserQuery
 logger = logging.getLogger(__name__)
 
 
+def _guarded_response(response_text: str, context_text: str) -> dict:
+    """Return {"response": response_text}, or the guardrail's refusal message if
+    check_output flags response_text as unsupported by context_text. Shared by
+    every agent that generates a response from an LLM call, so the guardrail
+    wiring lives in one place instead of being copy-pasted per agent.
+    """
+    output_check = check_output(response_text, context_text)
+    if output_check["blocked"]:
+        return {"response": output_check["message"]}
+    return {"response": response_text}
+
+
 # Define the CoordinatorAgent Class
 # This class is responsible for processing user queries and routing them to the appropriate specialized agent.
 # It acts as the central control unit for handling different types of customer inquiries.
@@ -151,10 +163,7 @@ class ReviewSummarizationAgent:
 
         # Return the summary, unless the faithfulness/moderation guardrail flags it.
         response_text = response.choices[0].message.content
-        output_check = check_output(response_text, reviews_text)
-        if output_check["blocked"]:
-            return {"response": output_check["message"]}
-        return {"response": response_text}
+        return _guarded_response(response_text, reviews_text)
 
 
 # Implement the Product Recommendation Agent
@@ -177,24 +186,11 @@ class ProductRecommendationAgent:
         brand = self._match_brand(query_lower)
         max_price = self._match_price_ceiling(query_lower)
 
-        candidates = [p for p in self.products if p.stock and p.stock > 0]
-        if category:
-            candidates = [p for p in candidates if p.category and p.category.lower() == category]
-        if brand:
-            candidates = [p for p in candidates if p.brand and p.brand.lower() == brand]
-        if max_price is not None:
-            candidates = [p for p in candidates if p.price is not None and p.price <= max_price]
-
-        if not candidates:
+        context_lines = self.shortlist_context(category, brand, max_price)
+        if not context_lines:
             return {"response": "I couldn't find any in-stock products matching your request. Try adjusting the category, brand, or price range."}
 
-        # Highest-rated matches first; cap the shortlist so the prompt stays small.
-        shortlist = sorted(candidates, key=lambda p: p.rating or 0, reverse=True)[:5]
-
-        product_details = "\n".join([
-            f"- {p.name} (Brand: {p.brand}, Category: {p.category}, Price: ${p.price}, Rating: {p.rating}/5): {p.description}"
-            for p in shortlist
-        ])
+        product_details = "\n".join(context_lines)
 
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -204,10 +200,29 @@ class ProductRecommendationAgent:
             ],
         )
         response_text = response.choices[0].message.content
-        output_check = check_output(response_text, product_details)
-        if output_check["blocked"]:
-            return {"response": output_check["message"]}
-        return {"response": response_text}
+        return _guarded_response(response_text, product_details)
+
+    def shortlist_context(self, category, brand, max_price) -> list:
+        """Return the formatted context lines for the top-5 in-stock shortlist
+        matching the given constraints -- one string per product, mirroring
+        PolicyIndex.search()'s list-of-chunks shape so both can be scored by
+        the same ragas faithfulness/relevancy eval pattern (see evals/).
+        """
+        candidates = [p for p in self.products if p.stock and p.stock > 0]
+        if category:
+            candidates = [p for p in candidates if p.category and p.category.lower() == category]
+        if brand:
+            candidates = [p for p in candidates if p.brand and p.brand.lower() == brand]
+        if max_price is not None:
+            candidates = [p for p in candidates if p.price is not None and p.price <= max_price]
+
+        # Highest-rated matches first; cap the shortlist so the prompt stays small.
+        shortlist = sorted(candidates, key=lambda p: p.rating or 0, reverse=True)[:5]
+
+        return [
+            f"- {p.name} (Brand: {p.brand}, Category: {p.category}, Price: ${p.price}, Rating: {p.rating}/5): {p.description}"
+            for p in shortlist
+        ]
 
     def _match_category(self, query_lower: str):
         """Return a catalog category (e.g. 'smart_tv') if it's referenced in the query."""
@@ -240,16 +255,13 @@ class ProductComparisonAgent:
         """
         # Find products whose names appear in the query
         query_lower = query.query.lower()
-        matched = [p for p in self.products if p.name and p.name.lower() in query_lower]
+        matched = self.matched_products(query_lower)
 
         if len(matched) < 2:
             return {"response": "Please mention at least two product names to compare."}
 
         # Build a summary of each product's key attributes
-        product_details = "\n".join([
-            f"- {p.name} (Brand: {p.brand}, Price: ${p.price}, Rating: {p.rating}/5): {p.description}"
-            for p in matched
-        ])
+        product_details = "\n".join(self.product_context(matched))
 
         # Ask OpenAI to produce a clear, structured comparison
         response = client.chat.completions.create(
@@ -260,10 +272,20 @@ class ProductComparisonAgent:
             ],
         )
         response_text = response.choices[0].message.content
-        output_check = check_output(response_text, product_details)
-        if output_check["blocked"]:
-            return {"response": output_check["message"]}
-        return {"response": response_text}
+        return _guarded_response(response_text, product_details)
+
+    def matched_products(self, query_lower: str) -> list:
+        """Return catalog products whose name appears in the query."""
+        return [p for p in self.products if p.name and p.name.lower() in query_lower]
+
+    def product_context(self, products) -> list:
+        """Format products as context lines -- shared by compare_products and
+        by evals/eval_comparison.py, which needs the same retrieved_contexts
+        the LLM call actually saw for faithfulness scoring."""
+        return [
+            f"- {p.name} (Brand: {p.brand}, Price: ${p.price}, Rating: {p.rating}/5): {p.description}"
+            for p in products
+        ]
 
 
 # Price Comparison Agent
@@ -448,7 +470,4 @@ class FAQAgent:
             ],
         )
         response_text = response.choices[0].message.content
-        output_check = check_output(response_text, policy_text)
-        if output_check["blocked"]:
-            return {"response": output_check["message"]}
-        return {"response": response_text}
+        return _guarded_response(response_text, policy_text)
