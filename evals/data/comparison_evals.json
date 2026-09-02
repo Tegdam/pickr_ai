@@ -1,0 +1,14 @@
+[
+  {
+    "user_input": "compare Pro Book v60930 and Performance Pro v56156",
+    "reference": "Pro Book v60930 (UltraComp, $1121.82, 5.0/5) is a 14 inch laptop featuring long battery life. Performance Pro v56156 (UltraComp, $399.08, 5.0/5) is a 13.3 inch laptop featuring the latest processor. Both are UltraComp laptops rated 5.0/5, but the Performance Pro v56156 is significantly cheaper while the Pro Book v60930 offers longer battery life."
+  },
+  {
+    "user_input": "compare Bass Boost v3811 and Ultra TV v73604",
+    "reference": "Bass Boost v3811 (AudioMax, $396.32, 3.6/5) is a speaker delivering deep bass. Ultra TV v73604 (ViewTech, $1245.19, 4.0/5) is a 40 inch smart TV with smart connectivity. They are different product categories (speaker vs. smart TV); the Ultra TV v73604 is both more expensive and more highly rated."
+  },
+  {
+    "user_input": "which is better, Bass Boost v3811 or Pro Book v60930",
+    "reference": "Bass Boost v3811 (AudioMax, $396.32, 3.6/5) is a speaker delivering deep bass. Pro Book v60930 (UltraComp, $1121.82, 5.0/5) is a 14 inch laptop featuring long battery life. They serve different purposes; by rating alone the Pro Book v60930 (5.0/5) outscores the Bass Boost v3811 (3.6/5), though it is also considerably more expensive."
+  }
+]

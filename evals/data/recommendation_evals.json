@@ -1,0 +1,18 @@
+[
+  {
+    "user_input": "recommend a laptop",
+    "reference": "A helpful answer recommends one or more of the current top-rated (5.0/5) in-stock laptops -- Pro Book v60930 (UltraComp, $1121.82, long battery life), Performance Pro v56156 (UltraComp, $399.08, latest processor), Performance Pro v42906 (NextGen, $1078.59, 17 inch, latest processor), Ultra Thin v83665 (EconCo, $1854.69, lightweight design), or Econo Note v86315 (NextGen, $1641.69, high performance graphics) -- and briefly explains why the pick fits the request."
+  },
+  {
+    "user_input": "recommend a speaker under $100",
+    "reference": "A helpful answer recommends one or more in-stock speakers priced at $100 or less -- SoundWave v29657 (BeatBox, $96.16, 5.0/5, compact design), ClearSound v43854 (AudioMax, $80.77, 4.7/5, crystal clear sound), SoundWave v18581 (AudioMax, $73.37, 4.5/5, wireless connectivity), Audio Pro v2655 (SoundCo, $61.83, 4.5/5, deep bass), or ClearSound v68748 (BeatBox, $53.03, 4.5/5, compact design) -- and does not recommend anything over $100."
+  },
+  {
+    "user_input": "recommend a techco smartphone",
+    "reference": "A helpful answer recommends one or more in-stock TechCo-brand smartphones -- Maxi Phone v54822 ($746.59, 5.0/5, long-lasting battery), Mobile Z v65692 ($1187.64, 5.0/5, advanced camera system), Maxi Phone v98649 ($933.68, 5.0/5, long-lasting battery), Fusion Phone v69001 ($896.16, 5.0/5, 5G connectivity), or Maxi Phone v34230 ($677.79, 5.0/5, advanced camera system) -- and does not recommend a smartphone from a different brand."
+  },
+  {
+    "user_input": "recommend a viewtech smart tv",
+    "reference": "A helpful answer recommends one or more in-stock ViewTech-brand smart TVs -- SmartView TV v3881 ($310.41, 5.0/5, sleek design), Vivid TV v81676 ($1777.28, 5.0/5, smart connectivity), Vivid TV v62813 ($2760.17, 5.0/5, smart connectivity), Vivid TV v92078 ($888.90, 5.0/5, 4K resolution), or Infinity TV v97267 ($1374.76, 5.0/5, smart connectivity) -- and does not recommend a TV from a different brand."
+  }
+]
