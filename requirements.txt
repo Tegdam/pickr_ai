@@ -5,11 +5,8 @@ openai
 langsmith      # Traces OpenAI calls via wrap_openai; used directly by app/agents.py, not just as a langchain dependency
 pandas
 python-dotenv
-motor           # For MongoDB connection with FastAPI
 sqlalchemy      # Chat history persistence (app/conversation.py) against RDS MySQL
 pymysql         # MySQL driver for sqlalchemy
-streamlit
-langchain
 pytest
 chromadb
 ragas
