@@ -44,6 +44,28 @@ def test_query_agent_exception_returns_500(client, monkeypatch):
     assert "boom" not in res.text
 
 
+def test_delete_session_returns_deleted_count(client, monkeypatch):
+    monkeypatch.setattr(
+        api.conversation, "delete_conversation",
+        MagicMock(return_value=4),
+    )
+    res = client.delete("/api/sessions/conv-123")
+    assert res.status_code == 200
+    assert res.json() == {"deleted": 4}
+
+
+def test_delete_session_db_error_returns_500(client, monkeypatch):
+    monkeypatch.setattr(
+        api.conversation, "delete_conversation",
+        MagicMock(side_effect=RuntimeError("boom")),
+    )
+    res = client.delete("/api/sessions/conv-123")
+    assert res.status_code == 500
+    # Generic message, not the raw exception text -- see api.GENERIC_ERROR_MESSAGE.
+    assert res.json() == {"detail": api.GENERIC_ERROR_MESSAGE}
+    assert "boom" not in res.text
+
+
 def test_root_serves_index_html(client):
     res = client.get("/")
     assert res.status_code == 200

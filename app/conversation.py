@@ -188,6 +188,26 @@ def save_exchange(conversation_id: str, user_message: str, assistant_message: st
         logger.warning("failed to save chat turn; continuing", exc_info=True)
 
 
+def delete_conversation(conversation_id: str) -> int:
+    """Delete every turn for a conversation. Returns the number of rows deleted.
+
+    Unlike load_history/list_sessions/load_full_history/save_exchange above,
+    this does NOT fail open -- a customer explicitly asking for their data to
+    be deleted is exactly the case where silently doing nothing on a DB error
+    would be worse than surfacing it: they'd otherwise be told (or assume)
+    the deletion succeeded when it didn't. Propagates to api.py's existing
+    try/except -> 500 handler instead.
+    """
+    with SessionLocal() as session:
+        deleted = (
+            session.query(ChatTurn)
+            .filter(ChatTurn.conversation_id == conversation_id)
+            .delete()
+        )
+        session.commit()
+    return deleted
+
+
 def condense_query(history: list, raw_query: str) -> str:
     """Rewrite a follow-up into a standalone query using prior turns, e.g.
     "what about something cheaper" -> "what's a cheaper alternative to the

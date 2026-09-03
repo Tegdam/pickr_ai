@@ -31,3 +31,13 @@ async def list_sessions():
 @router.get("/sessions/{conversation_id}")
 async def get_session(conversation_id: str):
     return conversation.load_full_history(conversation_id)
+
+
+@router.delete("/sessions/{conversation_id}")
+async def delete_session(conversation_id: str):
+    try:
+        deleted = conversation.delete_conversation(conversation_id)
+        return {"deleted": deleted}
+    except Exception:
+        logger.exception("unhandled error in DELETE /api/sessions/%s", conversation_id)
+        raise HTTPException(status_code=500, detail=GENERIC_ERROR_MESSAGE)

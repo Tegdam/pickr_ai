@@ -78,6 +78,39 @@ class TestLoadAndSaveHistory:
         conversation.save_exchange("conv-1", "q", "a")  # must not raise
 
 
+class TestDeleteConversation:
+    def test_deletes_all_turns_for_the_conversation(self, sqlite_db):
+        conversation.save_exchange("conv-1", "q1", "a1")
+        conversation.save_exchange("conv-1", "q2", "a2")
+
+        deleted = conversation.delete_conversation("conv-1")
+
+        assert deleted == 4  # 2 user + 2 assistant rows
+        assert conversation.load_history("conv-1") == []
+
+    def test_scoped_to_conversation_id(self, sqlite_db):
+        conversation.save_exchange("conv-1", "q1", "a1")
+        conversation.save_exchange("conv-2", "q2", "a2")
+
+        conversation.delete_conversation("conv-1")
+
+        assert conversation.load_history("conv-1") == []
+        assert conversation.load_history("conv-2") == [("user", "q2"), ("assistant", "a2")]
+
+    def test_returns_zero_for_unknown_conversation(self, sqlite_db):
+        assert conversation.delete_conversation("nonexistent") == 0
+
+    def test_does_not_fail_open_on_db_error(self, monkeypatch):
+        """Unlike load_history/save_exchange, an explicit deletion request
+        must surface a DB error rather than silently doing nothing -- see
+        the docstring on delete_conversation."""
+        def raise_error():
+            raise RuntimeError("db unreachable")
+        monkeypatch.setattr(conversation, "SessionLocal", raise_error)
+        with pytest.raises(RuntimeError):
+            conversation.delete_conversation("conv-1")
+
+
 class TestCondenseQuery:
     def test_no_history_returns_raw_query_unchanged(self, mock_chat):
         result = conversation.condense_query([], "what about something cheaper")

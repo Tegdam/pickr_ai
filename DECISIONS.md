@@ -389,6 +389,19 @@ so a DB hiccup degrades a turn to "no history" rather than failing
 same rule: a failed `create_all()` is logged and swallowed so the app still
 starts even if RDS isn't reachable yet.
 
+**Decision:** `delete_conversation(conversation_id)` (with a
+`DELETE /api/sessions/{conversation_id}` route in `api.py`) is the one
+write path that deliberately does *not* fail open, unlike everything else
+above. Fail-open is right for reads and normal writes because losing chat
+history isn't a safety issue — but an explicit customer request to delete
+their data is exactly the case where silently doing nothing on a DB error
+would be worse than surfacing it: they'd otherwise be told (or assume) the
+deletion succeeded when it didn't. The exception propagates to `api.py`'s
+existing try/except → 500 handler instead. No scheduler or background job
+was added for automatic time-based expiry — this only covers on-request
+deletion; whether to also add automatic expiry is still an open question
+(see the pre-deploy checklist).
+
 **Decision:** Connection config is five env vars (`DB_HOST`, `DB_PORT`,
 `DB_NAME`, `DB_USER`, `DB_PASSWORD`), assembled into a
 `mysql+pymysql://...` URL — not committed anywhere, including this file, to
