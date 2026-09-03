@@ -1,6 +1,6 @@
 # Pickr AI
 
-An AI shopping assistant that answers product, review, and store-policy questions — a coordinator routes each query to a specialized agent, rather than one do-everything prompt.
+Online shopping tools tend to force a choice between generic, non-interactive product listings and a single chatbot trying to handle recommendations, comparisons, reviews, and policy questions all at once — with no specialization and no safeguards against making things up. Pickr AI's objective is to show that task-specialized AI agents, each grounded in the real catalog rather than a model's memory, can do meaningfully better. An AI shopping assistant that answers product, review, and store-policy questions — a coordinator routes each query to a specialized agent, rather than one do-everything prompt.
 
 ## Architecture
 
@@ -22,6 +22,18 @@ flowchart LR
 ```
 
 Guardrails (prompt-injection, off-topic, moderation, hallucination checks) wrap every routed call, and conversation history persists to a MySQL database so follow-ups resolve correctly. Routing itself is keyword-based and free; a query matching no keyword rule is classified by one small LLM call instead of defaulting blindly, so novel phrasing still lands on the right agent.
+
+## Example queries
+
+Real queries against the actual catalog, not fabricated examples:
+
+| Ask | Routes to |
+|---|---|
+| "Recommend a laptop under $600" | `ProductRecommendationAgent` — filters in-stock laptops, explains the pick |
+| "Compare Pro Book v60930 and Performance Pro v56156" | `ProductComparisonAgent` — feature + price comparison |
+| "Which one's cheaper?" | `PriceComparisonAgent` — exact $ and % delta, no LLM call |
+| "What are people saying about the Bass Boost v3811?" | `ReviewSummarizationAgent` — summarizes real reviews |
+| "What's your return policy?" | `StorePolicyAgent`, falling back to a RAG search if nothing matches exactly |
 
 ## Run it
 
@@ -51,7 +63,23 @@ python -m uvicorn app.main:app --reload
 
 Open **http://localhost:8000** and ask a question. `Ctrl+C` to stop.
 
-Chat history (remembering earlier turns in a conversation) is optional — the app runs fine without it. To enable it, also add `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` for a MySQL database to `.env`.
+Chat history (remembering earlier turns in a conversation) is optional — the app runs fine without it. To enable it, also add these to `.env`:
+
+```
+DB_HOST=<value>
+DB_PORT=<value>
+DB_NAME=<value>
+DB_USER=<value>
+DB_PASSWORD=<value>
+```
+
+LangSmith tracing (per-query observability — which agent handled a request, how many OpenAI calls it made, and how long each step took) is optional too. To enable it, also add these to `.env`:
+
+```
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=<value>
+LANGSMITH_PROJECT=<value>
+```
 
 ## Stack
 
@@ -84,4 +112,6 @@ evals/                ragas evals against live OpenAI
 
 ## Deployment
 
-Containerized for Hugging Face Spaces (Docker SDK, port 7860) — see `Dockerfile`. Not yet deployed live.
+Deployed on [Hugging Face Spaces](https://huggingface.co/spaces) via the Docker SDK (port 7860) — see `Dockerfile`. Secrets (`OPENAI_API_KEY` and, optionally, the `DB_*`/`LANGSMITH_*` variables above) are set as Space secrets rather than baked into the image; `.dockerignore` keeps `.env` and the local virtual environment out of the build entirely.
+
+**Try it live:** _add the Space URL here once it's up_.
