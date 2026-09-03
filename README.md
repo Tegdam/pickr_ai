@@ -1,3 +1,13 @@
+---
+title: Pickr Ai
+emoji: 👁
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+pinned: false
+license: mit
+---
+
 # Pickr AI
 
 Online shopping tools tend to force a choice between generic, non-interactive product listings and a single chatbot trying to handle recommendations, comparisons, reviews, and policy questions all at once — with no specialization and no safeguards against making things up. Pickr AI's objective is to show that task-specialized AI agents, each grounded in the real catalog rather than a model's memory, can do meaningfully better. An AI shopping assistant that answers product, review, and store-policy questions — a coordinator routes each query to a specialized agent, rather than one do-everything prompt.
