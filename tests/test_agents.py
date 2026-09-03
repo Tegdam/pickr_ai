@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -377,10 +378,18 @@ class TestCoordinatorRouting:
         assert result == {"response": "mocked LLM response"}
 
     def test_default_falls_back_to_recommendations(self, patched_data, mock_openai):
+        # This query matches no keyword rule, so it now makes two calls: the
+        # LLM intent classifier first (mocked here to return "recommendation"),
+        # then ProductRecommendationAgent's own generation call (the fixture's
+        # default "mocked LLM response").
+        classify_message = MagicMock(content=json.dumps({"category": "recommendation"}))
+        classify_response = MagicMock(choices=[MagicMock(message=classify_message)])
+        mock_openai.side_effect = [classify_response, mock_openai.return_value]
+
         coordinator = agents.CoordinatorAgent()
         result = coordinator.handle_query(UserQuery(query="I need a laptop under $600"))
 
-        mock_openai.assert_called_once()
+        assert mock_openai.call_count == 2
         sent = sent_messages(mock_openai)
         assert "Alpha Laptop" in sent
         assert result == {"response": "mocked LLM response"}
@@ -441,7 +450,7 @@ def assert_routed_to(spies, expected_key):
 class TestCoordinatorRoutingAccuracy:
     @pytest.mark.parametrize("query, expected_route", [
         ("reviews for Alpha Laptop", "review"),
-        ("what do people think of Beta Laptop", "recommend"),  # no "review" keyword -> default
+        ("what do people think of Beta Laptop", "recommend"),  # no keyword match -> LLM fallback
         ("which is cheaper, Alpha Laptop or Beta Laptop", "price"),
         ("what's the price difference between Alpha Laptop and Beta Laptop", "price"),
         ("what's the price of Alpha Laptop", "recommend"),  # "price" alone, no compare/diff/cost
@@ -449,10 +458,17 @@ class TestCoordinatorRoutingAccuracy:
         ("what is your return policy", "policy"),
         ("what is your warranty duration", "policy"),  # policy_type keyword without the word "policy"
         ("my laptop is broken, is it still under warranty?", "policy"),
-        ("I need a laptop under $600", "recommend"),
-        ("recommend a smart tv", "recommend"),
+        ("I need a laptop under $600", "recommend"),  # no keyword match -> LLM fallback
+        ("recommend a smart tv", "recommend"),  # no keyword match -> LLM fallback
     ])
-    def test_routes_to_expected_agent(self, patched_data, routing_spies, query, expected_route):
+    def test_routes_to_expected_agent(self, patched_data, routing_spies, mock_openai, query, expected_route):
+        # Every "recommend" case above with a no-keyword-match comment falls
+        # through to CoordinatorAgent._classify_intent; this makes that call's
+        # mocked response classify as "recommendation" so those cases still
+        # resolve the way they did before the LLM fallback existed. Cases that
+        # match a keyword rule never reach the classifier, so this has no
+        # effect on them.
+        mock_openai.return_value.choices[0].message.content = json.dumps({"category": "recommendation"})
         coordinator = agents.CoordinatorAgent()
         coordinator.handle_query(UserQuery(query=query))
         assert_routed_to(routing_spies, expected_route)
@@ -532,7 +548,7 @@ class TestCoordinatorRoutingAccuracy:
         routing_spies["policy"].assert_called_once()
         routing_spies["faq"].assert_called_once()
 
-    def test_routing_accuracy_across_labeled_dataset(self, patched_data, routing_spies):
+    def test_routing_accuracy_across_labeled_dataset(self, patched_data, routing_spies, mock_openai):
         """
         A small labeled (query -> expected agent) dataset scored as a batch,
         mirroring how routing accuracy would be reported for a real eval: run
@@ -540,6 +556,9 @@ class TestCoordinatorRoutingAccuracy:
         stopping at the first mismatch, so a regression's full blast radius
         is visible in one run.
         """
+        # "I need a laptop under $600" below has no keyword match and falls
+        # through to the LLM classifier -- see test_routes_to_expected_agent.
+        mock_openai.return_value.choices[0].message.content = json.dumps({"category": "recommendation"})
         labeled_queries = [
             ("reviews for Alpha Laptop", "review"),
             ("which is cheaper, Alpha Laptop or Beta Laptop", "price"),
@@ -565,6 +584,84 @@ class TestCoordinatorRoutingAccuracy:
 
         accuracy = correct / len(labeled_queries)
         assert accuracy == 1.0, f"routing accuracy {accuracy:.0%}, misrouted: {misrouted}"
+
+
+# No keyword in this string matches any of CoordinatorAgent's routing rules
+# (review/cheaper/price+trigger/compare/policy keywords), so every query
+# below reaches the LLM fallback classifier every time.
+NO_KEYWORD_MATCH_QUERY = "something with no keyword match at all"
+
+
+class TestLLMIntentFallback:
+    """Coverage for the LLM classifier that CoordinatorAgent falls back to
+    when no keyword rule matches a query (see _classify_intent / the else
+    branch in handle_query). Keyword-matched routing itself is covered by
+    TestCoordinatorRoutingAccuracy above and is unaffected by any of this."""
+
+    def _mock_classification(self, mock_openai, category):
+        mock_openai.return_value.choices[0].message.content = json.dumps({"category": category})
+
+    @pytest.mark.parametrize("category, expected_route", [
+        ("review", "review"),
+        ("price_comparison", "price"),
+        ("comparison", "compare"),
+        ("store_policy", "policy"),
+        ("recommendation", "recommend"),
+        ("not_a_real_category", "recommend"),  # unrecognized value fails open to recommendation
+    ])
+    def test_classification_dispatches_to_expected_agent(
+        self, patched_data, routing_spies, mock_openai, category, expected_route
+    ):
+        self._mock_classification(mock_openai, category)
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(UserQuery(query=NO_KEYWORD_MATCH_QUERY))
+        assert_routed_to(routing_spies, expected_route)
+
+    def test_classifier_error_fails_open_to_recommendation(self, patched_data, routing_spies, monkeypatch):
+        broken_chat = MagicMock()
+        broken_chat.completions.create.side_effect = RuntimeError("boom")
+        monkeypatch.setattr(agents.client, "chat", broken_chat)
+
+        coordinator = agents.CoordinatorAgent()
+        result = coordinator.handle_query(UserQuery(query=NO_KEYWORD_MATCH_QUERY))
+
+        assert_routed_to(routing_spies, "recommend")
+        assert result == {"response": "ProductRecommendationAgent handled it"}
+
+    def test_price_comparison_classification_still_falls_through_when_not_enough_products(
+        self, patched_data, routing_spies, mock_openai
+    ):
+        self._mock_classification(mock_openai, "price_comparison")
+        routing_spies["price"].return_value.compare_products.return_value = {
+            "response": routing_spies["price"].NOT_ENOUGH_PRODUCTS_MESSAGE
+        }
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(UserQuery(query=NO_KEYWORD_MATCH_QUERY))
+
+        routing_spies["price"].assert_called_once()
+        routing_spies["recommend"].assert_called_once()
+
+    def test_store_policy_classification_still_falls_through_to_faq(
+        self, patched_data, routing_spies, mock_openai
+    ):
+        self._mock_classification(mock_openai, "store_policy")
+        routing_spies["policy"].return_value.get_policy_info.return_value = {
+            "response": routing_spies["policy"].NO_MATCH_MESSAGE
+        }
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(UserQuery(query=NO_KEYWORD_MATCH_QUERY))
+
+        routing_spies["policy"].assert_called_once()
+        routing_spies["faq"].assert_called_once()
+
+    def test_keyword_match_never_calls_the_classifier(self, patched_data, routing_spies, mock_openai):
+        """Regression guard for the narrow-fallback design (see the comment on
+        _INTENT_CATEGORIES in agents.py): a query that matches a keyword rule
+        must never reach the LLM classifier, so the deterministic, free path
+        stays deterministic and free."""
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(UserQuery(query="reviews for Alpha Laptop"))
+        mock_openai.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

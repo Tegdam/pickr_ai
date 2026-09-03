@@ -17,6 +17,31 @@ matching. Rejected for now — keyword matching is free, deterministic, and easy
 to test; revisit if query phrasing in practice turns out too varied for
 substring checks to keep up with.
 
+**Revisited: LLM fallback for queries with no keyword match.** The
+alternative above was reconsidered after real limitations of pure keyword
+matching became evident (category phrasing sensitivity, novel phrasing
+falling through to a blind default). A full replacement was rejected: it
+would have meant non-deterministic behavior across the entire, already
+well-tested keyword-routing suite, and — more concretely — a new LLM call
+on every single query, including the two fully deterministic agents
+(`PriceComparisonAgent`, `StorePolicyAgent`'s keyword path) that make zero
+OpenAI calls today.
+
+Implemented instead as a narrow fallback: when none of the keyword rules
+match, `CoordinatorAgent._classify_intent` makes one `gpt-3.5-turbo` call
+(temperature 0, JSON response format, mirroring `guardrails._classify`'s
+pattern) to pick one of the same five destination categories the keyword
+rules route to, then dispatches through the same per-category logic
+(including `PriceComparisonAgent`'s and `StorePolicyAgent`'s own
+fall-through behavior). Fails open to `"recommendation"` on any error or an
+unrecognized category — the same category the keyword-only default already
+used, so a classifier hiccup degrades to prior behavior rather than
+raising. Every keyword-matched query still costs nothing extra; only the
+minority that previously fell silently to `ProductRecommendationAgent` now
+gets a reasoned classification instead. Logged via a new `via=keyword|
+llm_fallback` field on the existing `coordinator_route` log line, so how
+often the fallback actually fires is directly observable.
+
 ## ReviewSummarizationAgent
 
 **Open question (not yet implemented):** the capstone brief calls for

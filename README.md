@@ -13,10 +13,15 @@ flowchart LR
     C -->|"compare"| PRCA[ProductComparisonAgent]
     C -->|policy keyword| SPA[StorePolicyAgent]
     SPA -. no keyword match .-> FAQ["FAQAgent (RAG)"]
-    C -->|default| PRA
+    C -->|no keyword match| LLM{LLM fallback classifier}
+    LLM --> RSA
+    LLM --> PCA
+    LLM --> PRCA
+    LLM --> SPA
+    LLM --> PRA
 ```
 
-Guardrails (prompt-injection, off-topic, moderation, hallucination checks) wrap every routed call, and conversation history persists to a MySQL database so follow-ups resolve correctly.
+Guardrails (prompt-injection, off-topic, moderation, hallucination checks) wrap every routed call, and conversation history persists to a MySQL database so follow-ups resolve correctly. Routing itself is keyword-based and free; a query matching no keyword rule is classified by one small LLM call instead of defaulting blindly, so novel phrasing still lands on the right agent.
 
 ## Run it
 

@@ -2,6 +2,7 @@
 
 import chromadb  # Persistent vector store used for the FAQ agent's retrieval step.
 import hashlib  # Used to detect when the policy index is stale and needs rebuilding.
+import json  # Used to parse the LLM intent-classifier's JSON response.
 import logging  # Structured logging of CoordinatorAgent's routing decisions.
 import re  # Used to pull price constraints (e.g. "under $800") out of free-text queries.
 import time  # Used to time how long each routed agent takes to handle a query.
@@ -17,6 +18,26 @@ from .models import UserQuery
 
 
 logger = logging.getLogger(__name__)
+
+
+# Fallback intent classifier -- only consulted when none of CoordinatorAgent's
+# keyword rules match a query. Keyword routing stays the fast, free, fully
+# deterministic path for the common case; this LLM call only runs on the
+# minority of queries that would otherwise silently default to
+# ProductRecommendationAgent, e.g. novel phrasing the keyword rules don't
+# anticipate. Kept as a narrow fallback rather than replacing keyword routing
+# outright, to avoid both a new cost/latency floor on every query and
+# regression risk against the existing keyword-routing test suite.
+_INTENT_CATEGORIES = ("review", "price_comparison", "comparison", "store_policy", "recommendation")
+
+_INTENT_CLASSIFIER_SYSTEM_PROMPT = """You are an intent router for a retail shopping assistant with five specialized agents. Classify the customer's message into exactly one category and respond with ONLY a JSON object of this exact shape:
+{"category": "review" | "price_comparison" | "comparison" | "store_policy" | "recommendation"}
+
+- review: asking what customers think of a product, or for a summary of its reviews.
+- price_comparison: asking for the exact price difference between two or more named products, or which one is cheaper.
+- comparison: asking to compare two or more named products on features (not just price).
+- store_policy: asking about returns, refunds, warranty, shipping, exchanges, or other store policies.
+- recommendation: asking for a product suggestion, or anything that doesn't clearly fit the categories above."""
 
 
 def _guarded_response(response_text: str, context_text: str) -> dict:
@@ -57,6 +78,7 @@ class CoordinatorAgent:
         agent_name = "unknown"
         status = "error"
         block_reason = None
+        routed_via = "keyword"
         try:
             input_check = check_input(query.raw_query or query.query)
             if input_check["blocked"]:
@@ -91,8 +113,33 @@ class CoordinatorAgent:
                     agent_name = "FAQAgent"
                     result = FAQAgent().get_policy_info(query)
             else:
-                agent_name = "ProductRecommendationAgent"
-                result = ProductRecommendationAgent().recommend_product(query)
+                # No keyword rule matched -- rather than silently assuming this is
+                # a recommendation request, ask a small LLM classifier which of
+                # the five agent categories actually fits. Narrow, contained
+                # fallback: see the comment on _INTENT_CATEGORIES above.
+                routed_via = "llm_fallback"
+                category = self._classify_intent(query.query)
+                if category == "review":
+                    agent_name = "ReviewSummarizationAgent"
+                    result = ReviewSummarizationAgent().analyze_reviews(query)
+                elif category == "price_comparison":
+                    agent_name = "PriceComparisonAgent"
+                    result = PriceComparisonAgent().compare_products(query)
+                    if result["response"] == PriceComparisonAgent.NOT_ENOUGH_PRODUCTS_MESSAGE:
+                        agent_name = "ProductRecommendationAgent"
+                        result = ProductRecommendationAgent().recommend_product(query)
+                elif category == "comparison":
+                    agent_name = "ProductComparisonAgent"
+                    result = ProductComparisonAgent().compare_products(query)
+                elif category == "store_policy":
+                    agent_name = "StorePolicyAgent"
+                    result = StorePolicyAgent().get_policy_info(query)
+                    if result["response"] == StorePolicyAgent.NO_MATCH_MESSAGE:
+                        agent_name = "FAQAgent"
+                        result = FAQAgent().get_policy_info(query)
+                else:  # "recommendation", or the classifier failed/returned something unexpected
+                    agent_name = "ProductRecommendationAgent"
+                    result = ProductRecommendationAgent().recommend_product(query)
             status = "ok"
             return result
         finally:
@@ -100,8 +147,8 @@ class CoordinatorAgent:
             # readable in plain console output while still being greppable/parseable,
             # without coupling the root logging config to this logger's fields.
             logger.info(
-                "coordinator_route agent=%s status=%s reason=%s elapsed_ms=%.1f query=%r",
-                agent_name, status, block_reason, (time.monotonic() - start) * 1000, query.query,
+                "coordinator_route agent=%s via=%s status=%s reason=%s elapsed_ms=%.1f query=%r",
+                agent_name, routed_via, status, block_reason, (time.monotonic() - start) * 1000, query.query,
             )
 
     def _is_policy_query(self, query_lower: str) -> bool:
@@ -115,6 +162,30 @@ class CoordinatorAgent:
             p.policy_type and any(word in query_lower for word in p.policy_type.lower().split())
             for p in self.policies
         )
+
+    def _classify_intent(self, query_text: str) -> str:
+        """Ask an LLM which of the five agent categories query_text belongs to.
+        Only called when no keyword rule matched (see the else branch above).
+        Fails open to "recommendation" on any error or unexpected response --
+        the same category the pre-existing keyword-only default used, so a
+        classifier hiccup degrades to prior behavior rather than raising.
+        """
+        try:
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                response_format={"type": "json_object"},
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": _INTENT_CLASSIFIER_SYSTEM_PROMPT},
+                    {"role": "user", "content": query_text},
+                ],
+            )
+            category = json.loads(response.choices[0].message.content).get("category")
+            if category in _INTENT_CATEGORIES:
+                return category
+        except Exception:
+            logger.warning("intent classifier fallback failed; defaulting to recommendation", exc_info=True)
+        return "recommendation"
 
 
 # Implement Specialized Agents to handle specific types of queries.
