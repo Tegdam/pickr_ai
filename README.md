@@ -124,4 +124,4 @@ evals/                ragas evals against live OpenAI
 
 Deployed on [Hugging Face Spaces](https://huggingface.co/spaces) via the Docker SDK (port 7860) — see `Dockerfile`. Secrets (`OPENAI_API_KEY` and, optionally, the `DB_*`/`LANGSMITH_*` variables above) are set as Space secrets rather than baked into the image; `.dockerignore` keeps `.env` and the local virtual environment out of the build entirely.
 
-**Try it live:** _add the Space URL here once it's up_.
+**Try it live:** https://huggingface.co/spaces/TegFace/pickr-ai
