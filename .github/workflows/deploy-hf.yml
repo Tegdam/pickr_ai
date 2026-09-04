@@ -1,0 +1,19 @@
+name: Deploy to Hugging Face Space
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: hf-deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git push https://TegFace:${HF_TOKEN}@huggingface.co/spaces/TegFace/pickr-ai HEAD:main --force
