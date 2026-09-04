@@ -36,6 +36,19 @@ POLICIES = [
                 conditions="Original packaging.", timeframe="30"),
 ]
 
+# Mirrors the real catalog's shape: several rows share one policy_type
+# ("returns") but cover different product categories, distinguished only by
+# `description`. Used to test that a named product narrows to its own
+# category's row instead of matching -- or dumping -- all of them.
+POLICIES_BY_CATEGORY = [
+    StorePolicy(policy_type="returns", description="Laptop Return Policy",
+                conditions="Unopened.", timeframe="14"),
+    StorePolicy(policy_type="returns", description="Smartphone Return Policy",
+                conditions="Factory reset required.", timeframe="14"),
+    StorePolicy(policy_type="warranty", description="Standard Laptop Warranty",
+                conditions="Defects only.", timeframe="365"),
+]
+
 # Hand-picked so a "return" query has an unambiguous nearest-neighbor ranking:
 # return < warranty < shipping < exchange. Lets tests assert retrieval actually
 # narrows to the top-k, not just that *something* came back.
@@ -187,6 +200,73 @@ class TestProductRecommendationAgent:
         sent = sent_messages(mock_openai)
         assert "Gamma Phone" not in sent  # out of stock
 
+    def test_constrained_request_uses_fit_framing(self, patched_data, mock_openai):
+        agent = agents.ProductRecommendationAgent()
+        agent.recommend_product(UserQuery(query="recommend a laptop under $600"))
+
+        system_prompt = mock_openai.call_args.kwargs["messages"][0]["content"]
+        assert "fits the customer's request" in system_prompt
+
+    def test_unconstrained_browsing_does_not_use_fit_framing(self, patched_data, mock_openai):
+        """
+        Regression test: a generic "what do you carry" browse question has no
+        category/brand/price constraint, so the prompt shouldn't instruct the
+        LLM to explain why products "fit the customer's request" -- that
+        framing led it to invent specific criteria the customer never stated.
+        """
+        agent = agents.ProductRecommendationAgent()
+        agent.recommend_product(UserQuery(query="what kind of products do you carry?"))
+
+        system_prompt = mock_openai.call_args.kwargs["messages"][0]["content"]
+        assert "fits the customer's request" not in system_prompt
+        assert "browsing" in system_prompt
+
+
+# ---------------------------------------------------------------------------
+# StockAvailabilityAgent
+# ---------------------------------------------------------------------------
+
+class TestStockAvailabilityAgent:
+    def test_reports_real_stock_count_for_named_product(self, patched_data):
+        """
+        Regression test: this must come from the catalog, not an LLM guess --
+        see the incident that motivated this agent, where a recommendation
+        prompt with no stock figure in its context invented "7 in stock" for
+        a product whose real count was 173.
+        """
+        agent = agents.StockAvailabilityAgent()
+        result = agent.check_stock(UserQuery(query="how many Alpha Laptop do you have in stock?"))
+        assert "10 available" in result["response"]
+
+    def test_reports_out_of_stock(self, patched_data):
+        agent = agents.StockAvailabilityAgent()
+        result = agent.check_stock(UserQuery(query="is the Gamma Phone in stock?"))
+        assert "out of stock" in result["response"].lower()
+
+    def test_no_product_named_returns_constant(self, patched_data):
+        agent = agents.StockAvailabilityAgent()
+        result = agent.check_stock(UserQuery(query="what do you have in stock?"))
+        assert result["response"] == agents.StockAvailabilityAgent.NO_PRODUCT_MATCH_MESSAGE
+
+    def test_reports_each_matched_product(self, patched_data):
+        agent = agents.StockAvailabilityAgent()
+        result = agent.check_stock(UserQuery(query="stock levels for Alpha Laptop and Beta Laptop?"))
+        assert "Alpha Laptop is in stock -- 10 available." in result["response"]
+        assert "Beta Laptop is in stock -- 5 available." in result["response"]
+
+
+# ---------------------------------------------------------------------------
+# CapabilitiesAgent
+# ---------------------------------------------------------------------------
+
+class TestCapabilitiesAgent:
+    def test_returns_static_description_without_calling_llm(self, mock_openai):
+        agent = agents.CapabilitiesAgent()
+        result = agent.describe_capabilities(UserQuery(query="what are you?"))
+
+        mock_openai.assert_not_called()
+        assert result == {"response": agents.CapabilitiesAgent.RESPONSE}
+
 
 # ---------------------------------------------------------------------------
 # PriceComparisonAgent
@@ -316,6 +396,77 @@ class TestStorePolicyAndFAQ:
         mock_openai.assert_not_called()
         assert result["response"] == agents.FAQAgent.NO_MATCH_MESSAGE
 
+    def test_narrows_to_product_category_when_multiple_rows_share_a_policy_type(self, monkeypatch):
+        """
+        Regression test for the Maxi Phone v54822 / Pro Book v60930 case: the
+        catalog has one "returns" row per product category, distinguished
+        only by description. When CoordinatorAgent has resolved the query to
+        a specific category, only that category's row should come back.
+        """
+        monkeypatch.setattr(agents, "load_store_policies", lambda: list(POLICIES_BY_CATEGORY))
+        agent = agents.StorePolicyAgent()
+        result = agent.get_policy_info(
+            UserQuery(query="what is the return policy for Maxi Phone v54822?", product_category="smartphone")
+        )
+        assert "Smartphone Return Policy" in result["response"]
+        assert "Laptop Return Policy" not in result["response"]
+
+    def test_no_product_category_returns_every_matching_row(self, monkeypatch):
+        monkeypatch.setattr(agents, "load_store_policies", lambda: list(POLICIES_BY_CATEGORY))
+        agent = agents.StorePolicyAgent()
+        result = agent.get_policy_info(UserQuery(query="what is your return policy"))
+        assert "Smartphone Return Policy" in result["response"]
+        assert "Laptop Return Policy" in result["response"]
+
+    def test_narrowing_falls_back_to_full_set_if_category_matches_nothing(self, monkeypatch):
+        """Category names aren't guaranteed to appear in a policy's description
+        verbatim -- if narrowing would eliminate every match, keep the full
+        set rather than incorrectly reporting no policy at all."""
+        monkeypatch.setattr(agents, "load_store_policies", lambda: list(POLICIES_BY_CATEGORY))
+        agent = agents.StorePolicyAgent()
+        result = agent.get_policy_info(
+            UserQuery(query="what is the return policy for my gadget?", product_category="gadget")
+        )
+        assert "Smartphone Return Policy" in result["response"]
+        assert "Laptop Return Policy" in result["response"]
+
+    def test_product_category_is_folded_into_semantic_search_text(
+        self, patched_data, mock_embeddings, in_memory_chroma, mock_openai
+    ):
+        """FAQAgent's retrieval should see the resolved category even though
+        the literal question never says it, so semantic search can connect a
+        named SKU to its category's policy chunk."""
+        agent = agents.FAQAgent()
+        agent.get_policy_info(
+            UserQuery(query="what is the return policy for Maxi Phone v54822?", product_category="smartphone")
+        )
+
+        last_search_input = mock_embeddings.call_args.kwargs["input"]
+        assert any("smartphone" in text for text in last_search_input)
+
+
+class TestPolicyTypeMatches:
+    """Unit coverage for the shared _policy_type_matches helper used by both
+    CoordinatorAgent._is_policy_query and StorePolicyAgent.get_policy_info."""
+
+    def test_matches_singular_query_against_plural_policy_type(self):
+        assert agents._policy_type_matches("returns", "what is the return policy") is True
+
+    def test_matches_plural_query_against_singular_policy_type(self):
+        assert agents._policy_type_matches("return", "what is your returns policy") is True
+
+    def test_multiword_type_does_not_match_on_one_word_alone(self):
+        """
+        Regression test: "price_matching" must not match a query that only
+        contains "price" (e.g. "what's the price of this laptop") -- word-by-word
+        matching on that split would misroute ordinary price questions into
+        store-policy handling.
+        """
+        assert agents._policy_type_matches("price_matching", "what's the price of this laptop") is False
+
+    def test_multiword_type_matches_full_phrase(self):
+        assert agents._policy_type_matches("price_matching", "what are your price matching rules") is True
+
 
 # ---------------------------------------------------------------------------
 # CoordinatorAgent routing
@@ -414,6 +565,8 @@ ROUTES = {
     "policy": ("StorePolicyAgent", "get_policy_info"),
     "faq": ("FAQAgent", "get_policy_info"),
     "recommend": ("ProductRecommendationAgent", "recommend_product"),
+    "capabilities": ("CapabilitiesAgent", "describe_capabilities"),
+    "stock": ("StockAvailabilityAgent", "check_stock"),
 }
 
 
@@ -423,6 +576,7 @@ def routing_spies(monkeypatch):
     it was constructed/called, decoupled from that agent's real behavior."""
     real_no_match_message = agents.StorePolicyAgent.NO_MATCH_MESSAGE
     real_not_enough_products_message = agents.PriceComparisonAgent.NOT_ENOUGH_PRODUCTS_MESSAGE
+    real_no_product_match_message = agents.StockAvailabilityAgent.NO_PRODUCT_MATCH_MESSAGE
 
     spies = {}
     for key, (class_name, method_name) in ROUTES.items():
@@ -433,6 +587,8 @@ def routing_spies(monkeypatch):
             spy_cls.NO_MATCH_MESSAGE = real_no_match_message
         if class_name == "PriceComparisonAgent":
             spy_cls.NOT_ENOUGH_PRODUCTS_MESSAGE = real_not_enough_products_message
+        if class_name == "StockAvailabilityAgent":
+            spy_cls.NO_PRODUCT_MATCH_MESSAGE = real_no_product_match_message
         monkeypatch.setattr(agents, class_name, spy_cls)
         spies[key] = spy_cls
     return spies
@@ -460,6 +616,11 @@ class TestCoordinatorRoutingAccuracy:
         ("my laptop is broken, is it still under warranty?", "policy"),
         ("I need a laptop under $600", "recommend"),  # no keyword match -> LLM fallback
         ("recommend a smart tv", "recommend"),  # no keyword match -> LLM fallback
+        ("what are you?", "capabilities"),
+        ("what can you do?", "capabilities"),
+        ("how can you help me?", "capabilities"),
+        ("is the Alpha Laptop in stock?", "stock"),
+        ("how many Alpha Laptop are available?", "stock"),
     ])
     def test_routes_to_expected_agent(self, patched_data, routing_spies, mock_openai, query, expected_route):
         # Every "recommend" case above with a no-keyword-match comment falls
@@ -505,6 +666,31 @@ class TestCoordinatorRoutingAccuracy:
         routing_spies["recommend"].assert_called_once()
         assert result == {"response": "ProductRecommendationAgent handled it"}
 
+    def test_stock_query_without_named_product_falls_through_to_recommend(self, patched_data, routing_spies):
+        """
+        Regression coverage: "what kind of products do you carry in stock?"
+        names no specific product, so StockAvailabilityAgent can't answer it --
+        it should fall back to browsing recommendations rather than dead-end
+        on "please mention a specific product".
+        """
+        routing_spies["stock"].return_value.check_stock.return_value = {
+            "response": routing_spies["stock"].NO_PRODUCT_MATCH_MESSAGE
+        }
+        coordinator = agents.CoordinatorAgent()
+        result = coordinator.handle_query(UserQuery(query="what kind of products do you carry in stock?"))
+
+        routing_spies["stock"].assert_called_once()
+        routing_spies["recommend"].assert_called_once()
+        assert result == {"response": "ProductRecommendationAgent handled it"}
+
+    def test_stock_query_with_named_product_does_not_fall_through_to_recommend(self, patched_data, routing_spies):
+        coordinator = agents.CoordinatorAgent()
+        result = coordinator.handle_query(UserQuery(query="is the Alpha Laptop in stock?"))
+
+        routing_spies["stock"].assert_called_once()
+        routing_spies["recommend"].assert_not_called()
+        assert result == {"response": "StockAvailabilityAgent handled it"}
+
     def test_price_comparison_match_does_not_fall_through_to_recommend(self, patched_data, routing_spies):
         coordinator = agents.CoordinatorAgent()
         result = coordinator.handle_query(
@@ -533,6 +719,27 @@ class TestCoordinatorRoutingAccuracy:
         routing_spies["policy"].assert_called_once()
         routing_spies["faq"].assert_not_called()
         assert result == {"response": "StorePolicyAgent handled it"}
+
+    def test_policy_query_naming_a_product_is_augmented_with_its_category(self, patched_data, routing_spies):
+        """
+        Regression coverage for the Maxi Phone v54822 / Pro Book v60930 case:
+        CoordinatorAgent should resolve a named product to its category before
+        handing the query to StorePolicyAgent, so downstream matching/retrieval
+        can connect a SKU to the policy that actually covers it.
+        """
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(UserQuery(query="what is the return policy for Alpha Laptop?"))
+
+        routing_spies["policy"].assert_called_once()
+        passed_query = routing_spies["policy"].return_value.get_policy_info.call_args[0][0]
+        assert passed_query.product_category == "laptop"
+
+    def test_policy_query_without_named_product_is_not_augmented(self, patched_data, routing_spies):
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(UserQuery(query="what is your return policy"))
+
+        passed_query = routing_spies["policy"].return_value.get_policy_info.call_args[0][0]
+        assert passed_query.product_category is None
 
     def test_expired_warranty_phrasing_routes_through_policy_to_faq(self, patched_data, routing_spies):
         """Regression coverage at the routing level: an expired-warranty query
@@ -607,6 +814,8 @@ class TestLLMIntentFallback:
         ("comparison", "compare"),
         ("store_policy", "policy"),
         ("recommendation", "recommend"),
+        ("capabilities", "capabilities"),
+        ("stock_availability", "stock"),
         ("not_a_real_category", "recommend"),  # unrecognized value fails open to recommendation
     ])
     def test_classification_dispatches_to_expected_agent(
@@ -639,6 +848,19 @@ class TestLLMIntentFallback:
         coordinator.handle_query(UserQuery(query=NO_KEYWORD_MATCH_QUERY))
 
         routing_spies["price"].assert_called_once()
+        routing_spies["recommend"].assert_called_once()
+
+    def test_stock_availability_classification_still_falls_through_when_no_product_named(
+        self, patched_data, routing_spies, mock_openai
+    ):
+        self._mock_classification(mock_openai, "stock_availability")
+        routing_spies["stock"].return_value.check_stock.return_value = {
+            "response": routing_spies["stock"].NO_PRODUCT_MATCH_MESSAGE
+        }
+        coordinator = agents.CoordinatorAgent()
+        coordinator.handle_query(UserQuery(query=NO_KEYWORD_MATCH_QUERY))
+
+        routing_spies["stock"].assert_called_once()
         routing_spies["recommend"].assert_called_once()
 
     def test_store_policy_classification_still_falls_through_to_faq(

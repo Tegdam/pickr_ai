@@ -13,6 +13,11 @@ class UserQuery(BaseModel):
     # actually typed rather than an LLM-rewritten version. Defaults to None so
     # every existing caller that passes only `query` is unaffected.
     raw_query: Optional[str] = None
+    # Set by CoordinatorAgent when the query names a specific catalog product,
+    # e.g. "smartphone" for "Maxi Phone v54822". Lets StorePolicyAgent/FAQAgent
+    # narrow to that product's category instead of matching every policy of a
+    # given type (or none, when the query only names a SKU, not a category).
+    product_category: Optional[str] = None
 
 
 # Define the ChatQuery Model (the /api/query request body: a query plus which
