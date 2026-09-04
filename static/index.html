@@ -86,8 +86,20 @@
     overflow-y: auto;
   }
 
+  .session-row {
+    display: flex;
+    align-items: stretch;
+    border-radius: 3px;
+  }
+
+  .session-row:hover { background: rgba(31, 36, 33, 0.06); }
+  .session-row.active { background: var(--ink); }
+  .session-row.active .session-preview,
+  .session-row.active .session-time { color: var(--paper); }
+
   .session-item {
-    width: 100%;
+    flex: 1;
+    min-width: 0;
     text-align: left;
     background: transparent;
     border: none;
@@ -97,10 +109,34 @@
     font-family: "IBM Plex Mono", monospace;
   }
 
-  .session-item:hover { background: rgba(31, 36, 33, 0.06); }
-  .session-item.active { background: var(--ink); }
-  .session-item.active .session-preview,
-  .session-item.active .session-time { color: var(--paper); }
+  /* Overrides the global button:hover accent color (higher specificity)
+     so hovering the row shows the intended subtle gray, not red. */
+  .session-row:hover .session-item { background: transparent; }
+
+  .session-delete {
+    flex: none;
+    align-self: center;
+    background: transparent;
+    border: none;
+    color: var(--ink-muted);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.85rem;
+    line-height: 1;
+    padding: 0.3rem 0.55rem;
+    margin-right: 0.25rem;
+    border-radius: 3px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+  }
+
+  .session-row:hover .session-delete,
+  .session-delete:focus-visible { opacity: 1; }
+
+  .session-delete:hover { background: var(--accent); color: var(--paper); }
+
+  .session-row.active .session-delete { color: var(--paper); opacity: 1; }
+  .session-row.active .session-delete:hover { background: var(--accent); }
 
   .session-preview {
     font-size: 0.8rem;
@@ -447,8 +483,8 @@
   }
 
   function highlightActiveSession() {
-    sessionList.querySelectorAll(".session-item").forEach((btn) => {
-      btn.classList.toggle("active", btn.dataset.conversationId === conversationId);
+    sessionList.querySelectorAll(".session-row").forEach((row) => {
+      row.classList.toggle("active", row.dataset.conversationId === conversationId);
     });
   }
 
@@ -464,23 +500,50 @@
     }
 
     for (const s of sessions) {
-      const li = document.createElement("li");
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "session-item";
-      btn.dataset.conversationId = s.conversation_id;
-      btn.innerHTML = `
+      const row = document.createElement("li");
+      row.className = "session-row";
+      row.dataset.conversationId = s.conversation_id;
+
+      const openButton = document.createElement("button");
+      openButton.type = "button";
+      openButton.className = "session-item";
+      openButton.innerHTML = `
         <div class="session-preview"></div>
         <div class="session-time"></div>
       `;
-      btn.querySelector(".session-preview").textContent = s.preview || "(no message)";
-      btn.querySelector(".session-time").textContent = formatTimestamp(s.last_activity);
-      btn.addEventListener("click", () => openSession(s.conversation_id));
-      li.appendChild(btn);
-      sessionList.appendChild(li);
+      openButton.querySelector(".session-preview").textContent = s.preview || "(no message)";
+      openButton.querySelector(".session-time").textContent = formatTimestamp(s.last_activity);
+      openButton.addEventListener("click", () => openSession(s.conversation_id));
+
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "session-delete";
+      deleteButton.setAttribute("aria-label", "Delete session");
+      deleteButton.textContent = "×";
+      deleteButton.addEventListener("click", () => deleteSession(s.conversation_id, row));
+
+      row.appendChild(openButton);
+      row.appendChild(deleteButton);
+      sessionList.appendChild(row);
     }
 
     highlightActiveSession();
+  }
+
+  async function deleteSession(id, row) {
+    const deleteButton = row.querySelector(".session-delete");
+    deleteButton.disabled = true;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`Request failed (${res.status})`);
+    } catch (err) {
+      deleteButton.disabled = false;
+      return;
+    }
+
+    row.remove();
+    if (!sessionList.children.length) renderSessions([]);
+    if (id === conversationId) startNewSession();
   }
 
   async function loadSessions() {
@@ -509,14 +572,16 @@
     input.focus();
   }
 
-  newSessionButton.addEventListener("click", () => {
+  function startNewSession() {
     conversationId = crypto.randomUUID();
     entries.innerHTML = "";
     receipt.classList.remove("visible");
     setReceiptHeader(conversationId);
     highlightActiveSession();
     input.focus();
-  });
+  }
+
+  newSessionButton.addEventListener("click", startNewSession);
 
   function typeOut(responseBody, text) {
     responseBody.classList.remove("printing");
