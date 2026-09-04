@@ -28,15 +28,20 @@ logger = logging.getLogger(__name__)
 # anticipate. Kept as a narrow fallback rather than replacing keyword routing
 # outright, to avoid both a new cost/latency floor on every query and
 # regression risk against the existing keyword-routing test suite.
-_INTENT_CATEGORIES = ("review", "price_comparison", "comparison", "store_policy", "recommendation")
+_INTENT_CATEGORIES = (
+    "review", "price_comparison", "comparison", "store_policy",
+    "recommendation", "capabilities", "stock_availability",
+)
 
-_INTENT_CLASSIFIER_SYSTEM_PROMPT = """You are an intent router for a retail shopping assistant with five specialized agents. Classify the customer's message into exactly one category and respond with ONLY a JSON object of this exact shape:
-{"category": "review" | "price_comparison" | "comparison" | "store_policy" | "recommendation"}
+_INTENT_CLASSIFIER_SYSTEM_PROMPT = """You are an intent router for a retail shopping assistant with seven specialized agents. Classify the customer's message into exactly one category and respond with ONLY a JSON object of this exact shape:
+{"category": "review" | "price_comparison" | "comparison" | "store_policy" | "recommendation" | "capabilities" | "stock_availability"}
 
 - review: asking what customers think of a product, or for a summary of its reviews.
 - price_comparison: asking for the exact price difference between two or more named products, or which one is cheaper.
 - comparison: asking to compare two or more named products on features (not just price).
 - store_policy: asking about returns, refunds, warranty, shipping, exchanges, or other store policies.
+- stock_availability: asking whether a specific product is in stock, or how many units are available.
+- capabilities: asking what the assistant itself is, what it can do, or how to use it -- not about a product or policy.
 - recommendation: asking for a product suggestion, or anything that doesn't clearly fit the categories above."""
 
 
@@ -50,6 +55,25 @@ def _guarded_response(response_text: str, context_text: str) -> dict:
     if output_check["blocked"]:
         return {"response": output_check["message"]}
     return {"response": response_text}
+
+
+def _policy_type_matches(policy_type: str, query_lower: str) -> bool:
+    """True if policy_type (e.g. "returns", "price_matching") is referenced in
+    query_lower.
+
+    Matches on the whole underscore-joined phrase plus its singular/plural
+    counterpart -- not word-by-word -- for two reasons: (1) word-by-word
+    matching on a multi-word type like "price_matching" would spuriously
+    match any query containing just "price" on its own; (2) catalog policy
+    types are stored in whichever of singular/plural read naturally in CSV
+    ("returns", "warranty"), but customers phrase questions with either
+    ("return policy", "returns policy"), so the comparison must accept both.
+    """
+    phrase = policy_type.lower().replace("_", " ")
+    if phrase in query_lower:
+        return True
+    variant = phrase[:-1] if phrase.endswith("s") else phrase + "s"
+    return variant in query_lower
 
 
 # Define the CoordinatorAgent Class
@@ -106,16 +130,26 @@ class CoordinatorAgent:
             elif "compare" in query_lower:
                 agent_name = "ProductComparisonAgent"
                 result = ProductComparisonAgent().compare_products(query)
+            elif self._is_capabilities_query(query_lower):
+                agent_name = "CapabilitiesAgent"
+                result = CapabilitiesAgent().describe_capabilities(query)
+            elif self._is_stock_query(query_lower):
+                agent_name = "StockAvailabilityAgent"
+                result = StockAvailabilityAgent().check_stock(query)
+                if result["response"] == StockAvailabilityAgent.NO_PRODUCT_MATCH_MESSAGE:
+                    agent_name = "ProductRecommendationAgent"
+                    result = ProductRecommendationAgent().recommend_product(query)
             elif self._is_policy_query(query_lower):
                 agent_name = "StorePolicyAgent"
-                result = StorePolicyAgent().get_policy_info(query)
+                policy_query = self._augment_query_with_category(query)
+                result = StorePolicyAgent().get_policy_info(policy_query)
                 if result["response"] == StorePolicyAgent.NO_MATCH_MESSAGE:
                     agent_name = "FAQAgent"
-                    result = FAQAgent().get_policy_info(query)
+                    result = FAQAgent().get_policy_info(policy_query)
             else:
                 # No keyword rule matched -- rather than silently assuming this is
                 # a recommendation request, ask a small LLM classifier which of
-                # the five agent categories actually fits. Narrow, contained
+                # the seven agent categories actually fits. Narrow, contained
                 # fallback: see the comment on _INTENT_CATEGORIES above.
                 routed_via = "llm_fallback"
                 category = self._classify_intent(query.query)
@@ -131,12 +165,22 @@ class CoordinatorAgent:
                 elif category == "comparison":
                     agent_name = "ProductComparisonAgent"
                     result = ProductComparisonAgent().compare_products(query)
+                elif category == "capabilities":
+                    agent_name = "CapabilitiesAgent"
+                    result = CapabilitiesAgent().describe_capabilities(query)
+                elif category == "stock_availability":
+                    agent_name = "StockAvailabilityAgent"
+                    result = StockAvailabilityAgent().check_stock(query)
+                    if result["response"] == StockAvailabilityAgent.NO_PRODUCT_MATCH_MESSAGE:
+                        agent_name = "ProductRecommendationAgent"
+                        result = ProductRecommendationAgent().recommend_product(query)
                 elif category == "store_policy":
                     agent_name = "StorePolicyAgent"
-                    result = StorePolicyAgent().get_policy_info(query)
+                    policy_query = self._augment_query_with_category(query)
+                    result = StorePolicyAgent().get_policy_info(policy_query)
                     if result["response"] == StorePolicyAgent.NO_MATCH_MESSAGE:
                         agent_name = "FAQAgent"
-                        result = FAQAgent().get_policy_info(query)
+                        result = FAQAgent().get_policy_info(policy_query)
                 else:  # "recommendation", or the classifier failed/returned something unexpected
                     agent_name = "ProductRecommendationAgent"
                     result = ProductRecommendationAgent().recommend_product(query)
@@ -159,12 +203,57 @@ class CoordinatorAgent:
         if "policy" in query_lower:
             return True
         return any(
-            p.policy_type and any(word in query_lower for word in p.policy_type.lower().split())
+            p.policy_type and _policy_type_matches(p.policy_type, query_lower)
             for p in self.policies
         )
 
+    # Short, self-referential phrasings a first-time user asks about the
+    # assistant itself rather than about a product or policy. Deliberately
+    # tight (not "help" alone, not "how does this work") to avoid swallowing
+    # genuine product/support questions that happen to share a few words.
+    _CAPABILITY_PHRASES = (
+        "what are you", "who are you", "what do you do", "what can you do",
+        "how can you help", "how do you help", "what do you help with",
+        "how do i use this", "how do you use this", "what should i ask you",
+        "what kind of questions can you answer",
+    )
+
+    def _is_capabilities_query(self, query_lower: str) -> bool:
+        """True if the query is asking what the assistant is or can do, not
+        about a product or policy."""
+        return any(phrase in query_lower for phrase in self._CAPABILITY_PHRASES)
+
+    def _is_stock_query(self, query_lower: str) -> bool:
+        """True if the query is asking about product availability/quantity."""
+        return "stock" in query_lower or "availab" in query_lower
+
+    def _match_named_product(self, query_lower: str):
+        """Return the first catalog product whose name appears in the query, if any."""
+        return next(
+            (p for p in self.products if p.name and p.name.lower() in query_lower), None
+        )
+
+    def _augment_query_with_category(self, query: UserQuery) -> UserQuery:
+        """
+        If the query names a specific catalog product, attach that product's
+        category so StorePolicyAgent/FAQAgent can narrow to the right
+        product-specific policy -- e.g. resolve "Maxi Phone v54822" to
+        "smartphone" so a return-policy question about it matches the
+        Smartphone Return Policy specifically, not every return policy (or
+        none, since neither agent otherwise has any way to connect a SKU to
+        its category on its own).
+        """
+        matched_product = self._match_named_product(query.query.lower())
+        if not matched_product or not matched_product.category:
+            return query
+        return UserQuery(
+            query=query.query,
+            raw_query=query.raw_query or query.query,
+            product_category=matched_product.category.lower(),
+        )
+
     def _classify_intent(self, query_text: str) -> str:
-        """Ask an LLM which of the five agent categories query_text belongs to.
+        """Ask an LLM which of the seven agent categories query_text belongs to.
         Only called when no keyword rule matched (see the else branch above).
         Fails open to "recommendation" on any error or unexpected response --
         the same category the pre-existing keyword-only default used, so a
@@ -256,6 +345,7 @@ class ProductRecommendationAgent:
         category = self._match_category(query_lower)
         brand = self._match_brand(query_lower)
         max_price = self._match_price_ceiling(query_lower)
+        has_constraints = bool(category or brand or max_price is not None)
 
         context_lines = self.shortlist_context(category, brand, max_price)
         if not context_lines:
@@ -263,10 +353,23 @@ class ProductRecommendationAgent:
 
         product_details = "\n".join(context_lines)
 
+        # Only frame this as "fits your request" when the customer actually
+        # stated a category/brand/price constraint. Applying that framing to
+        # a generic browse question (e.g. "what do you carry?") led the LLM to
+        # invent a specific need the customer never mentioned, so browsing
+        # gets a plainer, non-presumptive prompt instead.
+        system_prompt = (
+            "You are a helpful shopping assistant. Recommend products only from the provided shortlist, "
+            "and briefly explain why each recommended product fits the customer's request."
+            if has_constraints else
+            "You are a helpful shopping assistant. The customer is browsing without a specific request, "
+            "so give a brief, helpful overview of the shortlist below without inventing criteria they didn't mention."
+        )
+
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a helpful shopping assistant. Recommend products only from the provided shortlist, and briefly explain why each recommended product fits the customer's request."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Customer request: {query.query}\n\nShortlist of matching products:\n{product_details}"},
             ],
         )
@@ -312,6 +415,60 @@ class ProductRecommendationAgent:
         """Extract a price ceiling from phrasing like 'under $800' or 'less than 500'."""
         match = re.search(r"(?:under|below|less than|cheaper than)\s*\$?\s*(\d+(?:\.\d+)?)", query_lower)
         return float(match.group(1)) if match else None
+
+
+# Stock Availability Agent
+class StockAvailabilityAgent:
+    NO_PRODUCT_MATCH_MESSAGE = "Please mention a specific product so I can check its stock."
+
+    def __init__(self):
+        self.products = load_products()
+
+    def check_stock(self, query: UserQuery):
+        """
+        Report real stock counts for named products, straight from the
+        catalog. Deterministic (no LLM call) -- an "in stock" / "how many"
+        question has one factual answer, and asking an LLM to phrase it from
+        a context that (elsewhere in this app) doesn't even include the stock
+        number is exactly how a fabricated count like "7" (actual: 173) gets
+        served with confidence. This agent can't invent a number because it
+        never generates text; it only formats p.stock.
+        """
+        query_lower = query.query.lower()
+        matched = [p for p in self.products if p.name and p.name.lower() in query_lower]
+
+        if not matched:
+            return {"response": self.NO_PRODUCT_MATCH_MESSAGE}
+
+        return {"response": "\n".join(self._stock_line(p) for p in matched)}
+
+    def _stock_line(self, product) -> str:
+        if not product.stock or product.stock <= 0:
+            return f"{product.name} is currently out of stock."
+        return f"{product.name} is in stock -- {product.stock} available."
+
+
+# Capabilities Agent
+class CapabilitiesAgent:
+    """
+    Answers "what are you" / "what can you do" style questions about the
+    assistant itself. Deterministic (no LLM call): this is a fixed
+    description of the app's own scope, not something that varies with
+    catalog/policy data, so there's nothing to generate or ground.
+    """
+
+    RESPONSE = (
+        "I'm Pickr's shopping assistant. I can help you:\n"
+        "- Find and recommend products by category, brand, or price\n"
+        "- Compare products or prices\n"
+        "- Summarize what other customers said in reviews\n"
+        "- Check whether a product is in stock\n"
+        "- Answer questions about store policies (returns, warranty, shipping, exchanges, price matching, financing)\n\n"
+        "Try asking something like \"recommend a laptop under $800\" or \"what's the return policy for smartphones?\""
+    )
+
+    def describe_capabilities(self, query: UserQuery):
+        return {"response": self.RESPONSE}
 
 
 # Product Comparison Agent
@@ -427,8 +584,22 @@ class StorePolicyAgent:
         query_lower = self.EXPIRED_WARRANTY_PATTERN.sub("", query.query.lower())
         matched = [
             p for p in self.policies
-            if p.policy_type and any(word in query_lower for word in p.policy_type.lower().split())
+            if p.policy_type and _policy_type_matches(p.policy_type, query_lower)
         ]
+
+        # A policy_type like "returns" covers every product category (laptop,
+        # smartphone, TV, speaker...) as separate rows sharing that same
+        # type. When the query named a specific product, CoordinatorAgent
+        # resolves it to a category beforehand (query.product_category) --
+        # narrow to just the row(s) for that category so e.g. a Maxi Phone
+        # return question doesn't get every return policy dumped together.
+        # If narrowing would eliminate every match, keep the full set rather
+        # than dropping to "no match" -- category names aren't guaranteed to
+        # appear verbatim in a policy's description.
+        if query.product_category and matched:
+            narrowed = [p for p in matched if query.product_category in (p.description or "").lower()]
+            if narrowed:
+                matched = narrowed
 
         # Format and return the matching policy details
         if not matched:
@@ -521,7 +692,17 @@ class FAQAgent:
         instead of requiring an exact policy_type word in the query or stuffing every policy
         into the prompt.
         """
-        relevant_chunks = self.index.search(query.query, k=3)
+        # When CoordinatorAgent resolved a named product to its category
+        # (query.product_category), fold that into the text used for
+        # retrieval only -- e.g. "return policy for Maxi Phone v54822"
+        # becomes semantically closer to the "Smartphone Return Policy"
+        # chunk even though "smartphone" never appears in the question
+        # itself. The literal customer question (query.query) is still what
+        # gets shown to the LLM below, so the answer's phrasing stays natural.
+        search_text = query.query
+        if query.product_category:
+            search_text = f"{query.query} ({query.product_category})"
+        relevant_chunks = self.index.search(search_text, k=3)
 
         if not relevant_chunks:
             return {"response": self.NO_MATCH_MESSAGE}
