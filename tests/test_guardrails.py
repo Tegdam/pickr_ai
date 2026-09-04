@@ -1,3 +1,10 @@
+# Tests for app/guardrails.py in isolation: which classifier verdict maps to
+# which block reason, and the fail-open behavior on infrastructure errors.
+# Both OpenAI calls (the classifier and the moderation endpoint) are stubbed,
+# so these assert the wiring around the checks rather than the accuracy of
+# the models themselves. How the guardrails hook into routing is covered in
+# test_agents.py.
+
 from unittest.mock import MagicMock
 
 import pytest

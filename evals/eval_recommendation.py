@@ -1,3 +1,12 @@
+# ragas eval for ProductRecommendationAgent, scored on correctness,
+# faithfulness, and relevancy against evals/data/recommendation_evals.json.
+#
+#     python -m evals.eval_recommendation
+#
+# Unlike tests/, this makes real API calls -- the agent under test runs live,
+# and gpt-4o grades it -- so it costs money and is run deliberately rather
+# than in CI.
+
 from dotenv import load_dotenv
 from ragas.metrics import AspectCritic, Faithfulness, ResponseRelevancy
 from ragas.llms import LangchainLLMWrapper

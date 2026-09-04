@@ -1,3 +1,8 @@
+# Tests for chat history persistence, follow-up condensation, and the
+# per-turn orchestration in app/conversation.py. The database is a real
+# SQLite engine (see the sqlite_db fixture) rather than a mock, so the SQL
+# itself is exercised; only the OpenAI calls are stubbed.
+
 from unittest.mock import MagicMock
 
 import pytest

@@ -1,3 +1,8 @@
+# HTTP-layer tests: status codes, request validation, and that internal
+# errors don't leak out to the client. app.conversation is mocked throughout,
+# so these never touch OpenAI, the database, or the agents -- what those do
+# is covered in test_conversation.py and test_agents.py.
+
 from unittest.mock import MagicMock
 
 import pytest

@@ -1,3 +1,12 @@
+# ragas eval for ProductComparisonAgent, scored on correctness,
+# faithfulness, and relevancy against evals/data/comparison_evals.json.
+#
+#     python -m evals.eval_comparison
+#
+# Unlike tests/, this makes real API calls -- the agent under test runs live,
+# and gpt-4o grades it -- so it costs money and is run deliberately rather
+# than in CI.
+
 from dotenv import load_dotenv
 from ragas.metrics import AspectCritic, Faithfulness, ResponseRelevancy
 from ragas.llms import LangchainLLMWrapper
