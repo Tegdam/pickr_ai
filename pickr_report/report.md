@@ -50,7 +50,7 @@ invented.
 **Key features.**
 
 - **Query routing.** A `CoordinatorAgent` classifies each incoming query
-  and routes it to one of six specialized agents, rather than handling
+  and routes it to one of eight specialized agents, rather than handling
   every request with one general-purpose prompt.
 - **Product recommendations.** Filters the catalog by category, brand, and
   price ceiling extracted from the query, then has the LLM select and
@@ -68,7 +68,18 @@ invented.
 - **Store policy and FAQ.** Answers return, refund, warranty, and shipping
   questions via an exact-match policy lookup, falling back to a
   retrieval-augmented (RAG) search over the store policy set for questions
-  that don't use the exact policy keywords.
+  that don't use the exact policy keywords. Because the catalog holds one
+  policy row per product category (a separate return policy for laptops,
+  smartphones, TVs, and speakers), a query naming a specific product is
+  first resolved to that product's category, so a question about one SKU
+  reaches the policy that actually governs it.
+- **Stock availability.** Reports whether a named product is in stock and
+  how many units remain, read directly from the catalog without an LLM
+  call — a factual quantity with exactly one correct answer.
+- **Assistant self-description.** Answers "what are you?" / "what can you
+  do?" with a fixed description of the assistant's own scope, so a
+  first-time user can discover what the system handles rather than being
+  turned away by the off-topic guardrail.
 - **Safety guardrails.** Every query is checked for prompt injection and
   off-topic intent before routing, and every LLM-generated answer is
   checked against the context it was given for hallucination before being
@@ -134,16 +145,20 @@ a follow-up:
    not the rewritten version, so a rewrite can't inadvertently soften or
    obscure something the guardrail should catch. A flagged message never
    reaches an agent.
-5. `CoordinatorAgent` routes the (rewritten) query to one of six
-   specialized agents by keyword priority.
+5. `CoordinatorAgent` routes the (rewritten) query to one of eight
+   specialized agents by keyword priority. If the query names a specific
+   catalog product, the coordinator also resolves it to that product's
+   category at this point, so a policy question about a single SKU can be
+   matched against the policy covering its category.
 6. An LLM-generating agent builds its own grounded context — a filtered
    product shortlist, the specific products named in the query, a product's
    review text, or policy chunks retrieved via RAG — makes one OpenAI call,
    and passes its own response back through an output guardrail that checks
    it for hallucination against that same context before it's allowed to
-   reach the customer. The two fully deterministic agents (exact-match
-   store policy lookup, price-delta computation) skip this step since
-   there's no generated text to check.
+   reach the customer. The four fully deterministic agents (exact-match
+   store policy lookup, price-delta computation, stock lookup, and the
+   assistant's own self-description) skip this step since there's no
+   generated text to check.
 7. The exchange (the customer's original message and the final answer) is
    persisted as one row pair, and returned to the customer.
 
@@ -160,7 +175,7 @@ flowchart TD
     D -- no --> G
     CD --> G{Input guardrail<br/>checks the literal message}
     G -- flagged --> B[Return a fixed blocked-message response]
-    G -- clear --> R[CoordinatorAgent routes to one of six agents]
+    G -- clear --> R[CoordinatorAgent routes to one of eight agents]
     R --> O{Agent generates with an LLM?}
     O -- yes --> OG{Output guardrail checks the<br/>response against its own context}
     O -- no --> S[Persist exchange to RDS]
@@ -178,7 +193,7 @@ flowchart TD
 | API entrypoint | `app/main.py` | Mounts the API router and the static frontend |
 | HTTP layer | `app/api.py` | `/api/query`, `/api/sessions`; catches unhandled errors |
 | Orchestration | `app/conversation.py` | History load/save, follow-up condensation, tracing |
-| Coordinator + agents | `app/agents.py` | Routing and the six specialized agents |
+| Coordinator + agents | `app/agents.py` | Routing and the eight specialized agents |
 | Guardrails | `app/guardrails.py` | Input/output safety checks |
 | Data loading | `app/db.py`, `app/data_cleaning.py` | Cached, cleaned CSV catalog access |
 | Schema | `app/models.py` | Pydantic request/data models |
@@ -264,9 +279,11 @@ edited on disk has no effect until the process restarts.
 
 **External dependencies and risk mitigation.** Every LLM-generating agent
 depends on OpenAI's API being reachable; an outage or rate-limiting there
-degrades most of the assistant's functionality, though the two fully
-deterministic agents (exact-match policy lookup, price-delta computation)
-keep working regardless. This is mitigated by automatic retries on
+degrades most of the assistant's functionality, though the four fully
+deterministic agents (exact-match policy lookup, price-delta computation,
+stock lookup, and the assistant's own self-description) keep working
+regardless — a slightly wider floor of still-useful behavior during an
+outage than before those agents existed. This is mitigated by automatic retries on
 transient failures, but a sustained outage is still a hard dependency, not
 something the system can route around. The safety guardrails and the
 conversation-history database are both deliberately designed to fail open
@@ -277,6 +294,23 @@ of failing it outright — which trades a small amount of strictness for
 availability. The application currently runs as a single containerized
 process without a multi-worker or horizontal-scaling story, which would
 need addressing under concurrent load beyond what one instance can handle.
+
+**Guardrail coverage is probabilistic, not a guarantee.** The output
+faithfulness check is itself an LLM classifier, and reviewing real
+conversation history produced a confirmed miss: a fabricated stock figure
+("7" against a true value of 173) passed the check and reached the
+customer (§6). This is the honest limit of the design — a classifier
+reduces the rate of unsupported answers but cannot bound it, and it is
+weakest exactly where a fabrication is a single plausible-looking number
+rather than an obviously invented claim. The response was not to tune the
+classifier and call it fixed, but to remove the opportunity: factual
+lookups with one correct answer (stock counts, price deltas, exact policy
+text) are now handled by deterministic agents that make no LLM call at
+all, so for those questions there is nothing to hallucinate rather than a
+safety net hoping to catch it. That reasoning does not extend to the
+genuinely generative agents — recommendation, comparison, and review
+summarization still depend on the classifier, and the measured
+faithfulness gap noted above is the residual risk there.
 
 **Ethical and data-handling considerations.** Every LLM-generated response
 passes through an automated safety check before reaching a customer:
@@ -344,6 +378,48 @@ assessed by design, not by measurement.
   work, not a failing test, and fixed the same day (§3 describes the
   corrected flow). A reminder that accurate documentation is itself a way
   of surfacing real bugs, not just recording them after the fact.
+- **A fabricated stock count, and the coverage gap behind it.** Reviewing a
+  real stored conversation surfaced the most serious correctness failure
+  found in this project: asked how many units of a product were in stock,
+  the assistant confidently answered "7" when the catalog said 173. The
+  cause was structural rather than a bad prompt. No agent owned
+  stock questions, so the query fell through to
+  `ProductRecommendationAgent`, whose context lines carry brand, category,
+  price, rating, and description — but not `stock`. The model was asked a
+  quantitative question about a number it had never been shown, and
+  supplied one. The output guardrail, which exists precisely to catch
+  unsupported claims, did not flag it. The fix treats the root cause on
+  both counts: a dedicated `StockAvailabilityAgent` answers these
+  deterministically from `products.csv`, so there is no generation step in
+  which a number can be invented. The broader lesson — that an unanswerable
+  question routed to a plausible-looking agent is more dangerous than one
+  that dead-ends, because the fallback produces a confident answer rather
+  than an error — also motivated auditing which other question types had no
+  owner.
+- **Product-specific policy questions that quietly failed.** The same
+  conversation showed the assistant unable to answer "what is the return
+  policy for Maxi Phone v54822?" despite that policy existing, while the
+  category-level phrasing ("return policy for smartphones") worked
+  correctly. Two independent defects overlapped. Nothing in the pipeline
+  connected a product name to its category, so neither the keyword lookup
+  nor the RAG search could reach a policy whose text never mentions the
+  SKU; and `StorePolicyAgent`'s keyword match compared the query against
+  policy types word by word, so the catalog's plural `returns` never
+  matched a customer's singular "return" — meaning even category-level
+  questions were silently falling through to the RAG fallback rather than
+  matching directly. Both are now fixed and covered by tests, including a
+  regression test that a multi-word type like `price_matching` does not
+  match on the word "price" alone.
+- **A first-time user being turned away at the door.** The transcript
+  opened with "what are you?" and "what can you do?", both of which the
+  off-topic guardrail rejected — a reasonable classification in the
+  narrowest reading of its instructions, and clearly the wrong product
+  behavior for the first two questions a new user asks. The guardrail's
+  scope now treats the assistant's own capabilities as on-topic, and a
+  `CapabilitiesAgent` answers with a fixed description of what the system
+  handles. Worth recording because it wasn't a bug in the usual sense:
+  every component behaved as specified, and the specification was what was
+  wrong.
 
 **Scalability.** The in-process catalog cache and the content-hash-gated
 RAG index both exist specifically so repeated work isn't repeated: the
@@ -362,7 +438,7 @@ database are designed to fail open on their own infrastructure errors
 rather than take the whole request down with them. Unhandled errors return
 a fixed, generic message to the customer while the real exception is
 logged server-side, so failures are diagnosable without leaking internals.
-A 94-test automated suite covering routing, agents, guardrails, and the API
+A 121-test automated suite covering routing, agents, guardrails, and the API
 layer runs in CI on every push, catching regressions before they reach
 `main`.
 
@@ -437,6 +513,8 @@ documentation through each phase below.
 | Day 11 | RDS connection hardened with TLS and certificate/hostname verification |
 | Day 13 | UI overhaul (sessions sidebar, receipt-styled frontend); CSV cleaning and in-process caching; guardrail false-positive fix; dependency cleanup, DRY refactor, CI workflow, retry/error-handling hardening, and extended eval coverage |
 | Day 14 | Per-query LangSmith tracing; this documentation pass, which surfaced and fixed a real guardrail-ordering bug (§3, §6) |
+| Day 15 | Deployed to Hugging Face Spaces via a gated CI workflow; session deletion added to the sidebar |
+| Day 16 | UI refinements (bottom-anchored query input, status indicator); post-deployment transcript review added the stock-availability and capabilities agents, product-to-category policy resolution, and the policy keyword-matching fix (§6), growing the suite to 121 tests |
 
 **Roadmap followed.** Development and testing were never separate phases —
 every agent and feature was accompanied by tests as it was built, so the
@@ -474,7 +552,10 @@ $0.001–0.0015 per query, a tenth of a cent or less. The two Moderation
 calls in that same request add nothing, since that endpoint is free. The
 LLM routing fallback (§11) adds one more small, cheap call, but only for
 the minority of queries that match no keyword rule — everything else,
-including the two fully deterministic agents, is unaffected.
+including the four fully deterministic agents, is unaffected. Two of those
+four were added specifically to move common question types (stock counts,
+"what can you do?") off the LLM path entirely, so they now cost nothing
+per query as well as being immune to fabrication.
 
 **Cost-saving strategies.** Every framework and library in the stack is
 open-source with no licensing fee — FastAPI, ChromaDB, `ragas`, `pytest`,
@@ -514,6 +595,8 @@ querying the real catalog rather than inventing example data.
 | "What's your policy for sending back a laptop I'm not happy with?" | Returns the 14-day laptop return policy — unopened or like-new, original accessories and packaging, return label requested via the online account |
 | "What's the price difference between the Pro Book v60930 and the Performance Pro v56156?" | Computes it directly: $722.74 cheaper (64.4% less), no LLM call needed |
 | "What are people saying about the Bass Boost v3811?" | Summarizes its 9 reviews — consistently positive on sound quality, portability, and battery life |
+| "How many SmartView TV v3881 do you have in stock?" | Reads the real figure from the catalog — 173 available — with no LLM call, so the number cannot be invented |
+| "What's the return policy for Maxi Phone v54822?" | Resolves the SKU to `smartphone` and returns that category's 14-day policy: no cracks or water damage, factory reset, original charger and box |
 
 **Industries and businesses that could benefit.** The most direct fit is
 any online retailer or e-commerce platform looking to deflect repetitive
@@ -562,6 +645,9 @@ flowchart LR
     C -->|"cheaper" / price compare| PCA[PriceComparisonAgent]
     PCA -. no 2nd product .-> PRA[ProductRecommendationAgent]
     C -->|"compare"| PRCA[ProductComparisonAgent]
+    C -->|self-reference| CAP[CapabilitiesAgent]
+    C -->|"stock" / availability| STK[StockAvailabilityAgent]
+    STK -. no product named .-> PRA
     C -->|policy keyword| SPA[StorePolicyAgent]
     SPA -. no keyword match .-> FAQ["FAQAgent (RAG)"]
     C -->|no keyword match| LLM{LLM fallback classifier}
@@ -570,31 +656,47 @@ flowchart LR
     LLM --> PRCA
     LLM --> SPA
     LLM --> PRA
+    LLM --> CAP
+    LLM --> STK
 ```
 
 `CoordinatorAgent` checks a fixed priority order — review, then price
-comparison, then general comparison, then store policy — because several
-of these would otherwise overlap on the same query (a query like "compare
-the price of X and Y" contains both "compare" and "price"). A query
-matching none of those keyword rules no longer defaults blindly to product
-recommendation: one small LLM call classifies it into the same five
-categories instead, so unanticipated phrasing still reaches the right
-agent. This fallback is deliberately narrow — it only runs on that
-no-match minority, so every keyword-matched query, including the two fully
-deterministic agents, still costs nothing extra. Two further branches fall
-through rather than dead-ending, regardless of how they were reached:
-`PriceComparisonAgent` hands off to `ProductRecommendationAgent` when a
-query doesn't name two products to compare (e.g. a relative request like
-"something cheaper" rather than a head-to-head comparison), and
-`StorePolicyAgent`'s exact-keyword match falls back to `FAQAgent`'s
-retrieval-augmented search when a policy question is phrased without the
-literal policy keyword.
+comparison, then general comparison, then self-reference, then stock, then
+store policy — because several of these would otherwise overlap on the
+same query (a query like "compare the price of X and Y" contains both
+"compare" and "price"). A query matching none of those keyword rules no
+longer defaults blindly to product recommendation: one small LLM call
+classifies it into the same seven categories instead, so unanticipated
+phrasing still reaches the right agent. This fallback is deliberately
+narrow — it only runs on that no-match minority, so every keyword-matched
+query, including the four fully deterministic agents, still costs nothing
+extra. Three further branches fall through rather than dead-ending,
+regardless of how they were reached: `PriceComparisonAgent` hands off to
+`ProductRecommendationAgent` when a query doesn't name two products to
+compare (e.g. a relative request like "something cheaper" rather than a
+head-to-head comparison), `StockAvailabilityAgent` hands off the same way
+when a query asks about stock generally without naming a product ("what do
+you have in stock?"), and `StorePolicyAgent`'s exact-keyword match falls
+back to `FAQAgent`'s retrieval-augmented search when a policy question is
+phrased without the literal policy keyword.
+
+Two pieces of query preprocessing sit alongside this routing. First,
+policy-type matching compares against the whole policy-type phrase and its
+singular/plural counterpart, rather than word by word: the catalog stores
+`returns` while customers write "return policy", and a word-by-word match
+on a multi-word type like `price_matching` would otherwise fire on any
+query merely containing "price". Second, when a query names a specific
+catalog product, the coordinator attaches that product's category before
+handing off, which is what lets a question about "Maxi Phone v54822" reach
+the smartphone return policy — neither the keyword lookup nor the RAG
+search can connect a SKU to its category on its own, since the SKU appears
+nowhere in the policy text.
 
 ## 12. Conclusion
 
 Pickr AI set out to demonstrate that a multi-agent architecture could
 deliver task-specialized, grounded e-commerce assistance in place of a
-single general-purpose prompt, and it does: six specialized agents behind
+single general-purpose prompt, and it does: eight specialized agents behind
 one coordinator, each producing answers grounded in the real catalog rather
 than the model's own memory, protected end to end by input and output
 safety guardrails, with multi-turn conversation memory, an automated
@@ -618,7 +720,26 @@ question forced a closer look. And most recently, writing this document
 accurately — re-tracing the request pipeline rather than repeating what
 earlier notes claimed it did — surfaced a real, live bug in the input
 guardrail that no test had caught. Documentation and debugging turned out
-to be the same activity more often than expected. A handful of earlier
+to be the same activity more often than expected.
+
+Reading a full stored conversation end to end, rather than testing
+individual queries in isolation, was the single most productive debugging
+technique of the project — it surfaced four distinct defects in one pass
+(§6), including the fabricated stock count that was the most serious
+correctness failure found. Those defects shared a root cause worth stating
+plainly: the routing table had no concept of a question it could not
+answer. Every query resolved to some agent, and the default was an agent
+that generates prose, so an unowned question produced a confident,
+fluent, wrong answer instead of an error. That failure mode is
+specific to the fallback being generative — a system that dead-ends on an
+unrecognized query is merely unhelpful, while this one was actively
+misleading, and only a human reading the transcript would notice the
+difference. It also reframed what the guardrails are for: a
+classifier is a net for a generation step that shouldn't have been reached,
+and removing the generation step where a question has one factual answer
+is the stronger fix (§5).
+
+A handful of earlier
 decisions were also revisited rather than treated as settled once made —
 the FAQ agent moved from a "just pass the full context" plan to real RAG,
 its staleness check moved from counting rows to hashing content, and

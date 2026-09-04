@@ -21,6 +21,9 @@ flowchart LR
     C -->|"cheaper" / price compare| PCA[PriceComparisonAgent]
     PCA -. no 2nd product .-> PRA[ProductRecommendationAgent]
     C -->|"compare"| PRCA[ProductComparisonAgent]
+    C -->|"what can you do?"| CAP[CapabilitiesAgent]
+    C -->|"stock" / availability| STK[StockAvailabilityAgent]
+    STK -. no product named .-> PRA
     C -->|policy keyword| SPA[StorePolicyAgent]
     SPA -. no keyword match .-> FAQ["FAQAgent (RAG)"]
     C -->|no keyword match| LLM{LLM fallback classifier}
@@ -29,9 +32,13 @@ flowchart LR
     LLM --> PRCA
     LLM --> SPA
     LLM --> PRA
+    LLM --> CAP
+    LLM --> STK
 ```
 
 Guardrails (prompt-injection, off-topic, moderation, hallucination checks) wrap every routed call, and conversation history persists to a MySQL database so follow-ups resolve correctly. Routing itself is keyword-based and free; a query matching no keyword rule is classified by one small LLM call instead of defaulting blindly, so novel phrasing still lands on the right agent.
+
+Four of the eight agents are fully deterministic — no LLM call, so no room to invent an answer. Stock counts and price deltas are read straight from the catalog, exact-match policy lookups return the policy text itself, and the assistant's own "what can you do" description is fixed. When a query names a specific product, the coordinator resolves it to that product's category first (e.g. "Maxi Phone v54822" → `smartphone`), so a policy question about one SKU finds the policy that actually covers it.
 
 ## Example queries
 
@@ -44,6 +51,9 @@ Real queries against the actual catalog, not fabricated examples:
 | "Which one's cheaper?" | `PriceComparisonAgent` — exact $ and % delta, no LLM call |
 | "What are people saying about the Bass Boost v3811?" | `ReviewSummarizationAgent` — summarizes real reviews |
 | "What's your return policy?" | `StorePolicyAgent`, falling back to a RAG search if nothing matches exactly |
+| "What's the return policy for Maxi Phone v54822?" | `StorePolicyAgent` — resolves the SKU to `smartphone`, returns the 14-day smartphone policy |
+| "How many SmartView TV v3881 do you have in stock?" | `StockAvailabilityAgent` — reads the real count from the catalog, no LLM call |
+| "What can you do?" | `CapabilitiesAgent` — describes what the assistant handles, no LLM call |
 
 ## Run it
 
@@ -109,7 +119,7 @@ app/
   main.py             FastAPI entrypoint
   api.py              /api/query, /api/sessions routes
   conversation.py     chat history (MySQL) + query condensation
-  agents.py           CoordinatorAgent + the 6 specialized agents
+  agents.py           CoordinatorAgent + the 8 specialized agents
   guardrails.py       input/output safety checks
   db.py               CSV loading (cached)
   data_cleaning.py    CSV cleaning (dedupe, missing values, ranges)
