@@ -79,13 +79,18 @@ def build_rows(records: list[dict], tokenizer: QwenTokenizer, workload: str, sch
 
 def write_trace(rows: list[dict], path: Path) -> str:
     path = Path(path)
-    if path.exists():
-        raise FileExistsError(f"{path} exists; trace files are immutable — bump the version instead")
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as fh:
-        for row in rows:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    try:
+        with path.open("x", encoding="utf-8", newline="\n") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except FileExistsError:
+        raise FileExistsError(f"{path} exists; trace files are immutable — bump the version instead")
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def count_empty_responses(records: list[dict]) -> int:
+    return sum(1 for r in records if not r.get("response_text"))
 
 
 def quantiles(values: list[float]) -> dict:
@@ -127,8 +132,17 @@ def write_meta(rows: list[dict], path: Path, *, tokenizer: QwenTokenizer, seed: 
         "format": "vllm bench serve custom dataset (prompt, output_tokens); prompts pre-rendered with the "
                   "Qwen2.5 chat template for the completions endpoint with --skip-chat-template",
     }
-    meta.update(extra or {})
-    Path(path).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    extra = dict(extra or {})
+    for k in ("raw_records", "dropped_empty_response"):
+        if k in extra:
+            meta["counts"][k] = extra.pop(k)
+    meta.update(extra)
+    path = Path(path)
+    try:
+        with path.open("x", encoding="utf-8") as fh:
+            fh.write(json.dumps(meta, indent=2))
+    except FileExistsError:
+        raise FileExistsError(f"{path} exists; meta files are immutable — bump the version instead")
     return meta
 
 
@@ -144,6 +158,15 @@ def export_all(raw_path: Path, out_dir: Path, version: int, tokenizer: QwenToken
                app_git_sha: str | None) -> list[Path]:
     out_dir = Path(out_dir)
     records = read_raw(raw_path)
+    if not records:
+        raise ValueError(f"no records in {raw_path}; refusing to burn version {version}")
+
+    names = ["chat", "summarization", "structured"] + [f"multiturn_{p}" for p in PROFILES]
+    targets = [out_dir / f"{name}_v{version}{ext}" for name in names for ext in (".jsonl", ".meta.json")]
+    existing = [p for p in targets if p.exists()]
+    if existing:
+        raise FileExistsError(f"refusing to export v{version}: {existing} already exist")
+
     schema_path = out_dir / SCHEMA_REL
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     schema_sha = hashlib.sha256(schema_path.read_bytes()).hexdigest()
@@ -152,12 +175,18 @@ def export_all(raw_path: Path, out_dir: Path, version: int, tokenizer: QwenToken
     a = [r for r in records if assign_workload(r) == "A"]
     b = [r for r in records if assign_workload(r) == "B"]
     c_src = [r for r in a if r["call_role"] == "agent" and r.get("routed_agent") in STRUCTURED_AGENTS]
+    condense = [r for r in records if r["call_role"] == "condense"]
     written: list[Path] = []
-    written += _emit(build_rows(a, tokenizer, "A"), out_dir, "chat", version, extra={"workload": "A"}, **common)
-    written += _emit(build_rows(b, tokenizer, "B"), out_dir, "summarization", version, extra={"workload": "B"}, **common)
+    written += _emit(build_rows(a, tokenizer, "A"), out_dir, "chat", version,
+                     extra={"workload": "A", "raw_records": len(records),
+                            "dropped_empty_response": count_empty_responses(a)}, **common)
+    written += _emit(build_rows(b, tokenizer, "B"), out_dir, "summarization", version,
+                     extra={"workload": "B", "raw_records": len(records),
+                            "dropped_empty_response": count_empty_responses(b)}, **common)
     written += _emit(build_rows(c_src, tokenizer, "C", schema=schema), out_dir, "structured", version,
                      extra={"workload": "C", "source_workload": "A", "schema_file": SCHEMA_REL,
-                            "schema_sha256": schema_sha}, **common)
+                            "schema_sha256": schema_sha, "raw_records": len(records),
+                            "dropped_empty_response": count_empty_responses(c_src)}, **common)
     for profile in PROFILES:
         conv = [r for r in records if r["call_role"] == "condense"
                 and (r.get("conversation_id") or "").startswith(f"conv-{profile}-")]
@@ -165,6 +194,13 @@ def export_all(raw_path: Path, out_dir: Path, version: int, tokenizer: QwenToken
         written += _emit(build_rows(conv, tokenizer, f"multiturn_{profile}"), out_dir, f"multiturn_{profile}",
                          version, extra={"workload": f"multiturn_{profile}", "profile": profile,
                                          "note": "condense-call prompts in turn order; the app never resends "
-                                                 "history to the agent (HISTORY_WINDOW bounds the transcript)"},
+                                                 "history to the agent (HISTORY_WINDOW bounds the transcript)",
+                                         "raw_records": len(records),
+                                         "dropped_empty_response": count_empty_responses(conv)},
                          **common)
+
+    unassigned = [r["record_id"] for r in condense
+                 if not any((r.get("conversation_id") or "").startswith(f"conv-{p}-") for p in PROFILES)]
+    if unassigned:
+        raise ValueError(f"{len(unassigned)} condense records match no profile prefix: {unassigned[:5]}...")
     return written

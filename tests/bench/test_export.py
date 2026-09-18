@@ -131,3 +131,44 @@ def test_export_all_writes_every_workload_file(tmp_path, tok):
     assert medium == ""   # no medium conversations in this fixture; file still written (empty) with meta n=0
     meta = json.loads((out / "structured_v1.meta.json").read_text())
     assert meta["workload"] == "C" and meta["source_workload"] == "A" and meta["schema_sha256"]
+    assert meta["counts"]["raw_records"] == 5 and meta["counts"]["dropped_empty_response"] == 0
+
+
+def test_export_all_refuses_when_any_target_exists_and_writes_nothing(tmp_path, tok):
+    raw = tmp_path / "raw.jsonl"
+    raw.write_text(json.dumps(_rec()) + "\n")
+    out = tmp_path / "traces"
+    (out / "schemas").mkdir(parents=True)
+    (out / "schemas" / "product_card.schema.json").write_text("{}")
+    (out / "structured_v1.jsonl").write_text("")            # a LATER file already exists
+    with pytest.raises(FileExistsError):
+        export_all(raw, out, version=1, tokenizer=tok, seed=5, app_git_sha="abc")
+    assert not (out / "chat_v1.jsonl").exists() and not (out / "chat_v1.meta.json").exists()
+
+
+def test_export_all_refuses_empty_raw(tmp_path, tok):
+    out = tmp_path / "traces"
+    (out / "schemas").mkdir(parents=True)
+    (out / "schemas" / "product_card.schema.json").write_text("{}")
+    with pytest.raises(ValueError):
+        export_all(tmp_path / "missing.jsonl", out, version=1, tokenizer=tok, seed=5, app_git_sha="abc")
+    assert not any(out.glob("*_v1.*"))
+
+
+def test_export_all_rejects_condense_records_outside_profiles(tmp_path, tok):
+    raw = tmp_path / "raw.jsonl"
+    raw.write_text(json.dumps(_rec(record_id="x-c0", query_id="x", conversation_id="weird-0",
+                                   turn_index=1, call_role="condense")) + "\n")
+    out = tmp_path / "traces"
+    (out / "schemas").mkdir(parents=True)
+    (out / "schemas" / "product_card.schema.json").write_text("{}")
+    with pytest.raises(ValueError, match="condense"):
+        export_all(raw, out, version=1, tokenizer=tok, seed=5, app_git_sha="abc")
+
+
+def test_write_meta_is_immutable(tmp_path, tok):
+    rows = build_rows([_rec()], tok, workload="B")
+    path = tmp_path / "m.json"
+    write_meta(rows, path, tokenizer=tok, seed=5, app_git_sha="abc", raw_path="r", trace_sha256="d")
+    with pytest.raises(FileExistsError):
+        write_meta(rows, path, tokenizer=tok, seed=5, app_git_sha="abc", raw_path="r", trace_sha256="d")
