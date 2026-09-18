@@ -131,7 +131,7 @@ Budget (GB), three residency conditions:
 
 **What the stock client does not cover — built by the runner:**
 
-1. **Multi-turn replay** (P4b): ordered turns with growing history — `replay_multiturn.py`.
+1. **Multi-turn replay** (P4b Arm 2 only): ordered turns with a conventional history-resending client — `replay_multiturn.py`. Arm 1 needs no replayer: it is Pickr's own per-request stream (chat + condense traces) through the stock client.
 2. **Concurrent mixed load** (P4a): two client instances (chat Poisson + batch) against one server, coordinated by the runner.
 3. **Correctness** (P2d, P3): greedy token-identity diff and schema validation — `correctness.py`, not a load test.
 4. **Extra metrics:** acceptance rate, KV occupancy, clocks, temperature, power — scraped from `/metrics` and NVML.
@@ -155,18 +155,18 @@ Budget (GB), three residency conditions:
 | **P2d** correctness | engine{2} × method{2} × k{5} at c=1, 1 run each on a 50-prompt subset (25 from A, 25 from B), fixed seed, **greedy**: token-identity vs `off` = 20 runs. Control: `off` at c=1 vs c=8 per engine = 4 runs, to separate batch-numerics divergence from speculation divergence | 24 | Cheap; not a load test. Identity is verified under greedy decoding and **assumed** to carry to the sampled regime the rest of the study runs in (per-call temperature from the trace records, matching the app); rejection sampling guarantees distributional, not token, equivalence there, so P2/P3 acceptance rates are reported as measured under sampling. |
 | **P3** | workload C: engine{2} × method{off, ngram@k*, draft@k*} × constrained{off, on} × c{ladder}; schema validity parsed on every output; hang/crash log per cell | 216 | A/B excluded — constraints only mean something on structured output. Methods restricted to P2 winners. Natural termination with `max_tokens` cap (§3.2). **Pre-registered cut under time pressure:** constrained{off} runs at the 2 dense points only, not the full ladder (−48 runs); the cut is announced before the sweep starts, never mid-sweep. |
 | **P4a** goodput | engine{2} × condition{chat alone, + batch naive, + batch with engine priority control} × offered λ{5 points}, open-loop | 90 | **λ ladder is fixed in absolute req/s**, derived once from the chat-alone measurement (spanning below → above the rate at which chat-alone reaches the P1 knee) and held constant across all three conditions, so the three curves share an x-axis. Converting per-condition via Little's law would use latency that changes with the condition. An engine with no priority control yields a cell marked "none available" — a finding, not a gap. |
-| **P4b** prefix caching | cache{off, vLLM APC, SGLang RadixAttention} × **3 distinct multi-turn traces** with different turn-depth profiles (shallow 2–3 turns, medium 4–5, deep 6+); TTFT vs turn index; hit-rates from `/metrics` | 27 | One trace could flatter either engine; this is the sharpest engine comparison in the study. |
+| **P4b** prefix caching, **two arms** | cache{off, vLLM APC, SGLang RadixAttention} × **3 distinct multi-turn traces** (shallow 2–3 turns, medium 4–5, deep 6+). **Arm 1 — real, primary:** Pickr's own request stream (every request shares the identical system prompt; the condense call carries a transcript bounded at `HISTORY_WINDOW` = 6 rows) — hit rate and TTFT under repeated shared-prefix traffic, a per-request effect, with the condense call as the bounded turn-indexed case. **Arm 2 — synthetic, labelled:** the same conversations replayed with a conventional history-resending client, the pattern most chat apps use — TTFT vs turn index, explicitly marked NOT Pickr's behaviour. | 54 | **Amended 2026-09-19 (P0a finding):** Pickr never resends history to the agent — `handle_conversational_query` condenses the follow-up into a standalone query — so there is no large growing prefix on the interactive path and the original turn-indexed design would have measured a workload the app doesn't produce. The gap between the arms is the finding: how much prefix-cache benefit an application forfeits by not resending history. |
 | **P4c** memory table | residency{target, + draft fp16, + draft AWQ, + draft + embedder} × max-concurrency probe | 12 | Draft AWQ reported as cost-and-quality (§3.1). |
 | **P5** | Jetson Orin Nano Super: P1 ladder (one engine) + P2b batch=1 points | ~42 | Hard timebox; ships as "where it stopped" if it expires. |
 
-**Total ≈ 965 runs** at ~5–7 min each (container start, readiness, ~200 requests, cooldown) ≈ 90 hours of unattended GPU time, dominated by P2/P3. Resume-from-state (§6) makes it tolerable.
+**Total ≈ 990 runs** at ~5–7 min each (container start, readiness, ~200 requests, cooldown) ≈ 90 hours of unattended GPU time, dominated by P2/P3. Resume-from-state (§6) makes it tolerable.
 
 **Pre-registered graph predictions** (an inversion is a signal, not a surprise):
 
-- P1: knee at c ≈ 16–32 for A; lower for B, whose long prompts fill KV first. Large engine gaps at baseline mean a config problem.
+- P1: knee at c ≈ 16–32 for A. **B — amended 2026-09-19 (P0a finding):** the original prediction ("lower for B, whose long prompts fill KV first") is withdrawn before any run: the catalog holds a median of 2 reviews per product (~51 chars each), so B prompts are *short*, and the longest call on a summarisation turn is the output-guardrail faithfulness check, not the summary. Revised prediction: B's knee is at or above A's, and B is compute-bound, not KV-bound. The withdrawn prediction and its reason stay in the record. Large engine gaps at baseline mean a config problem.
 - P2: crossover K below the P1 knee; ngram beats draft on B (summaries copy their sources), draft beats ngram on A.
 - P3: direction genuinely open — grammar overhead pushes K left, predictable JSON boilerplate pushes acceptance up. No prediction; both outcomes are reported as found.
-- P4a: naive mixing collapses chat goodput above ~50% of knee load; priority control recovers a large fraction. P4b: prefix-off TTFT grows ~linearly with turn; APC/Radix hold it nearly flat unless evicted under memory pressure, which on 6 GB is expected at higher turn counts.
+- P4a: naive mixing collapses chat goodput above ~50% of knee load; priority control recovers a large fraction. P4b **(amended 2026-09-19):** Arm 1 — TTFT flat across the request stream with a high hit rate on the shared system prefix under APC/Radix, and only a small, bounded rise on the condense call up to turn 3 (the window then slides and the prefix changes); Arm 2 — prefix-off TTFT grows ~linearly with turn, APC/Radix hold it nearly flat unless evicted under memory pressure, which on 6 GB is expected at higher turn counts. The writeup states plainly that Pickr's architecture limits its own prefix-cache opportunity — a finding about real applications versus benchmark assumptions.
 
 ---
 
@@ -187,7 +187,7 @@ bench/
                          #   launch cmd, power limit + power mode, docker version, host reservation
     state.py             # sweep progress: pending/done/invalid/requeued; retry budget
     correctness.py       # P2d/P3: greedy diff vs baseline; schema validation
-    replay_multiturn.py  # P4b: ordered turns with growing history
+    replay_multiturn.py  # P4b Arm 2: ordered turns with a history-resending client (NOT Pickr's behaviour)
   capture/               # §3.2 generator + recorder + LangSmith export + validation check
   configs/               # sweep files, one per phase or sub-phase
   traces/                # versioned JSONL + meta; schemas/; validation/
