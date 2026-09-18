@@ -463,6 +463,39 @@ expected to be injected at runtime instead. Verified with a local
 
 ---
 
+## OPEN ISSUE (2026-09-18): test suite leaks fixture traces into LangSmith
+
+**Status:** OPEN — to be filed as a GitHub issue when `gh` is available; must
+be fixed before any LangSmith-based validation of benchmark traces (P0a
+addendum B2) is run.
+
+**What happens:** running `pytest tests` with `.env` loaded (so
+`LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` are in the environment)
+logs the `@traceable` root of `handle_conversational_query` for every test in
+`tests/test_conversation.py` that reaches it. The mocked OpenAI client emits
+no child runs, so the LangSmith project fills with root-only `chain` runs
+whose inputs are test fixtures (`conversation_id="conv-1"/"conv-new"`,
+`raw_query="raw follow up"/"recommend a laptop"`). On 2026-09-18 those 12
+runs were the *only* runs in the `pickr-ai` project, which made the
+benchmark's LangSmith validation export unusable (the deployed Space's own
+traces had aged out of retention and no real traffic had arrived since).
+
+**Why it matters:** any future validation set pulled from the project would
+be contaminated with fixture traffic unless filtered by hand.
+
+**Proposed fix (app-side, not on the benchmark branch):** gate tracing so the
+test suite never traces — e.g. an autouse fixture in `tests/conftest.py`
+that sets `LANGSMITH_TRACING=false` via `monkeypatch.setenv`, or a top-level
+`conftest.py` guard that clears the LangSmith env vars for the test session.
+Keep `wrap_openai`/`@traceable` unconditional in app code (they are no-ops
+when tracing is off), so production behaviour is unchanged.
+
+**Verified while diagnosing:** the integration itself works — one real query
+run locally with tracing on produced the expected three `llm` child runs
+(guardrail_input → agent → guardrail_output) with `usage_metadata`.
+
+---
+
 ## Summary: decisions later reversed
 
 | Decision | Reversed to | Why |
