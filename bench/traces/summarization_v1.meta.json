@@ -1,0 +1,82 @@
+{
+  "generated_at": "2026-09-18T16:46:50.701606+00:00",
+  "seed": 20260919,
+  "app_git_sha": "2ee5298132d5cd27e38b10b1c9c7e84fac76d5d9",
+  "raw_path": "bench/traces/raw/capture_20260919.jsonl",
+  "trace_sha256": "7ba02fbc768ff603a6c9546a69c0fcab4c9584fe199933c4f5c8f11a71833709",
+  "tokenizer": {
+    "model_id": "Qwen/Qwen2.5-3B-Instruct",
+    "revision": "aa8e72537993ba99e69dfaafa59ed015b17504d1",
+    "template_sha256": "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
+  },
+  "transformers_version": "5.17.0",
+  "counts": {
+    "total": 716,
+    "by_provenance": {
+      "generated": 716
+    },
+    "by_call_role": {
+      "agent": 358,
+      "guardrail_output": 358
+    },
+    "raw_records": 5530,
+    "dropped_empty_response": 0
+  },
+  "prompt_tokens_qwen": {
+    "n": 716,
+    "p10": 71.0,
+    "p50": 345.5,
+    "p90": 597.0,
+    "p99": 635.7,
+    "mean": 330.659217877095
+  },
+  "output_tokens": {
+    "n": 716,
+    "p10": 9.0,
+    "p50": 12.5,
+    "p90": 54.0,
+    "p99": 68.0,
+    "mean": 26.641061452513966
+  },
+  "by_call_role": {
+    "agent": {
+      "prompt_tokens_qwen": {
+        "n": 358,
+        "p10": 66.0,
+        "p50": 90.0,
+        "p90": 130.0,
+        "p99": 163.29,
+        "mean": 94.60614525139665
+      },
+      "output_tokens": {
+        "n": 358,
+        "p10": 31.0,
+        "p50": 44.0,
+        "p90": 60.0,
+        "p99": 71.0,
+        "mean": 44.28212290502793
+      }
+    },
+    "guardrail_output": {
+      "prompt_tokens_qwen": {
+        "n": 358,
+        "p10": 527.0,
+        "p50": 562.0,
+        "p90": 618.3,
+        "p99": 648.58,
+        "mean": 566.7122905027933
+      },
+      "output_tokens": {
+        "n": 358,
+        "p10": 9.0,
+        "p50": 9.0,
+        "p90": 9.0,
+        "p99": 9.0,
+        "mean": 9.0
+      }
+    }
+  },
+  "row_order": "capture completion order (non-deterministic across runs; files are immutable)",
+  "format": "vllm bench serve custom dataset (prompt, output_tokens); prompts pre-rendered with the Qwen2.5 chat template for the completions endpoint with --skip-chat-template",
+  "workload": "B"
+}

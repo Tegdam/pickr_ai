@@ -1,0 +1,65 @@
+{
+  "generated_at": "2026-09-18T16:46:50.718209+00:00",
+  "seed": 20260919,
+  "app_git_sha": "2ee5298132d5cd27e38b10b1c9c7e84fac76d5d9",
+  "raw_path": "bench/traces/raw/capture_20260919.jsonl",
+  "trace_sha256": "f3864300f03f616ddae66f1658f5894d53c430647c9a0beb2cebe206e387b551",
+  "tokenizer": {
+    "model_id": "Qwen/Qwen2.5-3B-Instruct",
+    "revision": "aa8e72537993ba99e69dfaafa59ed015b17504d1",
+    "template_sha256": "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
+  },
+  "transformers_version": "5.17.0",
+  "counts": {
+    "total": 138,
+    "by_provenance": {
+      "generated": 138
+    },
+    "by_call_role": {
+      "condense": 138
+    },
+    "raw_records": 5530,
+    "dropped_empty_response": 0
+  },
+  "prompt_tokens_qwen": {
+    "n": 138,
+    "p10": 167.7,
+    "p50": 282.0,
+    "p90": 471.9,
+    "p99": 607.61,
+    "mean": 302.0652173913044
+  },
+  "output_tokens": {
+    "n": 138,
+    "p10": 6.0,
+    "p50": 11.0,
+    "p90": 18.3,
+    "p99": 25.63,
+    "mean": 11.920289855072463
+  },
+  "by_call_role": {
+    "condense": {
+      "prompt_tokens_qwen": {
+        "n": 138,
+        "p10": 167.7,
+        "p50": 282.0,
+        "p90": 471.9,
+        "p99": 607.61,
+        "mean": 302.0652173913044
+      },
+      "output_tokens": {
+        "n": 138,
+        "p10": 6.0,
+        "p50": 11.0,
+        "p90": 18.3,
+        "p99": 25.63,
+        "mean": 11.920289855072463
+      }
+    }
+  },
+  "row_order": "capture completion order (non-deterministic across runs; files are immutable)",
+  "format": "vllm bench serve custom dataset (prompt, output_tokens); prompts pre-rendered with the Qwen2.5 chat template for the completions endpoint with --skip-chat-template",
+  "workload": "multiturn_medium",
+  "profile": "medium",
+  "note": "condense-call prompts in turn order; the app never resends history to the agent (HISTORY_WINDOW bounds the transcript)"
+}

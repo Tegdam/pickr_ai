@@ -1,0 +1,120 @@
+{
+  "generated_at": "2026-09-18T16:46:50.686711+00:00",
+  "seed": 20260919,
+  "app_git_sha": "2ee5298132d5cd27e38b10b1c9c7e84fac76d5d9",
+  "raw_path": "bench/traces/raw/capture_20260919.jsonl",
+  "trace_sha256": "02a61f1a46ea54d6d3a2c1f08f0298ce792760d1e6e84ad6a6be6242e4d41504",
+  "tokenizer": {
+    "model_id": "Qwen/Qwen2.5-3B-Instruct",
+    "revision": "aa8e72537993ba99e69dfaafa59ed015b17504d1",
+    "template_sha256": "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
+  },
+  "transformers_version": "5.17.0",
+  "counts": {
+    "total": 4375,
+    "by_provenance": {
+      "generated": 4375
+    },
+    "by_call_role": {
+      "guardrail_input": 1959,
+      "agent": 805,
+      "guardrail_output": 805,
+      "classifier": 806
+    },
+    "raw_records": 5530,
+    "dropped_empty_response": 0
+  },
+  "prompt_tokens_qwen": {
+    "n": 4375,
+    "p10": 242.0,
+    "p50": 265,
+    "p90": 755.0,
+    "p99": 877.26,
+    "mean": 348.0377142857143
+  },
+  "output_tokens": {
+    "n": 4375,
+    "p10": 7.0,
+    "p50": 14,
+    "p90": 66.6,
+    "p99": 179.26,
+    "mean": 26.128
+  },
+  "by_call_role": {
+    "guardrail_input": {
+      "prompt_tokens_qwen": {
+        "n": 1959,
+        "p10": 257.0,
+        "p50": 265,
+        "p90": 274.0,
+        "p99": 276.0,
+        "mean": 264.4920877998979
+      },
+      "output_tokens": {
+        "n": 1959,
+        "p10": 14.0,
+        "p50": 14,
+        "p90": 14.0,
+        "p99": 14.0,
+        "mean": 14.0
+      }
+    },
+    "agent": {
+      "prompt_tokens_qwen": {
+        "n": 805,
+        "p10": 117.0,
+        "p50": 288,
+        "p90": 310.0,
+        "p99": 317.0,
+        "mean": 242.85093167701862
+      },
+      "output_tokens": {
+        "n": 805,
+        "p10": 37.4,
+        "p50": 70,
+        "p90": 165.0,
+        "p99": 230.64,
+        "mean": 92.01987577639751
+      }
+    },
+    "guardrail_output": {
+      "prompt_tokens_qwen": {
+        "n": 805,
+        "p10": 680.4,
+        "p50": 759,
+        "p90": 823.6,
+        "p99": 940.24,
+        "mean": 758.4385093167701
+      },
+      "output_tokens": {
+        "n": 805,
+        "p10": 9.0,
+        "p50": 9,
+        "p90": 9.0,
+        "p99": 9.0,
+        "mean": 9.0
+      }
+    },
+    "classifier": {
+      "prompt_tokens_qwen": {
+        "n": 806,
+        "p10": 241.0,
+        "p50": 246.0,
+        "p90": 251.0,
+        "p99": 259.0,
+        "mean": 246.26178660049627
+      },
+      "output_tokens": {
+        "n": 806,
+        "p10": 6.0,
+        "p50": 7.0,
+        "p90": 7.0,
+        "p99": 8.0,
+        "mean": 6.901985111662531
+      }
+    }
+  },
+  "row_order": "capture completion order (non-deterministic across runs; files are immutable)",
+  "format": "vllm bench serve custom dataset (prompt, output_tokens); prompts pre-rendered with the Qwen2.5 chat template for the completions endpoint with --skip-chat-template",
+  "workload": "A"
+}
