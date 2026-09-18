@@ -1,6 +1,6 @@
 # Pickr Inference Benchmarking — Design Spec
 
-**Status:** approved for full rigor, weeks-scale scope (see §9).
+**Status:** SUPERSEDED on 2026-09-17 by `2026-09-17-pickr-inference-benchmark-design-v2.md`, which was written against brief v3 (§7 Phases). Kept for history; do not plan from it.
 **Source brief:** `smartshop-inference-benchmark-brief.md` (repo root; written against a placeholder app name "SmartShop" — this spec uses the real app name, Pickr, throughout).
 
 ---
