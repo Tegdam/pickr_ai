@@ -19,7 +19,9 @@ from .validate import compare, to_markdown
 def git_sha() -> str | None:
     try:
         sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-        if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
+        # Tracked modifications only: the capture's own untracked outputs
+        # (queries/raw files) must not mark the app code as dirty.
+        if subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"], text=True).strip():
             sha += "-dirty"
         return sha
     except Exception:
