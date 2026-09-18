@@ -1,4 +1,4 @@
-"""Fixtures shared by bench tests. Nothing here touches the network."""
+"""Fixtures shared by bench tests. Nothing here touches the network or data/chroma_db."""
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -92,3 +92,31 @@ def small_catalog(monkeypatch):
     monkeypatch.setattr(agents, "load_reviews", lambda: list(REVIEWS))
     monkeypatch.setattr(agents, "load_store_policies", lambda: list(POLICIES))
     return SimpleNamespace(products=PRODUCTS, reviews=REVIEWS, policies=POLICIES)
+
+
+@pytest.fixture(autouse=True)
+def in_memory_chroma(monkeypatch):
+    """
+    Redirect PolicyIndex's persistent Chroma client to an in-memory one.
+
+    chromadb.Client() caches its underlying system across calls with the same
+    (default) settings, so two tests in one process would otherwise share the
+    "store_policies" collection. Drop it first so each test starts clean.
+
+    Autouse so every bench test is protected regardless of which fixtures it
+    requests -- an FAQAgent fallback reachable from bench tests would otherwise
+    open the real data/chroma_db, see a content-hash mismatch against whatever
+    catalog the test is using, and delete/rewrite the developer's persisted
+    store_policies collection.
+    """
+    import chromadb as chromadb_module
+
+    def make_client(path):
+        client = chromadb_module.Client()
+        try:
+            client.delete_collection("store_policies")
+        except Exception:
+            pass  # collection didn't exist yet -- nothing to clean up
+        return client
+
+    monkeypatch.setattr(agents.chromadb, "PersistentClient", make_client)
