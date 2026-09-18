@@ -35,9 +35,10 @@ def _generate(a) -> int:
 
 def _capture(a) -> int:
     qs, convs = from_json(json.loads(Path(a.queries).read_text(encoding="utf-8")))
-    n = capture_all(qs, convs, Path(a.out), workers=a.workers, app_git_sha=git_sha())
-    print(f"wrote {n} new records to {a.out} ({len(read_raw(Path(a.out)))} total)")
-    return 0
+    written, failures = capture_all(qs, convs, Path(a.out), workers=a.workers, app_git_sha=git_sha())
+    print(f"wrote {written} new records, {failures} units failed (re-run to retry) to {a.out} "
+          f"({len(read_raw(Path(a.out)))} total)")
+    return 1 if failures else 0
 
 
 def _export(a) -> int:

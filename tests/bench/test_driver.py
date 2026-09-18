@@ -73,13 +73,13 @@ def test_capture_all_writes_jsonl_and_resumes(fake_chat, small_catalog, tmp_path
     qs = [_q("q1", "What do the reviews say about Alpha Laptop?"), _q("q2", "Is Alpha Laptop in stock?", intent="stock")]
     convs = [Conversation("c1", "shallow", (_q("c1-t0", "What do the reviews say about Alpha Laptop?"),
                                               _q("c1-t1", "Is Alpha Laptop in stock?", "followup_review", "natural")))]
-    n1 = capture_all(qs, convs, out, workers=2, app_git_sha="abc")
+    n1, f1 = capture_all(qs, convs, out, workers=2, app_git_sha="abc")
     rows = read_raw(out)
     # q1: 3 calls, q2: 1, c1-t0: 3, c1-t1: condense + guardrail_input = 2
-    assert n1 == len(rows) == 9
+    assert n1 == len(rows) == 9 and f1 == 0
     assert all(r["app_git_sha"] == "abc" and r["provenance"] == "generated" for r in rows)
-    n2 = capture_all(qs, convs, out, workers=2, app_git_sha="abc")
-    assert n2 == 0 and len(read_raw(out)) == len(rows)
+    n2, f2 = capture_all(qs, convs, out, workers=2, app_git_sha="abc")
+    assert n2 == 0 and f2 == 0 and len(read_raw(out)) == len(rows)
     # every line is valid JSON with the contract's keys
     required = {"record_id", "query_id", "conversation_id", "turn_index", "call_index", "call_role", "intent",
                 "phrasing", "query_text", "routed_agent", "routed_via", "route_status", "model", "messages",
@@ -96,7 +96,39 @@ def test_capture_all_resumes_only_pending_units(fake_chat, small_catalog, tmp_pa
                                               _q("c1-t1", "Is Alpha Laptop in stock?", "followup_review", "natural")))]
     capture_all(qs[:1], [], out, workers=1, app_git_sha="abc")          # q1 done in a previous run
     assert {r["query_id"] for r in read_raw(out)} == {"q1"}
-    n = capture_all(qs, convs, out, workers=2, app_git_sha="abc")       # re-run the same command
+    n, f = capture_all(qs, convs, out, workers=2, app_git_sha="abc")    # re-run the same command
     rows = read_raw(out)
-    assert n == 6 and len(rows) == 9                                     # q2 (1) + c1 (3 + 2) added; q1 not repeated
+    assert n == 6 and f == 0 and len(rows) == 9                          # q2 (1) + c1 (3 + 2) added; q1 not repeated
     assert sum(r["query_id"] == "q1" for r in rows) == 3
+
+
+def test_capture_all_isolates_a_failing_unit_and_writes_nothing_for_it(fake_chat, small_catalog, tmp_path):
+    # NOTE: deviates from the brief's Beta Laptop example. Beta Laptop (P2) has
+    # no reviews in the fixture, so ReviewSummarizationAgent returns "No reviews
+    # found" without ever calling the LLM -- the only call that mentions "Beta
+    # Laptop" is the guardrail_input classify call, and check_input fails OPEN
+    # on any classifier exception (see app/guardrails.py), so raising there
+    # never propagates and the unit does not fail. Gamma Phone (P3) has one
+    # review, so its query reaches ReviewSummarizationAgent's uncaught
+    # client.chat.completions.create call -- that's the call whose exception
+    # actually propagates out of CoordinatorAgent.handle_query (try/finally,
+    # no except) and fails the unit. Intent (one unit raises, nothing is
+    # written for it, resume re-runs it) is unchanged.
+    original = fake_chat.create
+
+    def failing_create(**kwargs):
+        if "Gamma Phone" in kwargs["messages"][-1]["content"]:
+            raise RuntimeError("simulated API failure")
+        return original(**kwargs)
+
+    fake_chat.create = failing_create
+    out = tmp_path / "raw.jsonl"
+    qs = [_q("q1", "What do the reviews say about Alpha Laptop?"),
+          _q("q2", "What do the reviews say about Gamma Phone?")]      # fails inside the agent call
+    written, failures = capture_all(qs, [], out, workers=2, app_git_sha="abc")
+    rows = read_raw(out)
+    assert failures == 1 and written == len(rows)
+    assert {r["query_id"] for r in rows} == {"q1"}                       # nothing partial for q2
+    fake_chat.create = original
+    written2, failures2 = capture_all(qs, [], out, workers=1, app_git_sha="abc")
+    assert failures2 == 0 and {r["query_id"] for r in read_raw(out)} == {"q1", "q2"}   # q2 re-runs on resume

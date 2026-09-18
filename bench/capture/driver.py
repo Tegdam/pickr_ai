@@ -9,6 +9,8 @@ database is needed and nothing is persisted to the app's tables.
 from __future__ import annotations
 
 import json
+import sys
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -74,9 +76,16 @@ def _done_ids(path: Path) -> set[str]:
 
 
 def capture_all(queries: list[GeneratedQuery], conversations: list[Conversation], out_path: Path,
-                workers: int = 4, app_git_sha: str | None = None) -> int:
+                workers: int = 4, app_git_sha: str | None = None) -> tuple[int, int]:
     """Run everything not already in out_path; append records as each unit
-    finishes so an interrupted capture resumes where it stopped."""
+    finishes so an interrupted capture resumes where it stopped.
+
+    Returns (records written, units that failed). Each unit's records are
+    written as a single buffered write so an interrupt or OSError mid-unit
+    never leaves a partial unit on disk. A unit whose call raises (an
+    APIError after the SDK's retries, a Chroma error, ...) is skipped and
+    counted as a failure instead of aborting the whole run; it stays absent
+    from out_path so the next invocation re-runs it."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = _done_ids(out_path)
@@ -84,6 +93,7 @@ def capture_all(queries: list[GeneratedQuery], conversations: list[Conversation]
     pending_c = [c for c in conversations if c.conversation_id not in done]
     coordinator = CoordinatorAgent()
     written = 0
+    failures = 0
     with Recorder() as recorder, RouteCapture.installed() as routes, out_path.open("a", encoding="utf-8") as fh:
         def unit_q(q):
             return run_single_turn(coordinator, q, recorder, routes, app_git_sha)
@@ -93,15 +103,30 @@ def capture_all(queries: list[GeneratedQuery], conversations: list[Conversation]
 
         pool = ThreadPoolExecutor(max_workers=workers)
         try:
-            futures = [pool.submit(unit_q, q) for q in pending_q] + [pool.submit(unit_c, c) for c in pending_c]
+            unit_of = {}
+            futures = []
+            for q in pending_q:
+                fut = pool.submit(unit_q, q)
+                unit_of[fut] = q.query_id
+                futures.append(fut)
+            for c in pending_c:
+                fut = pool.submit(unit_c, c)
+                unit_of[fut] = c.conversation_id
+                futures.append(fut)
             for fut in as_completed(futures):
-                for rec in fut.result():
-                    fh.write(json.dumps(rec.to_dict(), ensure_ascii=False) + "\n")
-                    written += 1
+                try:
+                    recs = fut.result()
+                except Exception:
+                    failures += 1
+                    print(f"capture: unit {unit_of[fut]} failed; it will be re-run on resume", file=sys.stderr)
+                    traceback.print_exc()
+                    continue
+                fh.write("".join(json.dumps(r.to_dict(), ensure_ascii=False) + "\n" for r in recs))
                 fh.flush()
+                written += len(recs)
         finally:
             # On Ctrl+C: drop everything still queued so workers stop after their
             # current unit instead of draining the whole run; finished units were
             # already written, so the next invocation resumes from there.
             pool.shutdown(wait=True, cancel_futures=True)
-    return written
+    return written, failures
