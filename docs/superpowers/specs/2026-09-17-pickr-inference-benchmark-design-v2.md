@@ -73,6 +73,8 @@ Budget (GB), three residency conditions:
 2. The fp16 draft costs ~1 GB of weights plus 33% more KV per token: roughly halves maximum concurrency. That is RQ4's "price of speculation" quantified in advance.
 3. Under full co-tenancy, concurrency 32 queues or fails; P4 is expected to find that edge.
 
+**P0a result (2026-09-18):** measured chat prompt median = **265 Qwen tokens** (p90 755, p99 877), far below the ~2k threshold → **prediction 1 stands**: 32 concurrent chat requests occupy ≈ 8.5k of ~70k KV tokens, so the P1 ladder to 32 is expected to be compute-bound, not KV-bound. First pre-registered prediction tested. See `bench/docs/p0a-writeup.md` §6.
+
 **Constraints on how the budget is applied:**
 
 - `--gpu-memory-utilization` (and SGLang's equivalent) is a fraction of *total* memory. It is set from the *measured free* amount at run start, recorded alongside that measurement in `config.yaml`, never 0.9 by reflex.
@@ -89,7 +91,7 @@ Budget (GB), three residency conditions:
 
 ### 3.2 Trace capture
 
-**Pipeline:** `bench/capture/` samples queries from `data/products.csv`, `data/reviews.csv`, `data/store_policies.csv` using templates per real routing path (recommendation, comparison, price comparison, store policy, FAQ, stock, review summary), seeded and deterministic, and drives `CoordinatorAgent.handle_query` in-process. A recording wrapper around `app.openai_client.client` captures every OpenAI call — messages, `response_format`, `temperature`, `max_tokens`, response text, `usage` — without altering behaviour. Calls are real (gpt-3.5-turbo) so that output lengths and multi-turn state are genuine. **Sample size: 1,500–2,000 queries** (~$2–3), because the records split across seven routing paths and three call roles, and the per-cell quantiles feed both §3.1 prediction 1 and the P0a validation check; ~500 would leave cells too thin. The capture is run once at this size — re-running later means a new seed and a provenance break. Multi-turn conversations run through `app/conversation.py` so history accumulates exactly as the app does it; they are exported as **three P4b traces with distinct turn-depth profiles** (shallow 2–3 turns, medium 4–5, deep 6+), each versioned separately.
+**Pipeline:** `bench/capture/` samples queries from `data/products.csv`, `data/reviews.csv`, `data/store_policies.csv` using templates per real routing path (recommendation, comparison, price comparison, store policy, FAQ, stock, review summary), seeded and deterministic, and drives `CoordinatorAgent.handle_query` in-process. A recording wrapper around `app.openai_client.client` captures every OpenAI call — messages, `response_format`, `temperature`, `max_tokens`, response text, `usage` — without altering behaviour. Calls are real (gpt-3.5-turbo) so that output lengths and multi-turn state are genuine. **Sample size: 1,500–2,000 queries** (measured 2026-09-18: 1.79M prompt + 128k completion tokens ≈ $1.10), because the records split across seven routing paths and three call roles, and the per-cell quantiles feed both §3.1 prediction 1 and the P0a validation check; ~500 would leave cells too thin. The capture is run once at this size — re-running later means a new seed and a provenance break. Multi-turn conversations run through `app/conversation.py` so history accumulates exactly as the app does it; they are exported as **three P4b traces with distinct turn-depth profiles** (shallow 2–3 turns, medium 4–5, deep 6+), each versioned separately.
 
 **One user turn is several LLM calls.** Guardrails fire a JSON-mode call on every query; the intent classifier fires on keyword-miss; then the agent call. Each LLM call is one trace record with `call_role: guardrail|classifier|agent`. The per-turn call structure is itself reported.
 
@@ -107,6 +109,16 @@ Budget (GB), three residency conditions:
 **Export:** `bench/traces/<workload>_v<N>.jsonl` in the client's custom-dataset format, plus `<workload>_v<N>.meta.json` holding length quantiles per workload and call role, generator seed, app git SHA, record counts by `provenance: generated|real`. Trace files are immutable once versioned; a change is a new version.
 
 **Validation set:** the LangSmith export of real emitted prompts lands in `bench/traces/validation/` in the same format. A check script compares generator-vs-real prompt-length quantiles per workload and asserts agreement within a stated tolerance; the result goes in the P0a writeup. Because real traffic is developer testing, writeups describe it as "developer testing traffic through the deployed app," never "production traffic."
+
+**Status (2026-09-18): deferred, not failed.** Prompt *construction* is verified by construction — every record is the exact message list Pickr's own code emitted. What is unverified is query *distribution* realism: whether the generator's query mix resembles what real users would send. The LangSmith project held no deployed-Space traffic at capture time (launch-week traces aged out of retention; no traffic since), so the check is deferred; with only developer-testing traffic available it would have been a weak check at best. The check script is retained (`bench/capture/validate.py`) and runs unchanged if traffic accumulates (P0a addendum B2, after the test-suite trace leak in `docs/decision-log.md` is fixed).
+
+**Measured facts (2026-09-18, seed 20260919, 5,530 calls over 1,959 turns) that later phases build on:**
+- **A turn is a serial chain of 2.82 LLM calls on average** (`guardrail_input` → [`classifier`] → `agent` → `guardrail_output`, with `condense` first from turn 1). User-perceived turn latency is the *sum* of the chain; the SLO's TTFT is the `guardrail_input` call's TTFT. Analysis reports A per `call_role` and additionally per turn (serial sum of e2e), never pooled across roles.
+- **`guardrail_output` is the long call on every turn** (Qwen p50/p90 = 759/824 tokens in A, 562/618 in B), not the agent call (288/310 in A, 90/130 in B). Workload A's length distribution is dominated by a call role assumed short when the spec was written.
+- **Workload B agent prompts p50 = 90 tokens** — a genuinely short-prompt workload (median 2 reviews/product); confirms the withdrawn P1 knee prediction for B.
+- **Condense prompts plateau:** p50 ≈ 170 → 230–300 → 340–390 tokens over turns 1–3, then flat ≈ 340–370 for turns 4–7 as `HISTORY_WINDOW` slides — real turn-indexed growth is bounded, supporting the P4b Arm 1 framing.
+- **55% of routing goes through the LLM classifier** (every recommendation query, plus natural phrasings elsewhere), so the classifier call is a first-class part of the interactive workload.
+- 18 of 1,959 turns were guardrail-blocked (real behaviour, kept in the traces as `guardrail_input`-only turns).
 
 ### 3.3 SLO (pre-registered)
 
@@ -264,7 +276,7 @@ Ordered by expected impact.
 
 | Phase | Work | Estimate |
 |---|---|---|
-| **P0a** | Capture generator + recorder, trace export, LangSmith export, validation check; writeup. **Exit:** traces v1 exist with validated quantiles; §3.1 prediction 1 re-evaluated against the measured median | 4–5 days |
+| **P0a** | Capture generator + recorder, trace export, LangSmith export, validation check; writeup. **Exit (amended 2026-09-18):** traces v1 exist with per-workload, per-call-role length distributions measured in Qwen tokens, and §3.1 prediction 1 re-evaluated against the measured chat median; external validation deferred with the check script retained and the reason logged. **Met 2026-09-18** (`bench/traces/*_v1.*`, `bench/docs/p0a-writeup.md`) | 4–5 days (actual: 1 day) |
 | **P0b** | Runner, collection, env capture, engine-flag verification (first), calibration runs, OOM/pin/graph/host-reservation probes, docker-flavour decision; writeup. **Exit:** variance floor and harness ceiling (≥ 3× the study's peak rate) quantified; engine flags verified at pins; probes done | 1.5 weeks |
 | **P1** | 72 runs (~7 h GPU) + optional Int8 point; knee analysis; SLO fallback evaluated; writeup | 3 days |
 | **P2** | ~480 runs (~45 h GPU, 4–5 nights) + correctness pass; crossover analysis; writeup | 2 weeks |
