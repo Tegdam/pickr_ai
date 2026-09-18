@@ -9,7 +9,7 @@ for the generator's distributions, not as the benchmark corpus (spec §3.2).
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .recorder import classify_call_role
@@ -24,14 +24,44 @@ def _first_choice(outputs: dict) -> tuple[str, str | None]:
     return msg.get("content") or "", ch.get("finish_reason")
 
 
+def _usage(outputs: dict) -> tuple[int | None, int | None]:
+    # langsmith's wrap_openai pops "usage" from the response body and writes
+    # "usage_metadata": {input_tokens, output_tokens, total_tokens} instead
+    # (langsmith 0.11.0, _openai.py:284-289). Support both shapes.
+    usage = (outputs or {}).get("usage")
+    if isinstance(usage, dict):
+        return usage.get("prompt_tokens"), usage.get("completion_tokens")
+    usage_metadata = (outputs or {}).get("usage_metadata")
+    if isinstance(usage_metadata, dict):
+        return usage_metadata.get("input_tokens"), usage_metadata.get("output_tokens")
+    return None, None
+
+
 def run_to_record(run, call_index: int) -> dict | None:
+    if getattr(run, "error", None):
+        return None  # errored runs never produced a real response
     inputs = run.inputs or {}
     messages = inputs.get("messages")
     if not isinstance(messages, list):
         return None  # embeddings / moderation / non-chat runs
     text, finish = _first_choice(run.outputs or {})
-    usage = (run.outputs or {}).get("usage") or {}
+    prompt_tokens, completion_tokens = _usage(run.outputs or {})
     query_id = f"ls-{run.trace_id}"
+
+    start_time = run.start_time
+    end_time = getattr(run, "end_time", None)
+    if isinstance(start_time, datetime) and isinstance(end_time, datetime):
+        latency_ms = (end_time - start_time).total_seconds() * 1000
+    else:
+        latency_ms = None
+
+    if isinstance(start_time, datetime):
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        captured_at = start_time.isoformat()
+    else:
+        captured_at = str(run.start_time)
+
     return {
         "record_id": f"{query_id}-c{call_index}",
         "query_id": query_id,
@@ -52,10 +82,10 @@ def run_to_record(run, call_index: int) -> dict | None:
         "max_tokens": inputs.get("max_tokens"),
         "response_text": text,
         "finish_reason": finish,
-        "prompt_tokens_openai": usage.get("prompt_tokens"),
-        "completion_tokens_openai": usage.get("completion_tokens"),
-        "latency_ms": 0.0,
-        "captured_at": run.start_time.isoformat() if isinstance(run.start_time, datetime) else str(run.start_time),
+        "prompt_tokens_openai": prompt_tokens,
+        "completion_tokens_openai": completion_tokens,
+        "latency_ms": latency_ms,
+        "captured_at": captured_at,
         "provenance": "real",
         "app_git_sha": None,
     }
