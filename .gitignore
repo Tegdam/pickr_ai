@@ -18,3 +18,7 @@ __pycache__/
 
 # Generated RAG index (rebuildable from data/store_policies.csv)
 data/chroma_db/
+
+# Benchmark run artifacts (large, regenerable from configs); traces are committed on purpose
+bench/results/
+bench/figures/

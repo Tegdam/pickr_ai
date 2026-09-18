@@ -1,0 +1,6 @@
+# Bench-only dependencies. Never merged into the app's requirements.txt (spec §1).
+transformers>=4.45   # Qwen2.5 tokenizer + chat template rendering only
+langsmith            # already an app dep; listed so bench installs standalone
+numpy
+pandas
+pytest
