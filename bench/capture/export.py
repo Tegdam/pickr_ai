@@ -109,6 +109,14 @@ def _dist(rows: list[dict]) -> dict:
     }
 
 
+def _transformers_version() -> str | None:
+    try:
+        import transformers
+    except Exception:
+        return None
+    return getattr(transformers, "__version__", None)
+
+
 def write_meta(rows: list[dict], path: Path, *, tokenizer: QwenTokenizer, seed: int, app_git_sha: str | None,
                raw_path: str, trace_sha256: str, extra: dict | None = None) -> dict:
     by_role: dict[str, list[dict]] = {}
@@ -125,10 +133,12 @@ def write_meta(rows: list[dict], path: Path, *, tokenizer: QwenTokenizer, seed: 
         "trace_sha256": trace_sha256,
         "tokenizer": {"model_id": tokenizer.model_id, "revision": tokenizer.revision,
                       "template_sha256": tokenizer.template_sha256},
+        "transformers_version": _transformers_version(),
         "counts": {"total": len(rows), "by_provenance": by_prov,
                    "by_call_role": {k: len(v) for k, v in by_role.items()}},
         **_dist(rows),
         "by_call_role": {k: _dist(v) for k, v in by_role.items()},
+        "row_order": "capture completion order (non-deterministic across runs; files are immutable)",
         "format": "vllm bench serve custom dataset (prompt, output_tokens); prompts pre-rendered with the "
                   "Qwen2.5 chat template for the completions endpoint with --skip-chat-template",
     }
@@ -187,20 +197,28 @@ def export_all(raw_path: Path, out_dir: Path, version: int, tokenizer: QwenToken
     schema_sha = hashlib.sha256(schema_path.read_bytes()).hexdigest()
     common = dict(tokenizer=tokenizer, seed=seed, app_git_sha=app_git_sha, raw_path=str(raw_path))
 
+    # Build every row list before writing anything, so a failure building a
+    # later workload's rows never leaves an earlier one written to disk.
+    chat_rows = build_rows(a, tokenizer, "A")
+    summarization_rows = build_rows(b, tokenizer, "B")
+    structured_rows = build_rows(c_src, tokenizer, "C", schema=schema)
+    multiturn_rows = {profile: build_rows(conv_by_profile[profile], tokenizer, f"multiturn_{profile}")
+                      for profile in PROFILES}
+
     written: list[Path] = []
-    written += _emit(build_rows(a, tokenizer, "A"), out_dir, "chat", version,
+    written += _emit(chat_rows, out_dir, "chat", version,
                      extra={"workload": "A", "raw_records": len(records),
                             "dropped_empty_response": count_empty_responses(a)}, **common)
-    written += _emit(build_rows(b, tokenizer, "B"), out_dir, "summarization", version,
+    written += _emit(summarization_rows, out_dir, "summarization", version,
                      extra={"workload": "B", "raw_records": len(records),
                             "dropped_empty_response": count_empty_responses(b)}, **common)
-    written += _emit(build_rows(c_src, tokenizer, "C", schema=schema), out_dir, "structured", version,
+    written += _emit(structured_rows, out_dir, "structured", version,
                      extra={"workload": "C", "source_workload": "A", "schema_file": SCHEMA_REL,
                             "schema_sha256": schema_sha, "raw_records": len(records),
                             "dropped_empty_response": count_empty_responses(c_src)}, **common)
     for profile in PROFILES:
         conv = conv_by_profile[profile]
-        written += _emit(build_rows(conv, tokenizer, f"multiturn_{profile}"), out_dir, f"multiturn_{profile}",
+        written += _emit(multiturn_rows[profile], out_dir, f"multiturn_{profile}",
                          version, extra={"workload": f"multiturn_{profile}", "profile": profile,
                                          "note": "condense-call prompts in turn order; the app never resends "
                                                  "history to the agent (HISTORY_WINDOW bounds the transcript)",
