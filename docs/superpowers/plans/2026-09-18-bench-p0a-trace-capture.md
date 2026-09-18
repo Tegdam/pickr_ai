@@ -884,15 +884,13 @@ FOLLOW_UPS: dict[str, list[str]] = {
 
 def _fill(template: str, catalog: Catalog, rng: random.Random) -> str:
     in_stock = catalog.in_stock
-    reviewed = catalog.reviewed or in_stock
     p1, p2 = rng.sample(in_stock, 2)
     prices = sorted(p.price for p in in_stock if p.price is not None)
     price = int(rng.choice(prices[len(prices) // 4:]) // 10 * 10) if prices else 500
     category = rng.choice(catalog.categories) if catalog.categories else "laptop"
     policy_type = rng.choice(catalog.policy_types) if catalog.policy_types else "returns"
     return template.format(
-        product=rng.choice(reviewed).name if "{product}" in template and "review" in template.lower()
-        else rng.choice(in_stock).name,
+        product=rng.choice(in_stock).name,
         p1=p1.name, p2=p2.name,
         category=category, category_text=category.replace("_", " "),
         brand=rng.choice(catalog.brands) if catalog.brands else "Acme",
@@ -1064,8 +1062,9 @@ def test_conversation_condenses_from_turn_one_and_windows_history(fake_chat, sma
     assert all(by_turn[t][0].call_role == "condense" for t in (1, 2, 3, 4))
     assert all(r.conversation_id == "c1" for r in records)
     # the condense prompt at turn 4 carries at most HISTORY_WINDOW rows of transcript
-    transcript = by_turn[4][0].messages[1]["content"]
-    assert transcript.count("\nCustomer: ") + transcript.count("\nAssistant: ") + transcript.startswith("Conversation so far:\nCustomer") <= HISTORY_WINDOW + 1
+    transcript = by_turn[4][0].messages[1]["content"].split("\n\nFollow-up message: ")[0]
+    rows = [l for l in transcript.splitlines() if l.startswith(("Customer: ", "Assistant: "))]
+    assert len(rows) == HISTORY_WINDOW          # 8 rows of history exist by turn 4; only the last 6 are sent
     # the resolved (condensed) query is what the coordinator saw
     assert by_turn[1][1].call_role == "guardrail_input"
     assert by_turn[1][1].messages[1]["content"] == "Is it in stock?"  # guardrail input sees the RAW query
