@@ -17,6 +17,7 @@ def test_compare_passes_when_quantiles_agree():
     assert cell["n_generated"] == 42 and cell["n_real"] == 11
     assert cell["status"] == "pass" and rep["overall_status"] == "pass"
     assert abs(cell["rel_diff_p50"]) < 0.05
+    assert rep["cells"]["all/agent"]["status"] == "pass"
 
 
 def test_compare_fails_when_generated_is_far_off():
@@ -56,4 +57,4 @@ def test_markdown_has_a_row_per_cell():
     tok = QwenTokenizer(StubHF(), "stub", "r")
     rep = compare([_rec(10)], [_rec(10, prov="real")], tok)
     md = to_markdown(rep)
-    assert "| A/agent |" in md and "overall" in md.lower()
+    assert "| A/agent |" in md and "| all/agent |" in md and "overall" in md.lower()

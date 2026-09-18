@@ -16,7 +16,10 @@ from .export import assign_workload, quantiles
 from .tokens import QwenTokenizer
 
 NOTE_ROUTING = ("routed_agent is unknown for real traffic, so real records are assigned by call_role only "
-                "(all to A); B and C cells have no real counterpart and are reported as insufficient_real.")
+                "(all to A); B and C cells have no real counterpart and are reported as insufficient_real. "
+                "The all/<call_role> cells pool every workload for that call_role (generated A+B+C vs real "
+                "A+B+C) and are the like-for-like comparison the writeup should lean on. condense calls are "
+                "excluded from validation entirely (multi-turn traces have no validation set).")
 
 
 def _lengths(records: list[dict], tokenizer: QwenTokenizer) -> dict[str, list[int]]:
@@ -25,8 +28,9 @@ def _lengths(records: list[dict], tokenizer: QwenTokenizer) -> dict[str, list[in
         w = assign_workload(r)
         if w is None:
             continue
-        key = f"{w}/{r['call_role']}"
-        out.setdefault(key, []).append(tokenizer.count(tokenizer.render(r["messages"])))
+        length = tokenizer.count(tokenizer.render(r["messages"]))
+        out.setdefault(f"{w}/{r['call_role']}", []).append(length)
+        out.setdefault(f"all/{r['call_role']}", []).append(length)
     return out
 
 
