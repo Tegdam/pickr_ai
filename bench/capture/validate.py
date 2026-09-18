@@ -56,7 +56,12 @@ def compare(generated: list[dict], real: list[dict], tokenizer: QwenTokenizer,
                       "p50_generated": qg["p50"], "p50_real": qr["p50"],
                       "p90_generated": qg["p90"], "p90_real": qr["p90"],
                       "rel_diff_p50": d50, "rel_diff_p90": d90, "status": status}
-    overall = "fail" if any(c["status"] == "fail" for c in cells.values()) else "pass"
+    if any(c["status"] == "fail" for c in cells.values()):
+        overall = "fail"
+    elif any(c["status"] == "pass" for c in cells.values()):
+        overall = "pass"
+    else:
+        overall = "insufficient"
     return {"tolerance": tolerance, "min_n": min_n, "cells": cells, "overall_status": overall,
             "notes": [NOTE_ROUTING]}
 

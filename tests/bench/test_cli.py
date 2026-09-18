@@ -44,7 +44,8 @@ def test_validate_writes_markdown(tmp_path, monkeypatch):
     gen.write_text(json.dumps(rec) + "\n")
     real.write_text(json.dumps({**rec, "provenance": "real", "routed_agent": None}) + "\n")
     out = tmp_path / "v.md"
-    assert cli.main(["validate", "--generated", str(gen), "--real", str(real), "--out", str(out)]) == 0
+    # its single real record is below min_n, so overall is "insufficient" -> exit 1
+    assert cli.main(["validate", "--generated", str(gen), "--real", str(real), "--out", str(out)]) == 1
     assert "| A/agent |" in out.read_text()
 
 
@@ -53,6 +54,12 @@ def test_validate_refuses_missing_inputs(tmp_path):
     present.write_text("")
     assert cli.main(["validate", "--generated", str(present), "--real", str(tmp_path / "nope.jsonl"), "--out", str(tmp_path / "v.md")]) == 1
     assert not (tmp_path / "v.md").exists()
+
+
+def test_langsmith_returns_1_when_nothing_exported(tmp_path, monkeypatch):
+    import bench.capture.langsmith_export as ls
+    monkeypatch.setattr(ls, "fetch_llm_runs", lambda project_name, since=None, client=None: [])
+    assert cli.main(["langsmith", "--project", "p", "--out", str(tmp_path / "ls.jsonl")]) == 1
 
 
 def test_export_reports_empty_raw_as_refusal(tmp_path, monkeypatch):

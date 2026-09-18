@@ -60,6 +60,10 @@ def _export(a) -> int:
 def _langsmith(a) -> int:
     since = datetime.fromisoformat(a.since).replace(tzinfo=timezone.utc) if a.since else None
     n = export_langsmith(a.project, Path(a.out), since=since)
+    if n == 0:
+        print(f"no chat runs exported from project {a.project}; check --project/--since and LANGSMITH_API_KEY",
+              file=sys.stderr)
+        return 1
     print(f"wrote {n} real records to {a.out}")
     return 0
 
@@ -75,7 +79,7 @@ def _validate(a) -> int:
     Path(a.out).write_text(to_markdown(report), encoding="utf-8")
     Path(a.out).with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"overall: {report['overall_status']} -> {a.out}")
-    return 0
+    return 1 if report["overall_status"] != "pass" else 0
 
 
 def build_parser() -> argparse.ArgumentParser:

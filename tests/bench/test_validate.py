@@ -46,6 +46,12 @@ def test_real_records_without_routing_are_assigned_by_call_role_only():
     assert "routed_agent is unknown for real traffic" in rep["notes"][0]
 
 
+def test_overall_is_insufficient_when_no_cell_can_be_judged():
+    tok = QwenTokenizer(StubHF(), "stub", "r")
+    rep = compare([_rec(10)], [_rec(10, prov="real")], tok)      # 1 real record < min_n
+    assert rep["overall_status"] == "insufficient"
+
+
 def test_markdown_has_a_row_per_cell():
     tok = QwenTokenizer(StubHF(), "stub", "r")
     rep = compare([_rec(10)], [_rec(10, prov="real")], tok)
