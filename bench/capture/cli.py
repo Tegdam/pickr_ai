@@ -18,7 +18,10 @@ from .validate import compare, to_markdown
 
 def git_sha() -> str | None:
     try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
+            sha += "-dirty"
+        return sha
     except Exception:
         return None
 

@@ -56,6 +56,38 @@ def test_validate_refuses_missing_inputs(tmp_path):
     assert not (tmp_path / "v.md").exists()
 
 
+def test_git_sha_appends_dirty_suffix_when_tree_is_dirty(monkeypatch):
+    def fake_check_output(args, text=True):
+        if args[:2] == ["git", "rev-parse"]:
+            return "deadbeef\n"
+        if args[:2] == ["git", "status"]:
+            return " M bench/capture/cli.py\n"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(cli.subprocess, "check_output", fake_check_output)
+    assert cli.git_sha() == "deadbeef-dirty"
+
+
+def test_git_sha_has_no_suffix_when_tree_is_clean(monkeypatch):
+    def fake_check_output(args, text=True):
+        if args[:2] == ["git", "rev-parse"]:
+            return "deadbeef\n"
+        if args[:2] == ["git", "status"]:
+            return ""
+        raise AssertionError(args)
+
+    monkeypatch.setattr(cli.subprocess, "check_output", fake_check_output)
+    assert cli.git_sha() == "deadbeef"
+
+
+def test_git_sha_returns_none_on_subprocess_failure(monkeypatch):
+    def raising(*a, **kw):
+        raise FileNotFoundError("no git")
+
+    monkeypatch.setattr(cli.subprocess, "check_output", raising)
+    assert cli.git_sha() is None
+
+
 def test_langsmith_returns_1_when_nothing_exported(tmp_path, monkeypatch):
     import bench.capture.langsmith_export as ls
     monkeypatch.setattr(ls, "fetch_llm_runs", lambda project_name, since=None, client=None: [])
