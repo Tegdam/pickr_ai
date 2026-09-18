@@ -22,8 +22,10 @@ class QwenTokenizer:
         from huggingface_hub import model_info
         from transformers import AutoTokenizer
 
-        tok = AutoTokenizer.from_pretrained(model_id, revision=revision)
-        resolved = revision or model_info(model_id).sha  # pin the exact commit for meta.json
+        # Resolve the commit first and download at exactly that commit, so the
+        # revision recorded in meta.json is the one the template came from.
+        resolved = revision or model_info(model_id).sha
+        tok = AutoTokenizer.from_pretrained(model_id, revision=resolved)
         return cls(tok, model_id, resolved)
 
     def render(self, messages: list[dict]) -> str:
