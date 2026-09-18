@@ -87,3 +87,16 @@ def test_capture_all_writes_jsonl_and_resumes(fake_chat, small_catalog, tmp_path
                 "prompt_tokens_openai", "completion_tokens_openai", "latency_ms", "captured_at", "provenance", "app_git_sha"}
     for line in out.read_text().splitlines():
         assert required <= set(json.loads(line))
+
+
+def test_capture_all_resumes_only_pending_units(fake_chat, small_catalog, tmp_path):
+    out = tmp_path / "raw.jsonl"
+    qs = [_q("q1", "What do the reviews say about Alpha Laptop?"), _q("q2", "Is Alpha Laptop in stock?", intent="stock")]
+    convs = [Conversation("c1", "shallow", (_q("c1-t0", "What do the reviews say about Alpha Laptop?"),
+                                              _q("c1-t1", "Is Alpha Laptop in stock?", "followup_review", "natural")))]
+    capture_all(qs[:1], [], out, workers=1, app_git_sha="abc")          # q1 done in a previous run
+    assert {r["query_id"] for r in read_raw(out)} == {"q1"}
+    n = capture_all(qs, convs, out, workers=2, app_git_sha="abc")       # re-run the same command
+    rows = read_raw(out)
+    assert n == 6 and len(rows) == 9                                     # q2 (1) + c1 (3 + 2) added; q1 not repeated
+    assert sum(r["query_id"] == "q1" for r in rows) == 3

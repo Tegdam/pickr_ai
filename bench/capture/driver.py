@@ -9,7 +9,7 @@ database is needed and nothing is persisted to the app's tables.
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from app.agents import CoordinatorAgent
@@ -91,11 +91,17 @@ def capture_all(queries: list[GeneratedQuery], conversations: list[Conversation]
         def unit_c(c):
             return run_conversation(coordinator, c, recorder, routes, app_git_sha)
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             futures = [pool.submit(unit_q, q) for q in pending_q] + [pool.submit(unit_c, c) for c in pending_c]
-            for fut in futures:
+            for fut in as_completed(futures):
                 for rec in fut.result():
                     fh.write(json.dumps(rec.to_dict(), ensure_ascii=False) + "\n")
                     written += 1
                 fh.flush()
+        finally:
+            # On Ctrl+C: drop everything still queued so workers stop after their
+            # current unit instead of draining the whole run; finished units were
+            # already written, so the next invocation resumes from there.
+            pool.shutdown(wait=True, cancel_futures=True)
     return written
