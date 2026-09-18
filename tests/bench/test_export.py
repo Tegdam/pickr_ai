@@ -166,6 +166,20 @@ def test_export_all_rejects_condense_records_outside_profiles(tmp_path, tok):
         export_all(raw, out, version=1, tokenizer=tok, seed=5, app_git_sha="abc")
 
 
+def test_condense_rejection_writes_nothing(tmp_path, tok):
+    raw = tmp_path / "raw.jsonl"
+    raw.write_text("\n".join(json.dumps(r) for r in [
+        _rec(),
+        _rec(record_id="x-c0", query_id="x", conversation_id="weird-0", turn_index=1, call_role="condense"),
+    ]) + "\n")
+    out = tmp_path / "traces"
+    (out / "schemas").mkdir(parents=True)
+    (out / "schemas" / "product_card.schema.json").write_text("{}")
+    with pytest.raises(ValueError, match="condense"):
+        export_all(raw, out, version=1, tokenizer=tok, seed=5, app_git_sha="abc")
+    assert not any(out.glob("*_v1.*"))
+
+
 def test_write_meta_is_immutable(tmp_path, tok):
     rows = build_rows([_rec()], tok, workload="B")
     path = tmp_path / "m.json"
