@@ -185,3 +185,24 @@ class RouteCapture(logging.Handler):
         query_id = ctx.query_id if ctx else "unknown"
         with self._lock:
             self.routes[query_id] = {"agent": m.group(1), "via": m.group(2), "status": m.group(3)}
+
+    @classmethod
+    def installed(cls):
+        """Context manager: install a RouteCapture on the app.agents logger for
+        the duration of the block and yield it."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            handler = cls()
+            logger = logging.getLogger("app.agents")
+            previous_level = logger.level
+            logger.addHandler(handler)
+            if logger.level > logging.INFO or logger.level == logging.NOTSET:
+                logger.setLevel(logging.INFO)
+            try:
+                yield handler
+            finally:
+                logger.removeHandler(handler)
+                logger.setLevel(previous_level)
+        return _cm()
