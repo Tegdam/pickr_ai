@@ -85,6 +85,8 @@ def classify_call_role(messages: list[dict]) -> str:
 
 
 def _extract(response) -> tuple[str, str | None, int | None, int | None]:
+    if not hasattr(response, "choices") or not response.choices:
+        return "", None, None, None
     choice = response.choices[0]
     text = getattr(choice.message, "content", None) or ""
     finish = getattr(choice, "finish_reason", None)
