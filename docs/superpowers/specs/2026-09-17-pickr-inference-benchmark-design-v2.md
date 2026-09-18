@@ -85,10 +85,11 @@ Budget (GB), three residency conditions:
 - **OOM-signal probe.** WSL2 runs the WDDM driver model, which can page GPU allocations to host RAM instead of failing. Deliberately over-allocate past the budget and observe. If it fails cleanly, record that. If it spills, build a detector — bandwidth collapse without a memory error, allocated-vs-reserved divergence as the tripwire — and apply it to every later run. Either outcome is a reportable 6 GB / WSL2 finding.
 - **Host reservation** measured at idle and tracked during runs (§6).
 - **CUDA-graph and workspace cost** measured for the pinned capture list.
+- **`ignore_eos` × acceptance-rate probe.** `ignore_eos` (§3.2) forces generation past the natural stopping point, so the draft predicts in a region the target would never have produced. Measure acceptance rate on a small sample with and without `ignore_eos`. If they diverge, the pre-registered handling is to report acceptance over the natural-length prefix only (the runner records per-request natural stop position from the no-`ignore_eos` reference so the prefix is identifiable); the P2 writeup states which rule applied.
 
 ### 3.2 Trace capture
 
-**Pipeline:** `bench/capture/` samples queries from `data/products.csv`, `data/reviews.csv`, `data/store_policies.csv` using templates per real routing path (recommendation, comparison, price comparison, store policy, FAQ, stock, review summary), seeded and deterministic, and drives `CoordinatorAgent.handle_query` in-process. A recording wrapper around `app.openai_client.client` captures every OpenAI call — messages, `response_format`, `temperature`, `max_tokens`, response text, `usage` — without altering behaviour. Calls are real (gpt-3.5-turbo; ~500 queries is well under $1) so that output lengths and multi-turn state are genuine. Multi-turn conversations (2–6 turns) run through `app/conversation.py` so history accumulates exactly as the app does it; those become the P4b prefix-cache trace.
+**Pipeline:** `bench/capture/` samples queries from `data/products.csv`, `data/reviews.csv`, `data/store_policies.csv` using templates per real routing path (recommendation, comparison, price comparison, store policy, FAQ, stock, review summary), seeded and deterministic, and drives `CoordinatorAgent.handle_query` in-process. A recording wrapper around `app.openai_client.client` captures every OpenAI call — messages, `response_format`, `temperature`, `max_tokens`, response text, `usage` — without altering behaviour. Calls are real (gpt-3.5-turbo) so that output lengths and multi-turn state are genuine. **Sample size: 1,500–2,000 queries** (~$2–3), because the records split across seven routing paths and three call roles, and the per-cell quantiles feed both §3.1 prediction 1 and the P0a validation check; ~500 would leave cells too thin. The capture is run once at this size — re-running later means a new seed and a provenance break. Multi-turn conversations run through `app/conversation.py` so history accumulates exactly as the app does it; they are exported as **three P4b traces with distinct turn-depth profiles** (shallow 2–3 turns, medium 4–5, deep 6+), each versioned separately.
 
 **One user turn is several LLM calls.** Guardrails fire a JSON-mode call on every query; the intent classifier fires on keyword-miss; then the agent call. Each LLM call is one trace record with `call_role: guardrail|classifier|agent`. The per-turn call structure is itself reported.
 
@@ -126,6 +127,8 @@ Budget (GB), three residency conditions:
 
 **Client:** `vllm bench serve` for both engines (D4), from a GPU-less container of the same pinned vLLM image on `--network host`, so the client version is captured with the server's. Both engines expose OpenAI-compatible chat, so the `openai-chat` backend serves both. Using one client removes the cross-tool TTFT/ITL definition mismatch the brief warns about; the client's definitions are still documented in the P0b writeup. Fallback if the pinned version lacks custom-dataset input or per-request output: SGLang's `bench_serving.py`.
 
+**Chat-template parity (P0b, before any comparative run).** The `openai-chat` backend sends messages and each *server* applies its own chat template. If vLLM and SGLang resolve Qwen2.5-3B-Instruct's template differently, identical input yields different prompt token counts — silently shifting prefill cost and prefix-cache behaviour, a phantom engine difference that would invalidate RQ3 without ever failing. P0b sends one fixed request to each engine and compares the reported prompt token counts. If they differ, either the template is pinned explicitly on both or the client switches to the completions endpoint with pre-templated text. The resolved template's hash is recorded in `env.json` either way.
+
 **What the stock client does not cover — built by the runner:**
 
 1. **Multi-turn replay** (P4b): ordered turns with growing history — `replay_multiturn.py`.
@@ -144,19 +147,19 @@ Budget (GB), three residency conditions:
 
 | Phase | Axes (× 3 reps unless noted) | Runs | Cuts and justification |
 |---|---|---|---|
-| **P0b** | 10 identical runs of one mid config (vLLM, A, c=8, spec off) → variance floor; echo-server request-rate ladder → harness ceiling; OOM-signal probe; CUDA-graph / host-reservation measurement | ~20 | — |
+| **P0b** | Engine method-availability check first; chat-template parity check; 10 identical runs of one mid config (vLLM, A, c=8, spec off) → variance floor; echo-server request-rate ladder → harness ceiling; OOM-signal probe; CUDA-graph / host-reservation measurement; `ignore_eos` × acceptance probe | ~25 | — |
 | **P1** | engine{vLLM, SGLang} × workload{A, B} × c{1, 2, 4, 8, 16, 32} | 72 | **FP16 dropped:** 3.09B × 2 B = 6.2 GB of weights alone. Optional single GPTQ-Int8 batch=1 point quantifies AWQ's own speed effect. Ladder extends to 64 by rule: while top-rung throughput > 1.1× the rung below. |
-| **P2a** k-sweep | engine{2} × workload{A, B} × method{ngram, draft} × k{1, 2, 3, 5, 8}, at c=1 | 120 | Full k × c cross (600 runs) cut: k is a per-step verification-cost trade-off most visible at batch=1, and the brief's k plot is at batch=1. Selects k* per (engine, workload, method). |
+| **P2a** k-sweep | engine{2} × workload{A, B} × method{ngram, draft} × k{1, 2, 3, 5, 8}, at c=1 | 120 | Full k × c cross (600 runs) cut: k is a per-step verification-cost trade-off most visible at batch=1, and the brief's k plot is at batch=1. Selects k* per (engine, workload, method). **Tie rule:** if the top two k values' confidence intervals overlap, both are carried into P2c's dense points rather than picking by point estimate. |
 | **P2b** crossover | engine{2} × workload{A, B} × method{off, ngram@k*, draft@k*} × c{P1 ladder + 2 dense points around the P1 knee} | 288 | `off` is re-run inside this sweep so the speedup ratio's denominator shares thermal state and randomisation with its numerator. |
-| **P2c** k-shift check | at the 2 dense points: k = the rung below k* | 48 | Guards the P2a cut — optimal k likely shrinks as batch grows. If the lower rung wins there, it is reported and the crossover recomputed at it. |
-| **P2d** correctness | engine{2} × method{2} × k{5} at c=1, 1 run each, 50-prompt subset, fixed seed, greedy: token-identity vs `off`. Control: `off` at c=1 vs c=8, to separate batch-numerics divergence from speculation divergence | 24 | Cheap; not a load test. |
-| **P3** | workload C: engine{2} × method{off, ngram@k*, draft@k*} × constrained{off, on} × c{ladder}; schema validity parsed on every output; hang/crash log per cell | 216 | A/B excluded — constraints only mean something on structured output. Methods restricted to P2 winners. Natural termination with `max_tokens` cap (§3.2). |
-| **P4a** goodput | engine{2} × condition{chat alone, + batch naive, + batch with engine priority control} × offered λ{5 points spanning below → above the P1 knee}, open-loop | 90 | An engine with no priority control yields a cell marked "none available" — a finding, not a gap. |
-| **P4b** prefix caching | cache{off, vLLM APC, SGLang RadixAttention} × multi-turn trace; TTFT vs turn index; hit-rates from `/metrics` | 9 | — |
+| **P2c** k-shift check | at the 2 dense points: k = the rung below k* (and the tied k, where the P2a tie rule fired) | 48 (+24 per tie) | Guards the P2a cut — optimal k likely shrinks as batch grows. If the lower rung wins there, it is reported and the crossover recomputed at it. |
+| **P2d** correctness | engine{2} × method{2} × k{5} at c=1, 1 run each on a 50-prompt subset (25 from A, 25 from B), fixed seed, **greedy**: token-identity vs `off` = 20 runs. Control: `off` at c=1 vs c=8 per engine = 4 runs, to separate batch-numerics divergence from speculation divergence | 24 | Cheap; not a load test. Identity is verified under greedy decoding and **assumed** to carry to the sampled regime the rest of the study runs in (per-call temperature from the trace records, matching the app); rejection sampling guarantees distributional, not token, equivalence there, so P2/P3 acceptance rates are reported as measured under sampling. |
+| **P3** | workload C: engine{2} × method{off, ngram@k*, draft@k*} × constrained{off, on} × c{ladder}; schema validity parsed on every output; hang/crash log per cell | 216 | A/B excluded — constraints only mean something on structured output. Methods restricted to P2 winners. Natural termination with `max_tokens` cap (§3.2). **Pre-registered cut under time pressure:** constrained{off} runs at the 2 dense points only, not the full ladder (−48 runs); the cut is announced before the sweep starts, never mid-sweep. |
+| **P4a** goodput | engine{2} × condition{chat alone, + batch naive, + batch with engine priority control} × offered λ{5 points}, open-loop | 90 | **λ ladder is fixed in absolute req/s**, derived once from the chat-alone measurement (spanning below → above the rate at which chat-alone reaches the P1 knee) and held constant across all three conditions, so the three curves share an x-axis. Converting per-condition via Little's law would use latency that changes with the condition. An engine with no priority control yields a cell marked "none available" — a finding, not a gap. |
+| **P4b** prefix caching | cache{off, vLLM APC, SGLang RadixAttention} × **3 distinct multi-turn traces** with different turn-depth profiles (shallow 2–3 turns, medium 4–5, deep 6+); TTFT vs turn index; hit-rates from `/metrics` | 27 | One trace could flatter either engine; this is the sharpest engine comparison in the study. |
 | **P4c** memory table | residency{target, + draft fp16, + draft AWQ, + draft + embedder} × max-concurrency probe | 12 | Draft AWQ reported as cost-and-quality (§3.1). |
 | **P5** | Jetson Orin Nano Super: P1 ladder (one engine) + P2b batch=1 points | ~42 | Hard timebox; ships as "where it stopped" if it expires. |
 
-**Total ≈ 950 runs** at ~5–7 min each (container start, readiness, ~200 requests, cooldown) ≈ 90 hours of unattended GPU time, dominated by P2/P3. Resume-from-state (§6) makes it tolerable.
+**Total ≈ 965 runs** at ~5–7 min each (container start, readiness, ~200 requests, cooldown) ≈ 90 hours of unattended GPU time, dominated by P2/P3. Resume-from-state (§6) makes it tolerable.
 
 **Pre-registered graph predictions** (an inversion is a signal, not a surprise):
 
@@ -252,7 +255,8 @@ Ordered by expected impact.
 7. **"Traffic imposed by the product"** is true of prompt construction, not of who sent the queries — handled by the validation-set framing in §3.2.
 8. **Client co-location** is low-risk at ≤ 64 concurrency; P0b's 3× ceiling test is the proof. If the client container competes with the engine for CPU, the ceiling test catches it before it corrupts timing.
 9. **HF cache must live on WSL2 ext4**, not `/mnt/c`: Docker Desktop bind-mounts from the Windows filesystem are slow enough to distort load and warmup time. Not a measurement risk after readiness, but a startup-time one.
-10. **Reference output lengths come from gpt-3.5-turbo**, a different model. Neutralised in P1/P2 by fixed `output_len`; in P3 natural termination makes output length a per-config observation.
+10. **Workload C's prompts were not written for schema output.** Re-issuing A's recommendation/comparison prompts under a schema overlay isolates the constraint's effect, but the model's natural output may fight the grammar in a way a purpose-written prompt would not — plausibly lowering acceptance and raising constraint overhead. **Known bias direction: toward finding a *larger* RQ2 effect.** The P3 writeup states this rather than leaving it to a reviewer.
+11. **Reference output lengths come from gpt-3.5-turbo**, a different model. Neutralised in P1/P2 by fixed `output_len`; in P3 natural termination makes output length a per-config observation.
 
 ---
 
@@ -265,7 +269,7 @@ Ordered by expected impact.
 | **P1** | 72 runs (~7 h GPU) + optional Int8 point; knee analysis; SLO fallback evaluated; writeup | 3 days |
 | **P2** | ~480 runs (~45 h GPU, 4–5 nights) + correctness pass; crossover analysis; writeup | 2 weeks |
 | **P3** | 216 runs (~20 h) + failure forensics; writeup | 1 week |
-| **P4** | Multi-turn replayer, priority-control discovery, ~110 runs, memory table; writeup | 1 week |
+| **P4** | Multi-turn replayer, priority-control discovery, ~130 runs, memory table; writeup | 1 week |
 | **P5** | Jetson, hard timebox | ≤ 1 week |
 | **Synthesis** | Assemble the blog series from per-phase writeups; cross-phase figures; version-stamped claims | 3–4 days |
 
