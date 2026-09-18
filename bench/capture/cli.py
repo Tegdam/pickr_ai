@@ -64,6 +64,10 @@ def _langsmith(a) -> int:
 
 
 def _validate(a) -> int:
+    for label, p in (("--generated", a.generated), ("--real", a.real)):
+        if not Path(p).exists():
+            print(f"{label} file not found: {p}", file=sys.stderr)
+            return 1
     tok = QwenTokenizer.load(model_id=a.tokenizer, revision=a.tokenizer_revision)
     report = compare(read_raw(Path(a.generated)), read_raw(Path(a.real)), tok, tolerance=a.tolerance, min_n=a.min_n)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)

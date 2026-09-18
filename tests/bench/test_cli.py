@@ -46,3 +46,21 @@ def test_validate_writes_markdown(tmp_path, monkeypatch):
     out = tmp_path / "v.md"
     assert cli.main(["validate", "--generated", str(gen), "--real", str(real), "--out", str(out)]) == 0
     assert "| A/agent |" in out.read_text()
+
+
+def test_validate_refuses_missing_inputs(tmp_path):
+    present = tmp_path / "g.jsonl"
+    present.write_text("")
+    assert cli.main(["validate", "--generated", str(present), "--real", str(tmp_path / "nope.jsonl"), "--out", str(tmp_path / "v.md")]) == 1
+    assert not (tmp_path / "v.md").exists()
+
+
+def test_export_reports_empty_raw_as_refusal(tmp_path, monkeypatch):
+    from bench.capture.tokens import QwenTokenizer
+    from tests.bench.test_tokens import StubHF
+    monkeypatch.setattr(cli.QwenTokenizer, "load", classmethod(lambda c, **kw: QwenTokenizer(StubHF(), "stub", "r")))
+    traces = tmp_path / "traces"
+    (traces / "schemas").mkdir(parents=True)
+    (traces / "schemas" / "product_card.schema.json").write_text("{}")
+    assert cli.main(["export", "--raw", str(tmp_path / "missing.jsonl"), "--out-dir", str(traces), "--version", "2", "--seed", "1"]) == 1
+    assert not any(traces.glob("*_v2.*"))
