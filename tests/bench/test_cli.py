@@ -61,6 +61,7 @@ def test_git_sha_appends_dirty_suffix_when_tree_is_dirty(monkeypatch):
         if args[:2] == ["git", "rev-parse"]:
             return "deadbeef\n"
         if args[:2] == ["git", "status"]:
+            assert "--untracked-files=no" in args   # capture outputs must not count as dirt
             return " M bench/capture/cli.py\n"
         raise AssertionError(args)
 
