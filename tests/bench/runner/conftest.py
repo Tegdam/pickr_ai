@@ -13,8 +13,8 @@ class FakeDocker:
         self.logs = {}
         self.digest = "sha256:" + "ab" * 32
 
-    def run(self, image, name, args, gpus=True, network_host=True, mounts=(), env=None, entrypoint=None):
-        self.calls.append(("run", image, name, list(args)))
+    def run(self, image, name, args, gpus=True, network_host=True, mounts=(), env=None, entrypoint=None, extra_args=None):
+        self.calls.append(("run", image, name, list(args), list(extra_args or [])))
         self.running.add(name)
         return "cid-" + name
 
@@ -41,10 +41,16 @@ class FakeHTTP:
     def __init__(self):
         self.healthy_after = 0   # number of health polls before 200
         self.polls = 0
+        self.ready_after = 0     # number of /ready polls before 200
+        self.ready_polls = 0
         self.posts = []
         self.metrics_text = ""
 
     def get(self, url, timeout=5):
+        if url.endswith("/ready"):
+            self.ready_polls += 1
+            ok = self.ready_polls > self.ready_after
+            return SimpleNamespace(status_code=200 if ok else 503, text="")
         if url.endswith("/health"):
             self.polls += 1
             ok = self.polls > self.healthy_after
