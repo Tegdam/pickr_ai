@@ -282,7 +282,30 @@ def test_run_probe_clock_pin_verifies_the_pin_holds(tmp_path, monkeypatch):
     assert result["pinned"] is True
     assert result["sm_clock_min"] == 2050 and result["sm_clock_max"] == 2060
     assert result["held"] is True
+    # mean(2050, 2060, 2055) == 2055.0 == the requested pin -- zero deviation.
+    assert result["sm_clock_mean"] == pytest.approx(2055.0)
+    assert result["sm_clock_deviation_mhz"] == pytest.approx(0.0)
     assert "-rgc" in calls[-1]  # reset still runs after sampling
+
+
+def test_run_probe_clock_pin_records_nonzero_deviation_from_requested_pin(tmp_path, monkeypatch):
+    monkeypatch.setattr(probes.subprocess, "run", lambda *a, **k: _FakeCompleted(returncode=0))
+    clock_readings = iter([2000, 2010])  # requested 2055 -- sits ~50 MHz low
+    gpu_reader = lambda cmd: {"sm_clock": next(clock_readings, 2005)}  # noqa: E731
+    state = {"t": 0.0}
+
+    def fake_clock():
+        state["t"] += 5.0
+        return state["t"]
+
+    result = probes.run_probe(
+        "clock_pin", {"clock_pin": {"sm_mhz": 2055}}, _scratch_paths(tmp_path),
+        docker=None, http=None, gpu_reader=gpu_reader, popen=None,
+        sleep=lambda s: None, clock=fake_clock,
+    )
+
+    assert result["sm_clock_mean"] == pytest.approx(2005.0)
+    assert result["sm_clock_deviation_mhz"] == pytest.approx(50.0)
 
 
 def test_run_probe_unknown_name_raises():
@@ -386,6 +409,8 @@ def test_run_oom_fraction_exited_without_oom_text_is_clean_fail_no_oom_text(tmp_
 
     assert result["outcome"] == "clean_fail_no_oom_text"
     assert "log_tail" in result
+    stop_calls = [c for c in fake_docker.calls if c["op"] == "stop" and c["name"] == f"bench-{cfg.run_id}"]
+    assert stop_calls, "engine must always be stopped, even on a clean failure without OOM text"
 
 
 def test_run_oom_fraction_success_is_served_and_always_stops(tmp_path, monkeypatch):
@@ -423,6 +448,112 @@ def test_run_oom_fraction_computes_ratios_vs_baseline(tmp_path, monkeypatch):
     assert result["outcome"] == "served"
     assert result["ready_ratio_vs_baseline"] == pytest.approx(10.0 / 5.0)
     assert result["rate_ratio_vs_baseline"] == pytest.approx(result["rate_tok_s"] / 100.0)
+
+
+# ---------------------------------------------------------------------------
+# _OOM_RE (fix round 2, item 3): whole-word match only.
+# ---------------------------------------------------------------------------
+
+
+def test_oom_regex_does_not_match_headroom_zoom_or_room():
+    assert probes._OOM_RE.search("plenty of headroom left") is None
+    assert probes._OOM_RE.search("zoom in on the chart") is None
+    assert probes._OOM_RE.search("clean the room please") is None
+
+
+def test_oom_regex_still_matches_real_oom_signatures():
+    assert probes._OOM_RE.search("CUDA out of memory. Tried to allocate ...")
+    assert probes._OOM_RE.search("raised an OOM error")
+    assert probes._OOM_RE.search("torch.OutOfMemoryError")
+    assert probes._OOM_RE.search("less than desired GPU memory utilization")
+    assert probes._OOM_RE.search("cudaErrorMemoryAllocation")
+
+
+# ---------------------------------------------------------------------------
+# _classify_oom_outcome (fix round 2, item 1): the five top-level outcomes.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_oom_outcome_fits_all_when_every_fraction_serves_cleanly():
+    ladder = [
+        {"fraction": 0.90, "outcome": "served", "rate_ratio_vs_baseline": 0.95, "ready_ratio_vs_baseline": 1.1},
+        {"fraction": 0.95, "outcome": "served", "rate_ratio_vs_baseline": 0.90, "ready_ratio_vs_baseline": 1.2},
+    ]
+    result = probes._classify_oom_outcome(ladder)
+    assert result["outcome"] == "fits_all"
+
+
+def test_classify_oom_outcome_clean_oom_boundary_when_first_failure_is_clean_oom():
+    ladder = [
+        {"fraction": 0.90, "outcome": "served", "rate_ratio_vs_baseline": 0.95, "ready_ratio_vs_baseline": 1.1},
+        {"fraction": 0.95, "outcome": "clean_oom"},
+        {"fraction": 0.98, "outcome": "clean_oom"},
+    ]
+    result = probes._classify_oom_outcome(ladder)
+    assert result["outcome"] == "clean_oom_boundary"
+    assert "0.95" in result["outcome_reason"]
+
+
+def test_classify_oom_outcome_spill_suspected_on_a_hung_fraction():
+    # This is the fix round 2 gap: a hung/paging fraction must never fall
+    # through to fits_all just because nothing else in the ladder tripped.
+    ladder = [
+        {"fraction": 0.90, "outcome": "served", "rate_ratio_vs_baseline": 0.95, "ready_ratio_vs_baseline": 1.1},
+        {"fraction": 0.95, "outcome": "slow_or_hung"},
+    ]
+    result = probes._classify_oom_outcome(ladder)
+    assert result["outcome"] == "spill_suspected"
+    assert "slow_or_hung" in result["outcome_reason"] and "0.95" in result["outcome_reason"]
+
+
+def test_classify_oom_outcome_spill_suspected_on_rate_or_ready_ratio():
+    rate_collapse = [{"fraction": 0.95, "outcome": "served", "rate_ratio_vs_baseline": 0.3, "ready_ratio_vs_baseline": 1.0}]
+    assert probes._classify_oom_outcome(rate_collapse)["outcome"] == "spill_suspected"
+
+    ready_collapse = [{"fraction": 0.95, "outcome": "served", "rate_ratio_vs_baseline": 0.9, "ready_ratio_vs_baseline": 4.0}]
+    assert probes._classify_oom_outcome(ready_collapse)["outcome"] == "spill_suspected"
+
+
+def test_classify_oom_outcome_inconclusive_on_an_ambiguous_failure():
+    for outcome in ("clean_fail_no_oom_text", "served_then_failed", "probe_error"):
+        ladder = [
+            {"fraction": 0.90, "outcome": "served", "rate_ratio_vs_baseline": 0.95, "ready_ratio_vs_baseline": 1.1},
+            {"fraction": 0.95, "outcome": outcome},
+        ]
+        result = probes._classify_oom_outcome(ladder)
+        assert result["outcome"] == "inconclusive", outcome
+        assert "0.95" in result["outcome_reason"]
+
+
+# ---------------------------------------------------------------------------
+# _probe_oom_signal: baseline_failed short-circuits the ladder (fix round 2,
+# item 2).
+# ---------------------------------------------------------------------------
+
+
+def test_probe_oom_signal_baseline_failed_skips_the_ladder_entirely(tmp_path, monkeypatch):
+    monkeypatch.setattr(probes, "wait_healthy", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("dead")))
+    build_calls = []
+    orig_probe_run_config = probes._probe_run_config
+
+    def counting_probe_run_config(paths, run_id, **kw):
+        build_calls.append(run_id)
+        return orig_probe_run_config(paths, run_id, **kw)
+
+    monkeypatch.setattr(probes, "_probe_run_config", counting_probe_run_config)
+
+    result = probes._probe_oom_signal(
+        {"fractions": [0.90, 0.95], "baseline_fraction": 0.85, "requests": 3},
+        _scratch_paths(tmp_path), docker=FakeDocker(), http=FakeHTTP(),
+        gpu_reader=_constant_gpu_reader, popen=None, sleep=lambda s: None, clock=_counting_clock(),
+    )
+
+    assert result["outcome"] == "baseline_failed"
+    assert "0.85" in result["outcome_reason"]
+    assert len(result["runs"]) == 1
+    assert result["runs"][0]["fraction"] == 0.85
+    # Only the baseline was ever launched -- the ladder must not run at all.
+    assert build_calls == ["probe-oom-baseline"]
 
 
 # ---------------------------------------------------------------------------

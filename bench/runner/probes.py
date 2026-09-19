@@ -169,7 +169,9 @@ def throttle_baseline(gpu_rows: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 _OOM_RE = re.compile(
-    r"out of memory|OutOfMemory|OOM|less than desired GPU memory utilization|cudaErrorMemoryAllocation",
+    # Fix round 2, item 3: a bare, case-insensitive "OOM" also matches
+    # "room"/"zoom"/"headroom" -- \b...\b requires it as its own word.
+    r"out of memory|OutOfMemory|\bOOM\b|less than desired GPU memory utilization|cudaErrorMemoryAllocation",
     re.IGNORECASE,
 )
 _GRAPH_GIB_RE = re.compile(r"graph capturing finished in.*?took\s+([0-9.]+)\s*gi?b", re.IGNORECASE)
@@ -274,9 +276,15 @@ def _probe_clock_pin(params: dict, paths: RunPaths, *, docker, http, gpu_reader,
             sleep(2.0)
         sm_min = min(samples) if samples else None
         sm_max = max(samples) if samples else None
+        mean_sm_clock = statistics.fmean(samples) if samples else None
         result["sm_clock_min"] = sm_min
         result["sm_clock_max"] = sm_max
         result["held"] = (sm_max - sm_min) <= 50 if (sm_min is not None and sm_max is not None) else False
+        result["sm_clock_mean"] = mean_sm_clock
+        # Fix round 2, item 4: how far the observed clock sat from the
+        # requested pin, not just whether it held steady around wherever it
+        # actually landed.
+        result["sm_clock_deviation_mhz"] = abs(mean_sm_clock - sm) if mean_sm_clock is not None else None
 
     reset = subprocess.run([*WIN_SMI, "-rgc"], capture_output=True, text=True, check=False)
     result["output"].update(reset_returncode=reset.returncode, reset_stdout=reset.stdout, reset_stderr=reset.stderr)
@@ -499,33 +507,70 @@ def _run_oom_fraction(cfg: RunConfig, paths: RunPaths, frac: float, timeout_s: f
     return result
 
 
-def _classify_oom_outcome(ladder_results: list[dict]) -> str:
-    """Fix round 1, item 4's top-level verdict: `clean_oom_boundary` if the
-    first fraction (ascending) that didn't serve failed with an OOM
-    signature; `spill_suspected` if any served fraction shows a >2x
-    throughput collapse or a >3x readiness slowdown relative to the
-    baseline (the WDDM-paging signature, spec §3.1) with no OOM error;
-    otherwise `fits_all`."""
-    first_failure = next((r for r in ladder_results if r.get("outcome") != "served"), None)
-    if first_failure is not None and first_failure.get("outcome") == "clean_oom":
-        return "clean_oom_boundary"
+def _classify_oom_outcome(ladder_results: list[dict]) -> dict:
+    """Fix round 2, item 1's top-level verdict -- vocabulary
+    `{clean_oom_boundary, spill_suspected, inconclusive, fits_all}`
+    (`baseline_failed` is handled one level up, before the ladder even
+    runs; see `_probe_oom_signal`). Rules, in order:
+
+    1. Any `slow_or_hung` fraction anywhere in the ladder -> `spill_suspected`
+       -- a live-but-glacial (paging) container IS the paging signature
+       itself, not something to fall through past. (Fix round 1 made this
+       classification *reachable* by no longer mislabelling it `clean_fail`;
+       fix round 1's own `_classify_oom_outcome` then failed to route it
+       anywhere but `fits_all` -- this closes that gap.)
+    2. Any served fraction with `rate_ratio_vs_baseline < 0.5` or
+       `ready_ratio_vs_baseline > 3` -> `spill_suspected` (throughput
+       collapse or readiness slowdown with no OOM error).
+    3. The first fraction (ascending) that didn't serve was `clean_oom`, and
+       neither rule above fired -> `clean_oom_boundary`.
+    4. The first non-served fraction was `clean_fail_no_oom_text` /
+       `served_then_failed` / `probe_error` (an ambiguous failure, not a
+       clean OOM and not a spill signal) -> `inconclusive`.
+    5. Every fraction served with no spill signal -> `fits_all`.
+
+    Returns `{"outcome": ..., "outcome_reason": ...}` -- the reason names
+    which rule fired and the fraction that triggered it, so a human reading
+    `oom_signal-*.json` doesn't have to re-derive the verdict."""
+    for r in ladder_results:
+        if r.get("outcome") == "slow_or_hung":
+            return {"outcome": "spill_suspected",
+                    "outcome_reason": f"slow_or_hung (live-but-glacial launch) at fraction {r['fraction']}"}
+
     for r in ladder_results:
         if r.get("outcome") != "served":
             continue
         rate_ratio, ready_ratio = r.get("rate_ratio_vs_baseline"), r.get("ready_ratio_vs_baseline")
-        if (rate_ratio is not None and rate_ratio < 0.5) or (ready_ratio is not None and ready_ratio > 3):
-            return "spill_suspected"
-    return "fits_all"
+        if rate_ratio is not None and rate_ratio < 0.5:
+            return {"outcome": "spill_suspected",
+                    "outcome_reason": f"rate_ratio_vs_baseline={rate_ratio:.3f} < 0.5 at fraction {r['fraction']}"}
+        if ready_ratio is not None and ready_ratio > 3:
+            return {"outcome": "spill_suspected",
+                    "outcome_reason": f"ready_ratio_vs_baseline={ready_ratio:.3f} > 3 at fraction {r['fraction']}"}
+
+    first_failure = next((r for r in ladder_results if r.get("outcome") != "served"), None)
+    if first_failure is None:
+        return {"outcome": "fits_all", "outcome_reason": "every fraction served with no spill signal"}
+    if first_failure.get("outcome") == "clean_oom":
+        return {"outcome": "clean_oom_boundary",
+                "outcome_reason": f"first non-served fraction {first_failure['fraction']} was clean_oom"}
+    return {"outcome": "inconclusive",
+            "outcome_reason": (f"first non-served fraction {first_failure['fraction']} was "
+                                f"{first_failure.get('outcome')} (not clean_oom, no spill signal)")}
 
 
 def _probe_oom_signal(params: dict, paths: RunPaths, *, docker, http, gpu_reader, popen, sleep, clock) -> dict:
     """Spec §3.1 OOM-signal probe: WSL2's WDDM driver model can page GPU
-    allocations to host RAM instead of failing cleanly. For each fraction
-    (ascending): does the launch fail cleanly, hang/page, or serve? If it
-    serves, compare a small timed-request rate and readiness time against
-    the `baseline_fraction` run's -- a throughput collapse or readiness
-    slowdown without an OOM error is the WDDM-paging signature (fix round 1,
-    items 1-4; see `_run_oom_fraction`/`_classify_oom_outcome`)."""
+    allocations to host RAM instead of failing cleanly. If the baseline
+    fraction itself doesn't serve, there is no reference to compare the
+    ladder against -- the ladder is skipped entirely and `outcome:
+    "baseline_failed"` is returned with just the baseline's own row (fix
+    round 2, item 2). Otherwise, for each ladder fraction (ascending): does
+    the launch fail cleanly, hang/page, or serve? If it serves, compare a
+    small timed-request rate and readiness time against the baseline's --
+    a throughput collapse or readiness slowdown without an OOM error is the
+    WDDM-paging signature (see `_run_oom_fraction`/`_classify_oom_outcome`
+    for the full outcome vocabulary, fix rounds 1-2)."""
     _preflight_guard(docker)
     fractions = sorted(params.get("fractions", [0.90, 0.95, 0.98, 1.00]))
     baseline_fraction = params.get("baseline_fraction", 0.85)
@@ -560,8 +605,23 @@ def _probe_oom_signal(params: dict, paths: RunPaths, *, docker, http, gpu_reader
     except Exception as e:  # noqa: BLE001 - item 3: a totally unexpected failure still yields a JSON-able row
         baseline = {"fraction": baseline_fraction, "outcome": "probe_error",
                      "detail": str(e), "error_type": type(e).__name__}
-    baseline_rate = baseline.get("rate_tok_s") if baseline.get("outcome") == "served" else None
-    baseline_ready_s = baseline.get("ready_s") if baseline.get("outcome") == "served" else None
+
+    if baseline.get("outcome") != "served":
+        # Fix round 2, item 2: a dead baseline means there is no reference
+        # rate/readiness time to compare the ladder against at all -- every
+        # ladder fraction would be launched, measured and classified against
+        # nothing, burning a full ladder's worth of launches for a verdict
+        # that can't mean anything. Fail fast and say so, but still write the
+        # baseline's own row (never lose it).
+        return {
+            "baseline_fraction": baseline_fraction, "fractions": fractions, "runs": [baseline],
+            "outcome": "baseline_failed",
+            "outcome_reason": f"baseline fraction {baseline_fraction} did not serve "
+                               f"(outcome={baseline.get('outcome')})",
+        }
+
+    baseline_rate = baseline.get("rate_tok_s")
+    baseline_ready_s = baseline.get("ready_s")
     # Item 1: the ladder's own readiness budget is derived from how long the
     # baseline actually took to become healthy, not the full 900s engine
     # timeout -- a 3x-or-more readiness slowdown is itself the paging
@@ -580,7 +640,7 @@ def _probe_oom_signal(params: dict, paths: RunPaths, *, docker, http, gpu_reader
 
     return {
         "baseline_fraction": baseline_fraction, "fractions": fractions,
-        "runs": runs, "outcome": _classify_oom_outcome(ladder_results),
+        "runs": runs, **_classify_oom_outcome(ladder_results),
     }
 
 
