@@ -84,7 +84,7 @@ def test_image_present_true_when_inspect_returns_output(monkeypatch):
     def fake_subprocess_run(cmd, check, capture_output, text):
         assert list(cmd) == ["docker", "image", "inspect", "vllm/vllm-openai:v0.29.0"]
         assert check is False
-        return SimpleNamespace(stdout='[{"Id": "sha256:abc"}]\n', stderr="")
+        return SimpleNamespace(stdout='[{"Id": "sha256:abc"}]\n', stderr="", returncode=0)
 
     import bench.runner.docker as docker_mod
 
@@ -94,9 +94,11 @@ def test_image_present_true_when_inspect_returns_output(monkeypatch):
     assert d.image_present("vllm/vllm-openai:v0.29.0") is True
 
 
-def test_image_present_false_when_inspect_returns_nothing(monkeypatch):
+def test_image_present_false_when_image_is_missing(monkeypatch):
+    # Real docker prints "[]" to STDOUT for a missing image and exits 1 --
+    # deciding on stdout would report the image as present.
     def fake_subprocess_run(cmd, check, capture_output, text):
-        return SimpleNamespace(stdout="", stderr="Error: No such image")
+        return SimpleNamespace(stdout="[]\n", stderr="Error response from daemon: No such image", returncode=1)
 
     import bench.runner.docker as docker_mod
 
