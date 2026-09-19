@@ -6,8 +6,9 @@ from tests.bench.runner.test_engine import _cfg
 
 def _summary(**over):
     base = {
-        "completed": 200,
+        "attempted": 200,
         "error_rate": 0.0,
+        "host_drift_flag": False,
         "host_share_drift_mb": 10,
         "acceptance_rate_mean": 0.7,
         "acceptance_source": "vllm_counters",
@@ -23,11 +24,11 @@ def test_clean_run_is_valid():
     assert valid is True and reason is None
 
 
-def test_completed_short_of_num_prompts_is_invalid():
+def test_attempted_short_of_num_prompts_is_invalid():
     cfg = _cfg(num_prompts=200)
-    valid, reason = check(cfg, _summary(completed=190), spec_on=False, thresholds=Thresholds())
+    valid, reason = check(cfg, _summary(attempted=190), spec_on=False, thresholds=Thresholds())
     assert valid is False
-    assert "completed" in reason and "190" in reason and "200" in reason
+    assert "attempted" in reason and "190" in reason and "200" in reason
 
 
 def test_error_rate_above_threshold_is_invalid():
@@ -43,16 +44,43 @@ def test_error_rate_at_threshold_is_valid():
     assert valid is True and reason is None
 
 
-def test_host_share_drift_above_threshold_is_invalid():
+# Ruling P22: a single failed request (attempted == num_prompts, one of them
+# an error) no longer fails rule (1) outright -- it is judged by error rate.
+def test_one_failure_at_low_error_rate_is_valid():
     cfg = _cfg(num_prompts=200)
-    valid, reason = check(cfg, _summary(host_share_drift_mb=300), spec_on=False, thresholds=Thresholds())
+    valid, reason = check(cfg, _summary(attempted=200, error_rate=0.005), spec_on=False, thresholds=Thresholds())
+    assert valid is True and reason is None
+
+
+def test_several_failures_above_error_rate_threshold_is_invalid():
+    cfg = _cfg(num_prompts=200)
+    valid, reason = check(cfg, _summary(attempted=200, error_rate=0.015), spec_on=False, thresholds=Thresholds())
+    assert valid is False
+    assert "error_rate" in reason
+
+
+def test_attempted_short_with_zero_failures_is_invalid_attempted():
+    # e.g. completed = N-1, failed = 0: the client never even attempted one
+    # of the prompts (a crash/hang, not a request-level failure).
+    cfg = _cfg(num_prompts=200)
+    valid, reason = check(cfg, _summary(attempted=199, error_rate=0.0), spec_on=False, thresholds=Thresholds())
+    assert valid is False
+    assert "attempted" in reason
+
+
+def test_host_drift_flag_true_is_invalid():
+    cfg = _cfg(num_prompts=200)
+    valid, reason = check(cfg, _summary(host_drift_flag=True, host_share_drift_mb=300),
+                           spec_on=False, thresholds=Thresholds())
     assert valid is False
     assert "host_share_drift_mb" in reason
 
 
-def test_host_share_drift_none_does_not_invalidate():
+def test_host_drift_flag_false_does_not_invalidate_even_with_large_value():
+    # assertions trusts the pre-computed flag rather than recomputing it.
     cfg = _cfg(num_prompts=200)
-    valid, reason = check(cfg, _summary(host_share_drift_mb=None), spec_on=False, thresholds=Thresholds())
+    valid, reason = check(cfg, _summary(host_drift_flag=False, host_share_drift_mb=9999),
+                           spec_on=False, thresholds=Thresholds())
     assert valid is True
 
 
