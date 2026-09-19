@@ -165,6 +165,32 @@ Model Runner V2 does not yet support ngram/ngram_gpu speculative decoding; using
 
 so baseline-vs-spec would compare two model runners. Verified that `VLLM_USE_V2_MODEL_RUNNER=0` puts the baseline on the V1 runner (`gpu_model_runner.py:5471`) cleanly. See Decisions.
 
+### 3.6 Sampling defaults (ruling P9)
+
+From `vllm serve --help=all`, verbatim:
+
+```
+  --generation-config GENERATION_CONFIG
+                        The folder path to the generation config. Defaults to
+                        `"auto"`, the generation config will be loaded from
+                        model path. If set to `"vllm"`, no generation config
+                        is loaded, vLLM defaults will be used. If set to a
+                        folder path, the generation config will be loaded from
+                        the specified folder path. If `max_new_tokens` is
+                        specified in generation config, then it sets a server-
+                        wide limit on the number of output tokens for all
+                        requests. (default: auto)
+  --override-generation-config OVERRIDE_GENERATION_CONFIG
+                        Overrides or sets generation config. e.g.
+                        `{"temperature": 0.5}`. If used with `--generation-
+                        config auto`, the override parameters will be merged
+                        with the default config from the model. If used with
+                        `--generation-config vllm`, only the override
+                        parameters are used.
+```
+
+The Qwen snapshot ships a `generation_config.json` (listed in §2), so the default `auto` would inject the model's recommended sampling parameters (temperature/top_p/top_k/repetition_penalty) into every request that does not set them. Ruling P9: every vLLM arm passes `--generation-config vllm`, so the client is the only source of sampling parameters. Not exercised in the smokes (all ran `auto`; the parity requests set `temperature: 0` explicitly, and the client always sends `repetition_penalty: 1.0`). P2d's T=0 token-identity check between engines is the leakage detector: if either server still injects defaults, greedy outputs diverge.
+
 ## 4. SGLang 0.5.20 — flags, speculative methods, routes, metrics
 
 ### 4.1 Server flags (from `python -m sglang.launch_server --help`, verbatim)
@@ -227,6 +253,43 @@ _handle_ngram: speculative_eagle_topk = cfg.speculative_ngram_max_bfs_breadth (t
 
 `k` mapping: for STANDALONE with topk 1, `--speculative-num-steps k --speculative-num-draft-tokens k+1` (verified `3`/`4` -> `/get_server_info` reports `speculative_num_steps: 3, speculative_eagle_topk: 1, speculative_num_draft_tokens: 4`). For NGRAM, `--speculative-num-draft-tokens k+1` is the verify window; `--speculative-eagle-topk` is overridden to `ngram_max_bfs_breadth` (10) regardless of what is passed (observed: passed 1, server info says 10). `srt/managers/tokenizer_manager.py:2940`: per-request `num_proposed_drafts = spec_verify_ct * (speculative_num_draft_tokens - 1)`, so `k = num_draft_tokens - 1` is the accounting SGLang itself uses.
 
+Every ngram flag at the pin (`python -m sglang.launch_server --help | grep -i ngram`, run inside the container, verbatim; usage-line duplicates elided):
+
+```
+  --speculative-ngram-min-bfs-breadth SPECULATIVE_NGRAM_MIN_BFS_BREADTH
+                        The minimum breadth for BFS (Breadth-First Search) in
+                        ngram speculative decoding.
+  --speculative-ngram-max-bfs-breadth SPECULATIVE_NGRAM_MAX_BFS_BREADTH
+                        The maximum breadth for BFS (Breadth-First Search) in
+                        ngram speculative decoding.
+  --speculative-ngram-match-type {BFS,PROB}
+                        The match type for cache tree.
+  --speculative-ngram-max-trie-depth SPECULATIVE_NGRAM_MAX_TRIE_DEPTH
+                        The max trie depth for ngram speculative decoding.
+  --speculative-ngram-capacity SPECULATIVE_NGRAM_CAPACITY
+                        The cache capacity for ngram speculative decoding.
+  --speculative-ngram-external-corpus-path SPECULATIVE_NGRAM_EXTERNAL_CORPUS_PATH
+  --speculative-ngram-external-sam-budget SPECULATIVE_NGRAM_EXTERNAL_SAM_BUDGET
+  --speculative-ngram-external-corpus-max-tokens SPECULATIVE_NGRAM_EXTERNAL_CORPUS_MAX_TOKENS
+```
+
+Resolved defaults from `/get_server_info` on a live server: `speculative_ngram_min_bfs_breadth 1, speculative_ngram_max_bfs_breadth 10, speculative_ngram_max_trie_depth 18, speculative_ngram_match_type "BFS", speculative_ngram_capacity 10000000`.
+
+**Which flag is vLLM's `prompt_lookup_max`?** There is no `min/max-match-window` flag at 0.5.20. The match length is bounded by `--speculative-ngram-max-trie-depth`: `srt/speculative/ngram_worker.py:257-263`
+
+```
+        # Only the last max_trie_depth tokens can match; the ids are
+        # array.array, so list() the tails for list concat below.
+        input_tails = [
+            list(req.origin_input_ids[-self.max_trie_depth :]) for req in batch.reqs
+        ]
+        output_tails = [
+            list(req.output_ids[-self.max_trie_depth :]) for req in batch.reqs
+        ]
+```
+
+and `_efficient_concat_last_n(..., self.max_trie_depth)` builds the lookup key from the last `max_trie_depth` tokens (`ngram_worker.py:295-299`); the corpus is a suffix-automaton/trie over the request's own token stream (`cpp_ngram/ngram_corpus.py`, `NgramCorpus(max_trie_depth, min_bfs_breadth, max_bfs_breadth, draft_token_num, match_type)`). So `--speculative-ngram-max-trie-depth` is the counterpart of `prompt_lookup_max` (the longest suffix used for matching; SGLang has no separate minimum — it matches the longest available suffix up to the depth), and the branching flags are what vLLM lacks: ruling P15 pins `--speculative-ngram-max-bfs-breadth 1` so SGLang drafts a single linear chain like vLLM's ngram (this also makes the forced `speculative_eagle_topk` = 1, matching STANDALONE's topk). The equivalence is approximate — vLLM matches an n-gram of length in `[prompt_lookup_min, prompt_lookup_max]` and copies the continuation; SGLang matches the longest suffix ≤ `max_trie_depth` in its trie — and the writeup states it as such.
+
 Two launch requirements found by failure (verbatim errors):
 
 1. `--speculative-draft-model-path Qwen/Qwen2.5-0.5B-Instruct` with `HF_HUB_OFFLINE=1` fails before the server starts: `speculative_hook.py:54 _resolve_speculative_algorithm_alias -> get_config(speculative_draft_model_path)` is called **without the revision**, and the cache has no `refs/main` -> `huggingface_hub.errors.LocalEntryNotFoundError: Cannot find the requested files in the disk cache and outgoing traffic has been disabled.` Fix: pass the draft as its snapshot directory.
@@ -279,7 +342,22 @@ Labels observed: `{engine_type="unified",model_name="Qwen/Qwen2.5-3B-Instruct-AW
 
 (verbatim from a 64-token row-3 request on STANDALONE k=3). Summing `spec_num_correct_drafts` / `spec_num_proposed_drafts` across requests gives the cumulative counts that vLLM exposes on `/metrics`. The stock client ignores `sglext`, so the runner has to collect it itself (correctness/acceptance pass, not the load run).
 
-Prefix-cache "queries": SGLang has no per-token queries counter; the pair to record is `sglang:cached_tokens_total{cache_source="device"}` (hits, tokens) against `sglang:prompt_tokens_total` (all prefill tokens), plus the per-request `usage.prompt_tokens_details.cached_tokens` when `--enable-cache-report` is set.
+Prefix-cache "queries": SGLang has no per-token queries counter; the pair to record is `sglang:cached_tokens_total{cache_source="device"}` (hits, tokens) against `sglang:prompt_tokens_total` (all prefill tokens), plus the per-request `usage.prompt_tokens_details.cached_tokens` when `--enable-cache-report` is set. `prompt_tokens_total` is only a **proxy** for vLLM's `prefix_cache_queries_total`: after the identical 21 requests SGLang reported 6930 while vLLM reported 6924 (= 265 + 6659, exactly the prompt tokens sent) — SGLang's counter includes a few tokens vLLM's does not (the launch-time warmup `/generate` calls are the likely source; not chased). Compare hit *ratios* across engines only with that caveat.
+
+### 4.5 Sampling defaults (ruling P9)
+
+From `python -m sglang.launch_server --help`, verbatim:
+
+```
+  --sampling-defaults {openai,model}
+                        Where to get default sampling parameters. 'openai'
+                        uses SGLang/OpenAI defaults (temperature=1.0,
+                        top_p=1.0, etc.). 'model' uses the model's
+                        generation_config.json to get the recommended sampling
+                        parameters if available. Default is 'model'.
+```
+
+Ruling P9: every SGLang arm passes `--sampling-defaults openai`. Launched once (the awq_marlin kernel-identity run, §6.3): `/get_server_info` -> `"sampling_defaults": "openai"`. As on vLLM, P2d's T=0 identity check is the leakage detector.
 
 ## 5. Client — `vllm bench serve` at v0.29.0 (from `--help=all` and `vllm/benchmarks/serve.py`, `datasets/datasets.py`, `lib/endpoint_request_func.py`)
 
@@ -353,7 +431,7 @@ All three agree (`MATCH` on every launch, including the spec arms; row 19: 699 o
 | `draft_model` k=3 (`{"method":"draft_model","model":"Qwen/Qwen2.5-0.5B-Instruct","revision":"7ae55...","num_speculative_tokens":3}`) | pin memory only (no dev mode) | healthy in 100 s; V1 runner forced | 2.88 GiB (target+draft) | **0.5 GiB = 10,976 tokens** ("5.36x") | 0.42 GiB (default list to 256) | 4415 MiB |
 | `ngram` (`{"method":"ngram","num_speculative_tokens":3,"prompt_lookup_max":4}`) | pin memory only | healthy in 88 s; V1 runner forced | 1.95 GiB | 1.31 GiB = 38,144 tokens | 0.28 GiB | 4419 MiB |
 
-First launch without `VLLM_WSL2_ENABLE_PIN_MEMORY=1` exited in 52 s with `RuntimeError: UVA is not available` (§3.5). The `draft_model` launch logged `ERROR [repo_utils.py:119] Error retrieving safetensors: Cannot reach https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae55.../model.safetensors: offline mode is enabled` twice and then loaded the draft from the cache anyway — noise, but pass the snapshot dir instead. Kernel: `awq.py:448] Using MarlinLinearKernel for AutoAWQMarlinLinearMethod` (vLLM's `--quantization awq` resolves to `auto_awq` -> Marlin). Attention: `Using FLASH_ATTN attention backend ... FlashAttention version 2`. Engine init ≈ 30 s of which torch.compile ≈ 20 s (cached under `/root/.cache/vllm` inside the container, lost with the container).
+First launch without `VLLM_WSL2_ENABLE_PIN_MEMORY=1` exited in 52 s with `RuntimeError: UVA is not available` (§3.5). The `draft_model` launch logged `ERROR [repo_utils.py:119] Error retrieving safetensors: Cannot reach https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae55.../model.safetensors: offline mode is enabled` twice and then loaded the draft from the cache anyway — harmless noise; this repo-id + `"revision"` form is the verified one (a snapshot-dir `"model"` value was not launched on vLLM). Kernel: `awq.py:448] Using MarlinLinearKernel for AutoAWQMarlinLinearMethod` (vLLM's `--quantization awq` resolves to `auto_awq` -> Marlin). Attention: `Using FLASH_ATTN attention backend ... FlashAttention version 2`. Engine init ≈ 30 s of which torch.compile ≈ 20 s (cached under `/root/.cache/vllm` inside the container, lost with the container).
 
 Spec counters after 20 greedy requests (rows 0–19, max_tokens 64), verbatim:
 
@@ -376,6 +454,7 @@ Routes: `GET /health -> 200`, `GET /version -> 200 {"version":"0.29.0"}`, `POST 
 | target only, `--quantization awq` | healthy 95–101 s | 1.98 GB | 57,014 tokens (0.98 + 0.98 GB) | 5477–5529 MiB | `available_gpu_mem=0.00 GB` after graphs; prefill graph 40.8 s / 0.40 GB; decode graphs `bs=[1, 2, 4, 8]` (default) |
 | target only, `--mem-fraction-static 0.60` | healthy 91 s | 1.98 GB | 28,239 tokens | 4521 MiB | `available_gpu_mem=0.72 GB` |
 | target only, **`--quantization awq_marlin`** | healthy **288 s** | 1.98 GB | 56,786 tokens | 5345 MiB | see kernel finding below |
+| target only, `awq_marlin` + `--sampling-defaults openai` (fix round 1) | healthy **348 s** | 1.99 GB | 56,786 tokens | n/a (no client run) | kernel line + `/get_server_info` pasted below |
 | STANDALONE k=3 (draft = snapshot dir, `unquant`, steps 3 / topk 1 / draft tokens 4) | healthy 112–114 s | 1.98 + 0.98 GB | **17,142 tokens** (target 0.29+0.29 GB fp16, draft 0.10+0.10 GB bf16) | 5909–5913 MiB | `--cuda-graph-bs-decode 1 2 4 8 16 32` honoured for draft decode/extend graphs |
 | NGRAM (steps 3 / draft tokens 4) | healthy 97 s | 1.98 GB | 57,014 tokens | 5565 MiB | "The mixed chunked prefill are disabled because of using ngram speculative decoding."; topk resolved to 10 |
 
@@ -399,7 +478,26 @@ Baseline scheduler gauges after the same load: `num_running_reqs 1.0`, `num_queu
 | SGLang awq, 0.60 | 76.55 ms | 78.10 ms | 482 ms | 2989 ms | 19.67 s |
 | SGLang **awq_marlin**, 0.80 | **15.68 ms** | 15.57 ms | 338 ms | 838 ms | 5.00 s |
 
-The 5x decode gap is the kernel, not memory (0.60 changed nothing) and not the engine. Both engines must run the Marlin AWQ kernel (Decisions). The Marlin launch spent ~4 min in prefill-graph capture before `/health` answered, so readiness timeouts must allow ≥ 6 min for SGLang.
+The 5x decode gap is the kernel, not memory (0.60 changed nothing) and not the engine. Both engines must run the Marlin AWQ kernel (Decisions). The Marlin launches spent ~4–5 min in prefill-graph capture before `/health` answered (288 s and 348 s), so readiness timeouts must allow well over 6 min for SGLang (ruling P4: 900 s).
+
+Kernel identity under `--quantization awq_marlin` (second launch, with `--sampling-defaults openai`; container log, verbatim):
+
+```
+[2026-09-19 00:31:58] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+[2026-09-19 00:32:32] Load weight end. elapsed=9.71 s, type=Qwen2ForCausalLM, quant=awq, bits=4, avail mem=2.94 GB, mem usage=1.99 GB.
+```
+
+(the `quant=awq` in the load line names the checkpoint format; the kernel line is the one to record as `quantization_kernel`, ruling P10). `/get_server_info` on that server (selected keys, verbatim):
+
+```
+{"version": "0.5.20", "quantization": "awq_marlin", "sampling_defaults": "openai", "chunked_prefill_size": 2048, "max_prefill_tokens": 16384,
+ "max_total_num_tokens": 56786, "max_running_requests": 32, "context_length": 2048, "mem_fraction_static": 0.8,
+ "cuda_graph_bs_decode": [1, 2, 4, 8, 16, 32], "cuda_graph_max_bs_decode": null, "attention_backend": "flashinfer", "page_size": 1,
+ "schedule_policy": "fcfs", "random_seed": 0, "speculative_ngram_min_bfs_breadth": 1, "speculative_ngram_max_bfs_breadth": 10,
+ "speculative_ngram_max_trie_depth": 18, "speculative_ngram_match_type": "BFS", "speculative_ngram_capacity": 10000000}
+```
+
+This is the evidence that `chunked_prefill_size` resolves to 2048 without being passed (the earlier "default was already 2048" claim) and that `max_prefill_tokens` defaults to 16384 — ruling P11 pins both explicitly (`--chunked-prefill-size 2048 --max-prefill-tokens 2048`). For the unoptimised path the corresponding lines were `Detected that the model can run with awq_marlin, however you specified quantization=awq explicitly, so forcing awq.` and `awq quantization is not fully optimized yet.`; vLLM's line is `awq.py:448] Using MarlinLinearKernel for AutoAWQMarlinLinearMethod`.
 
 ### 6.4 Client end-to-end (both engines)
 
@@ -449,7 +547,7 @@ Measured budget lines for spec §3.1 (0.80 fraction, 2048 ctx): vLLM target-only
 
 **Final pins:** `vllm/vllm-openai:v0.29.0` (`sha256:c291...1ae1`) for server and client; `lmsysorg/sglang:v0.5.20-runtime` (`sha256:00b0...6800`). Models at the shas in §2. **No arm is dropped and no pin is stepped back**: `draft_model` and `ngram` work on vLLM, `STANDALONE` and `NGRAM` work on SGLang, all with non-zero acceptance. RQ3's speculation comparison is symmetric.
 
-**Common to every container:** `--gpus all --network host`, `-v /home/edamiba/.cache/huggingface:/root/.cache/huggingface:ro`, `-e HF_HUB_OFFLINE=1`; models by repo id + `--revision <sha>` for the target, and **draft models by snapshot directory** (both engines; the only form that resolves offline on both). Memory fractions are set from measured free memory per spec §3.1, and equalised by *measured footprint* (WSL `nvidia-smi memory.used` + engine-reported KV tokens), never by the nominal fraction, because 0.80 means different things to the two engines.
+**Common to every container:** `--gpus all --network host`, `-v /home/edamiba/.cache/huggingface:/root/.cache/huggingface:ro`, `-e HF_HUB_OFFLINE=1`; models by repo id + `--revision <sha>` for the target. Draft model: **vLLM by repo id + `"revision"` key inside `--speculative-config`** (the launched form; the snapshot-dir form is untested on vLLM), **SGLang by snapshot directory** (the launched form; repo id + `--speculative-draft-model-revision` fails offline, §4.2). Memory fractions are set per engine from measured free VRAM at run start (spec §3.1, ruling P12) and are **not** equalised across residency conditions; the resulting KV budget per arm (engine-reported KV tokens + WSL `nvidia-smi memory.used`) is reported as RQ4's measurement — necessary because 0.80 means different things to the two engines (§7). Engine compile/graph caches (`/root/.cache/vllm`, SGLang's flashinfer/JIT caches) are mounted read-write as per-engine volumes (ruling P13; **untested** — every smoke here ran with a cold cache, which is why vLLM spent ~20 s in torch.compile and SGLang 4–5 min in graph capture on each launch).
 
 ### vLLM launch (per arm)
 
@@ -465,7 +563,9 @@ Measured budget lines for spec §3.1 (0.80 fraction, 2048 ctx): vLLM target-only
 | port | `--port 8000` | |
 | CUDA-graph capture list | `--cudagraph-capture-sizes 1 2 4 8 16 32` | verified honoured; `--enforce-eager` never |
 | prefix cache | `--enable-prefix-caching` / `--no-enable-prefix-caching` | default None = on for this model |
-| spec: draft model | `--speculative-config '{"method":"draft_model","model":"<0.5B snapshot dir>","num_speculative_tokens":k}'` | k=3 verified with `"model":"Qwen/Qwen2.5-0.5B-Instruct","revision":"7ae55..."` |
+| spec: draft model | `--speculative-config '{"method":"draft_model","model":"Qwen/Qwen2.5-0.5B-Instruct","revision":"7ae557604adf67be50417f59c2c2f167def9a775","num_speculative_tokens":k}'` | k=3 launched in exactly this form (loads from the cache after two harmless `repo_utils.py` offline errors). Snapshot-dir form for `"model"`: **untested** on vLLM |
+| sampling defaults | `--generation-config vllm` | ruling P9 (§3.6); **untested** in the smokes (all smokes ran the default `auto`) |
+| shared memory | `--shm-size 2g` (docker) | ruling: both engines get it; **not used in the vLLM smokes** (SGLang smokes used it) |
 | spec: ngram | `--speculative-config '{"method":"ngram","num_speculative_tokens":k,"prompt_lookup_max":4}'` | `prompt_lookup_min` copies max when omitted |
 | **required env** | `-e VLLM_WSL2_ENABLE_PIN_MEMORY=1 -e VLLM_USE_V2_MODEL_RUNNER=0 -e VLLM_SERVER_DEV_MODE=1` | pin memory: WSL2 pinned-memory gate; V2=0: **all vLLM arms on the V1 model runner** (spec arms are forced there anyway, and the baseline must not silently run a different runner); dev mode: mounts `/reset_prefix_cache` |
 | health | `GET /health` -> 200 | poll; `GET /version` gives `{"version":"0.29.0"}` for env.json |
@@ -480,7 +580,8 @@ Measured budget lines for spec §3.1 (0.80 fraction, 2048 ctx): vLLM target-only
 | quantization | **`--quantization awq_marlin`** | `awq` forces the unoptimised kernel (5x slower decode, §6.3) |
 | context | `--context-length 2048` | |
 | max running requests | `--max-running-requests N` | 32 |
-| chunked prefill size | `--chunked-prefill-size 2048` | (default was already 2048) |
+| chunked prefill size | `--chunked-prefill-size 2048 --max-prefill-tokens 2048` | resolved default was already 2048 (`/get_server_info`, §6.3); `max_prefill_tokens` defaults to 16384 and is vLLM's `--max-num-batched-tokens` counterpart (ruling P11); pinning `--max-prefill-tokens 2048` is **untested** |
+| sampling defaults | `--sampling-defaults openai` | ruling P9; launched once (`"sampling_defaults": "openai"` in `/get_server_info`) |
 | memory fraction | `--mem-fraction-static 0.80` (or `--max-total-tokens`) | static allocation only; graphs/activations come on top |
 | seed | `--random-seed 0` | |
 | port | `--port 30000 --host 0.0.0.0` | |
@@ -488,25 +589,42 @@ Measured budget lines for spec §3.1 (0.80 fraction, 2048 ctx): vLLM target-only
 | prefix cache | on by default; `--disable-radix-cache` to turn off | |
 | metrics | `--enable-metrics` (required for `/metrics`) ; `--enable-cache-report` for per-request cached tokens | |
 | spec: draft model | `--speculative-algorithm STANDALONE --speculative-draft-model-path <0.5B snapshot dir> --speculative-draft-model-quantization unquant --speculative-num-steps k --speculative-eagle-topk 1 --speculative-num-draft-tokens k+1` | k=3 verified (3 / 1 / 4) |
-| spec: ngram | `--speculative-algorithm NGRAM --speculative-num-steps k --speculative-num-draft-tokens k+1` | topk is forced to `--speculative-ngram-max-bfs-breadth` (default 10); window-size flags do not exist at 0.5.20 (`min/max-bfs-breadth`, `max-trie-depth` are the tunables) |
-| health | `GET /health` -> 200 (no generation) ; `GET /ready` -> 200/503 | poll `/ready` then `/health`; allow ≥ 6 min with awq_marlin |
+| spec: ngram | `--speculative-algorithm NGRAM --speculative-num-steps k --speculative-num-draft-tokens k+1 --speculative-ngram-max-bfs-breadth 1 --speculative-ngram-max-trie-depth W` | ruling P15: `max-bfs-breadth 1` = linear draft (topk is forced to that value; default 10 was what the smoke ran — the `1` setting is **untested**); `--speculative-ngram-max-trie-depth` is the `prompt_lookup_max` counterpart (§4.2), default 18; no `min` exists |
+| health | `GET /health` -> 200 (no generation) ; `GET /ready` -> 200/503 | poll `/ready` then `/health`; allow 900 s with awq_marlin (ruling P4; observed 288–348 s) |
+| shared memory | `--shm-size 2g` (docker) | used in all SGLang smokes |
 | cache reset | `GET` or `POST /flush_cache` -> 200 with body starting `Cache flushed.` | status is 200 even when refused — check the body |
 | metrics names | `sglang:num_used_tokens` + `sglang:token_usage` (KV usage), `sglang:max_total_num_tokens`, `sglang:num_running_reqs`, `sglang:num_queue_reqs` (waiting), `sglang:cached_tokens_total{cache_source="device"}` (prefix hits, tokens) vs `sglang:prompt_tokens_total` (queries proxy), `sglang:spec_accept_length` / `sglang:spec_accept_rate` (interval gauges), `sglang:spec_verify_calls_total` (cumulative) | cumulative accepted/proposed drafts only per request via `"return_spec_tokens_details": true` -> `sglext.spec_tokens_details.{spec_num_correct_drafts, spec_num_proposed_drafts, spec_verify_ct, spec_accept_rate, spec_accept_length}` |
-| container | `--shm-size 2g` | used in all smokes |
 
 ### Client (`vllm bench serve`, GPU-less container of the vLLM image)
 
-- Container: `docker run --rm --network host -v <traces>:/traces:ro -v <hf cache>:/root/.cache/huggingface:ro -v <out>:/out -e HF_HUB_OFFLINE=1 --entrypoint bash vllm/vllm-openai:v0.29.0 -c "pip install -q pandas && exec vllm bench serve ..."` — or a derived image `FROM vllm/vllm-openai:v0.29.0; RUN pip install pandas` recorded in `env.json`. The runtime `pip install` needs network (~15 s); the derived image is the reproducible option.
+- Container (ruling P5): a derived image `bench-client:v0.29.0` = `FROM vllm/vllm-openai:v0.29.0` + `RUN pip install pandas`, its digest recorded in `env.json`; run as `docker run --rm --network host -v <traces>:/traces:ro -v <hf cache>:/root/.cache/huggingface:ro -v <out>:/out -e HF_HUB_OFFLINE=1 --entrypoint vllm bench-client:v0.29.0 bench serve ...`. No per-run `pip install`. (The smokes used the runtime-pip form `--entrypoint bash ... -c "pip install -q pandas && exec vllm bench serve ..."`, which is functionally the same client; the derived image itself is **untested** until Task 2 builds it.)
 - Backend: `--backend openai --endpoint /v1/completions` (completions endpoint; `openai-chat` is not used — the trace is pre-templated and parity holds on completions).
 - Model/tokenizer: `--model Qwen/Qwen2.5-3B-Instruct-AWQ --tokenizer <3B snapshot dir>`.
 - Dataset: `--dataset-name custom --dataset-path /traces/<trace>_v1.jsonl --custom-output-len -1 --skip-chat-template --disable-shuffle --no-oversample --num-prompts N` (`-1` is mandatory: the default is 256; `--output-len` would override it — never pass `--output-len`).
 - Ordering guarantee: `--disable-shuffle` -> request `i` is trace row `i`, `request_id = <prefix><i>`; use `--request-id-prefix` per run.
 - Termination: `--ignore-eos` for P1/P2 (fixed `output_len` = trace `output_tokens`); omit it for P3 natural termination.
-- Sampling: `--temperature 0` for greedy; `--top-p/--top-k` only when set. `--extra-body '<json>'` merges into every request body (e.g. `{"return_spec_tokens_details": true}` on SGLang, `response_format` for P3; note `repetition_penalty: 1.0` is always sent).
+- Sampling: `--temperature 0` for greedy; `--top-p/--top-k` only when set. `--extra-body '<json>'` merges into every request body (e.g. `response_format` for P3; note `repetition_penalty: 1.0` is always sent). `"return_spec_tokens_details": true` is **not** for the load client — the stock client discards `sglext`, so it would only add response bytes; it belongs in the runner's own per-request acceptance pass (non-streaming requests it parses itself, alongside correctness.py).
 - Load: `--max-concurrency C --request-rate inf` (closed loop) or `--request-rate R --burstiness 1.0` (Poisson).
 - Output: `--save-result --save-detailed --result-dir /out --result-filename <run>.json --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 --metadata k=v ...`; per-request arrays are `input_lens`, `output_lens`, `ttfts`, `itls`, `start_times`, `generated_texts`, `errors`. Leave `--ready-check-timeout-sec` at 0 (no pre-run request) and `--num-warmups 0`; the runner does its own warmup + cache reset (spec §4 step 5).
-- Metric semantics to state in the writeups: `ttft` = first chunk; `itl` = inter-*chunk*; `tpot = (e2el - ttft)/(output_len-1)`; under speculation chunks bundle accepted tokens (SGLang verified: 4 chunks for 14 tokens), so report `tpot`/`e2el` as the per-token latency metrics for spec arms and treat `itl` as per-step latency; record `len(itls[i])` vs `output_lens[i]` as the tripwire.
+- Metric semantics to state in the writeups: `ttft` = first chunk; `itl` = inter-*chunk*; `tpot = (e2el - ttft)/(output_len-1)`; under speculation chunks bundle accepted tokens (SGLang verified: 4 chunks for 14 tokens), so report `tpot`/`e2el` as the per-token latency metrics for spec arms and treat `itl` as per-step latency; record `len(itls[i])` vs `output_lens[i]` as the tripwire. Ruling P7: the runner derives per-request TPOT itself as `(e2e - ttft) / (output_tokens - 1)` from `ttfts`, `itls` (e2e = ttft + sum(itls)) and `output_lens`, rather than trusting the client's aggregate under speculation.
+
+### Controller rulings (decided; recorded verbatim, not re-argued here)
+
+- **P3:** `VLLM_USE_V2_MODEL_RUNNER=0` on ALL vLLM arms (spec on/off must share a runner); stated in every writeup claim as a WSL2 deviation.
+- **P4:** SGLang `--quantization awq_marlin`; readiness timeout 900 s.
+- **P5:** client runs from a derived image `bench-client:v0.29.0` (pinned vLLM image + `pip install pandas`), digest recorded; no per-run pip install.
+- **P6:** `VLLM_SERVER_DEV_MODE=1` on vLLM containers for `/reset_prefix_cache`.
+- **P7:** under speculation `itls` are per-chunk; the runner derives TPOT as (e2e − ttft)/(output_tokens − 1) from `output_lens`.
+- **P8:** clock pin unavailable → `cooldown_temp_c 50`, `cooldown_min_s 90`, `clock_cv` covariate; `try_clock_pin: false`.
+- **P9:** vLLM arms pass `--generation-config vllm`; SGLang arms pass `--sampling-defaults openai` — the client is the sole source of sampling params; P2d's T=0 identity check is the leakage detector.
+- **P10:** vLLM `--quantization awq` (resolves to Marlin), SGLang `--quantization awq_marlin`; `quantization_kernel` recorded in `env.json` from the launch log (`Using MarlinLinearKernel for AutoAWQMarlinLinearMethod` / `Using awq_marlin kernel.`).
+- **P11:** SGLang `--max-prefill-tokens 2048` is the counterpart of vLLM `--max-num-batched-tokens 2048`; `--chunked-prefill-size 2048` also pinned.
+- **P12:** memory fraction NOT equalised across residency conditions — fixed per engine from measured free VRAM; the resulting KV budget per arm is reported as RQ4's measurement.
+- **P13:** engine compile/graph caches mounted rw as per-engine volumes; `compile_cache_mounted: true` in `env.json`.
+- **P14:** elevated `-lgc` not attempted by the runner; "deferred to the user".
+- **P15:** SGLang NGRAM arms run `--speculative-ngram-max-bfs-breadth 1` (linear draft, matching vLLM's ngram); `--speculative-ngram-max-trie-depth` is the `prompt_lookup_max` counterpart (§4.2).
+- **Requirements:** `bench/requirements.txt` stays at pyyaml / requests / aiohttp — no task imports NVML or jsonschema (gpu_monitor uses the nvidia-smi CLI; schema.py is hand-rolled).
 
 ### Platform notes carried into `env.json`
 
-`docker 28.0.4 (native WSL2, nvidia runtime, nvidia-container-cli 1.17.8)`, WSL kernel `5.15.167.4-microsoft-standard-WSL2`, driver `610.88`, GPU `RTX 4050 Laptop 6141 MiB`, `power.max_limit 100 W`, `power.default_limit 55 W`, host idle VRAM 0 MiB, clock pinning unavailable (contingency: cooldown + `clock_cv`), chat-template sha256 `cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f`, vLLM env `VLLM_WSL2_ENABLE_PIN_MEMORY=1 VLLM_USE_V2_MODEL_RUNNER=0`.
+`docker 28.0.4 (native WSL2, nvidia runtime, nvidia-container-cli 1.17.8)`, WSL kernel `5.15.167.4-microsoft-standard-WSL2`, driver `610.88`, GPU `RTX 4050 Laptop 6141 MiB`, `power.max_limit 100 W`, `power.default_limit 55 W`, host idle VRAM 0 MiB, clock pinning unavailable (`try_clock_pin: false`, `cooldown_temp_c 50`, `cooldown_min_s 90`, `clock_cv` covariate; elevated `-lgc` deferred to the user), chat-template sha256 `cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f`, vLLM env `VLLM_WSL2_ENABLE_PIN_MEMORY=1 VLLM_USE_V2_MODEL_RUNNER=0 VLLM_SERVER_DEV_MODE=1`, `quantization_kernel` per engine from the launch log, `compile_cache_mounted: true`, client image `bench-client:v0.29.0` digest.
