@@ -189,11 +189,13 @@ def _sw_throttle_fraction(values: list[int]):
 
 
 def build_summary(client: dict, requests: list[dict], gpu_rows: list[dict], metric_rows: list[dict],
-                   cfg, timing: dict) -> dict:
+                   cfg, timing: dict, thresholds: Thresholds = Thresholds()) -> dict:
     """Computed once by the runner from the run's artifacts (spec §7
     summary.json). `valid`/`invalid_reason` are filled in-place by
     `assertions.check`, using `cfg.spec_method != "off"` for `spec_on` and
-    the default `Thresholds`."""
+    the given `thresholds` (default `Thresholds()`) -- the same object is
+    used both to compute `host_drift_flag` here and to judge validity in
+    `check()`, so the two never disagree for a single `build_summary` call."""
     completed_requests = [r for r in requests if not r.get("error")]
 
     # Ruling P22: `completed` (the client's success-only count) is kept for
@@ -251,8 +253,8 @@ def build_summary(client: dict, requests: list[dict], gpu_rows: list[dict], metr
 
     summary["timing"] = dict(timing)
 
-    thresholds = Thresholds()
-    # Ruling P23: computed once here so assertions.check can just read it.
+    # Recorded for humans/analysis; assertions.check recomputes its own
+    # verdict from host_share_drift_mb rather than reading this flag back.
     summary["host_drift_flag"] = (
         summary["host_share_drift_mb"] is not None
         and summary["host_share_drift_mb"] > thresholds.max_host_drift_mb

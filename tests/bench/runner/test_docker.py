@@ -88,6 +88,31 @@ def test_image_digest_uses_repo_digests_when_present(monkeypatch):
     assert len(d.command_lines) == 1
 
 
+def test_ps_names_lists_running_container_names(monkeypatch):
+    def fake_subprocess_run(cmd, check, capture_output, text):
+        return SimpleNamespace(stdout="bench-r1\nbench-r1-client\n", stderr="")
+
+    import bench.runner.docker as docker_mod
+
+    monkeypatch.setattr(docker_mod.subprocess, "run", fake_subprocess_run)
+
+    d = Docker()
+    assert d.ps_names() == ["bench-r1", "bench-r1-client"]
+    assert d.command_lines == [["docker", "ps", "--format", "{{.Names}}"]]
+
+
+def test_ps_names_empty_when_nothing_running(monkeypatch):
+    def fake_subprocess_run(cmd, check, capture_output, text):
+        return SimpleNamespace(stdout="\n", stderr="")
+
+    import bench.runner.docker as docker_mod
+
+    monkeypatch.setattr(docker_mod.subprocess, "run", fake_subprocess_run)
+
+    d = Docker()
+    assert d.ps_names() == []
+
+
 def test_container_logs_is_one_merged_chronological_call(monkeypatch):
     calls = []
 

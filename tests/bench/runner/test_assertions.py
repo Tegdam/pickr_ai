@@ -76,12 +76,23 @@ def test_host_drift_flag_true_is_invalid():
     assert "host_share_drift_mb" in reason
 
 
-def test_host_drift_flag_false_does_not_invalidate_even_with_large_value():
-    # assertions trusts the pre-computed flag rather than recomputing it.
+def test_host_drift_recomputed_from_share_drift_ignores_stale_flag():
+    # Fixes the coupling a review found: check() recomputes rule (3) from
+    # host_share_drift_mb + its own thresholds, rather than trusting a
+    # host_drift_flag baked in by build_summary's own (possibly different)
+    # Thresholds -- a stale/false flag must not mask a real drift.
     cfg = _cfg(num_prompts=200)
     valid, reason = check(cfg, _summary(host_drift_flag=False, host_share_drift_mb=9999),
                            spec_on=False, thresholds=Thresholds())
-    assert valid is True
+    assert valid is False
+    assert "host_share_drift_mb" in reason
+
+
+def test_host_drift_none_does_not_invalidate():
+    cfg = _cfg(num_prompts=200)
+    valid, reason = check(cfg, _summary(host_drift_flag=True, host_share_drift_mb=None),
+                           spec_on=False, thresholds=Thresholds())
+    assert valid is True and reason is None
 
 
 def test_throttled_alone_does_not_invalidate():

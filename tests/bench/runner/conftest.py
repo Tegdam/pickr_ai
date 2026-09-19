@@ -57,6 +57,9 @@ class FakeDocker:
     def container_logs(self, name):
         return self.logs.get(name, "")
 
+    def ps_names(self):
+        return sorted(self.running)
+
     def build(self, tag, dockerfile, context):
         self.calls.append({"op": "build", "tag": tag, "dockerfile": dockerfile, "context": context})
         return "build output"

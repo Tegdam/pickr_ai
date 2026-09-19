@@ -38,6 +38,12 @@ class Docker:
     def is_running(self, name: str) -> bool:
         return self._run("docker", "inspect", "-f", "{{.State.Running}}", name, check=False) == "true"
 
+    def ps_names(self) -> list[str]:
+        """Names of all currently-running containers (pre-flight check, spec
+        §6 step 1: refuse to start while a `bench-*` container is running)."""
+        out = self._run("docker", "ps", "--format", "{{.Names}}", check=False)
+        return [line for line in out.splitlines() if line]
+
     def exit_code(self, name: str) -> int:
         out = self._run("docker", "inspect", "-f", "{{.State.ExitCode}}", name, check=False)
         try:

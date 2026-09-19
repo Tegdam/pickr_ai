@@ -29,9 +29,13 @@ def check(cfg, summary: dict, spec_on: bool, thresholds: Thresholds) -> tuple[bo
     is computed once in `build_summary` and stored on `summary`; failures are
     then judged by the error-rate threshold instead.
 
-    Ruling P23: rule (3) reads the pre-computed `host_drift_flag` off
-    `summary` (also set by `build_summary` from the same `thresholds`)
-    rather than recomputing the comparison here.
+    Rule (3) recomputes the host-drift comparison from `host_share_drift_mb`
+    against the caller's own `thresholds` rather than trusting the
+    pre-computed `host_drift_flag` on `summary` -- `build_summary` sets that
+    flag from its own `Thresholds` default, and a caller of `check()` with a
+    different `thresholds` would otherwise silently get build_summary's
+    verdict instead of its own (the coupling a review found). `host_drift_flag`
+    is still recorded on `summary.json` for humans/analysis, just not read here.
     """
     attempted = summary.get("attempted")
     if attempted != cfg.num_prompts:
@@ -41,8 +45,8 @@ def check(cfg, summary: dict, spec_on: bool, thresholds: Thresholds) -> tuple[bo
     if error_rate is not None and error_rate > thresholds.max_error_rate:
         return False, f"error_rate {error_rate} exceeds max_error_rate {thresholds.max_error_rate}"
 
-    if summary.get("host_drift_flag"):
-        drift = summary.get("host_share_drift_mb")
+    drift = summary.get("host_share_drift_mb")
+    if drift is not None and drift > thresholds.max_host_drift_mb:
         return False, f"host_share_drift_mb {drift} exceeds max_host_drift_mb {thresholds.max_host_drift_mb}"
 
     if spec_on:
