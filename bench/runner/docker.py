@@ -42,9 +42,12 @@ class Docker:
         return self._run(*cmd, image, *args)
 
     def image_present(self, image: str) -> bool:
-        """I4/P33: pre-flight checks this before launching -- `docker image
-        inspect` exits non-zero (empty stdout) when the image is missing."""
-        return bool(self._run("docker", "image", "inspect", image, check=False))
+        """I4/P33: pre-flight checks this before launching. Decide on the exit
+        code, not stdout: a missing image makes `docker image inspect` print
+        `[]` to stdout and exit non-zero (verified against the real daemon)."""
+        cmd = ["docker", "image", "inspect", image]
+        self.command_lines.append(cmd)
+        return subprocess.run(cmd, check=False, capture_output=True, text=True).returncode == 0
 
     def stop(self, name: str, timeout: int = 30) -> None:
         self._run("docker", "stop", "-t", str(timeout), name, check=False)
