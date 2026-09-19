@@ -11,6 +11,16 @@ The client's own mean inter-chunk latency is kept alongside as
 records whether `itl_ms` entries are per-token or per-chunk. `summary.json`
 reports the derived TPOT everywhere; the client's percentiles are kept too,
 suffixed `_client`.
+
+Minor (final-review fix wave): the runner's own quantile dicts over the
+client's raw per-request arrays are named `ttft_ms_runner`/`tpot_ms_runner`/
+`e2e_ms_runner`/`itl_ms_runner` -- inclusive-method quantiles (`bench.capture
+.export.quantiles`) computed HERE, in `build_summary`, from the requests this
+module itself wrote. They are a different thing from the `*_p50/p90/p99_client`
+scalars just below, which are the client tool's OWN reported percentiles,
+copied through unmodified -- the earlier `ttft_ms_client`/`tpot_ms_derived`/
+`e2e_ms_derived`/`itl_ms` names for these dicts collided with that `_client`
+suffix convention and made the two easy to confuse.
 """
 from __future__ import annotations
 
@@ -20,6 +30,11 @@ import statistics
 from pathlib import Path
 
 from bench.capture.export import quantiles as _quantiles
+from bench.gpu_throttle import (
+    THROTTLE_BITS as _THROTTLE_BITS,
+    throttle_bits_fraction as _throttle_bits_fraction,
+    throttle_reason_values as _throttle_reason_values,
+)
 
 from . import metrics_scraper
 from .assertions import Thresholds, check as check_validity
@@ -31,7 +46,9 @@ from .metrics_scraper import _peak
 # so including SW bits in the trip would flag almost every run.
 HW_THROTTLE_MASK = 0x8 | 0x40 | 0x80   # HW Slowdown | HW Thermal Slowdown | HW Power Brake
 SW_THROTTLE_MASK = 0x4 | 0x20          # SW Power Cap | SW Thermal Slowdown
-_THROTTLE_BITS = (0x4, 0x8, 0x20, 0x40, 0x80)
+# _THROTTLE_BITS, _throttle_reason_values, _throttle_bits_fraction: moved to
+# bench.gpu_throttle (Minors) so bench.analysis.reducers.throttle_baseline
+# can reuse the exact same bit semantics without importing bench.runner.
 
 # summary.json "<metric>_p50_client"/"<metric>_p90_client"/"<metric>_p99_client"
 # <- client's own "median_<prefix>_ms"/"p90_<prefix>_ms"/"p99_<prefix>_ms"
@@ -89,6 +106,13 @@ def write_requests(client: dict, trace_rows: list[dict], cfg, out_path) -> list[
             "schema_valid": None,
             "error": errors[i] or None,
             "generated_text_sha256": _sha256_hex(generated_texts[i]),
+            # Minor: a free parity/ordering tripwire on every run -- if the
+            # client's own reported input token count ever drifts from the
+            # trace row's own pre-computed count at this same index, either
+            # the request ordering broke (doc §8 "Ordering guarantee") or the
+            # tokenizer used to build the trace disagrees with the one the
+            # engine/client actually used.
+            "prompt_tokens_matches_trace": input_lens[i] == trace_row.get("prompt_tokens_qwen"),
         }
         if start_times is not None:
             record["start_time"] = start_times[i]
@@ -155,31 +179,8 @@ def _clock_cv(gpu_rows: list[dict]):
     return statistics.pstdev(vals) / mean
 
 
-def _throttle_reason_values(gpu_rows: list[dict]) -> list[int]:
-    values: list[int] = []
-    for row in gpu_rows:
-        reasons = row.get("throttle_reasons")
-        if reasons is None:
-            continue
-        try:
-            values.append(int(reasons, 16))
-        except (TypeError, ValueError):
-            continue
-    return values
-
-
 def _throttled(values: list[int]) -> bool:
     return any(v & HW_THROTTLE_MASK for v in values)
-
-
-def _throttle_bits_fraction(values: list[int]) -> dict:
-    """Fraction of samples (with non-None reasons) having each bit set, for
-    every individually-meaningful throttle bit -- lets analysis correlate SW
-    bits with `clock_cv` even though they don't flag `throttled` themselves."""
-    if not values:
-        return {f"0x{b:x}": None for b in _THROTTLE_BITS}
-    n = len(values)
-    return {f"0x{b:x}": sum(1 for v in values if v & b) / n for b in _THROTTLE_BITS}
 
 
 def _sw_throttle_fraction(values: list[int]):
@@ -215,12 +216,16 @@ def build_summary(client: dict, requests: list[dict], gpu_rows: list[dict], metr
         "req_s": client.get("request_throughput"),
     }
 
-    summary["ttft_ms_client"] = _quantiles([r["ttft_ms_client"] for r in completed_requests])
+    # Minor: named *_runner (not *_client) -- these are inclusive-method
+    # quantiles this module computes from the client's raw per-request
+    # arrays, not the client tool's own reported percentiles (those are the
+    # `*_p50/p90/p99_client` scalars just below).
+    summary["ttft_ms_runner"] = _quantiles([r["ttft_ms_client"] for r in completed_requests])
     tpot_vals = [r["tpot_ms_derived"] for r in completed_requests if r["tpot_ms_derived"] is not None]
-    summary["tpot_ms_derived"] = _quantiles(tpot_vals)
-    summary["e2e_ms_derived"] = _quantiles([r["e2e_ms_derived"] for r in completed_requests])
+    summary["tpot_ms_runner"] = _quantiles(tpot_vals)
+    summary["e2e_ms_runner"] = _quantiles([r["e2e_ms_derived"] for r in completed_requests])
     flat_itl_ms = [x for r in completed_requests for x in r["itl_ms"]]
-    summary["itl_ms"] = _quantiles(flat_itl_ms)
+    summary["itl_ms_runner"] = _quantiles(flat_itl_ms)
     summary["itl_is_per_chunk"] = cfg.spec_method != "off"
 
     for key, prefix in _CLIENT_METRIC_PREFIX.items():
@@ -246,6 +251,9 @@ def build_summary(client: dict, requests: list[dict], gpu_rows: list[dict], metr
 
     total = len(requests)
     summary["error_rate"] = (sum(1 for r in requests if r.get("error")) / total) if total else 0.0
+    # Minor: the count behind write_requests's prompt_tokens_matches_trace
+    # tripwire -- nonzero on every run means look here first.
+    summary["prompt_token_mismatches"] = sum(1 for r in requests if not r.get("prompt_tokens_matches_trace"))
 
     grid = goodput_grid(requests)
     summary["goodput_by_threshold"] = grid

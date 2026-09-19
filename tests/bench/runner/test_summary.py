@@ -64,6 +64,38 @@ def test_write_requests_itl_is_per_chunk_true_under_speculation(client_json, tmp
     assert all(r["itl_is_per_chunk"] is True for r in requests)
 
 
+def test_write_requests_prompt_tokens_matches_trace_tripwire(client_json, tmp_path):
+    """Minor: a free parity/ordering tripwire -- true iff the client's own
+    input token count at this index equals the trace row's own pre-computed
+    prompt_tokens_qwen; None/missing on the trace row side is a mismatch."""
+    rows = [
+        {**TRACE_ROWS[0], "prompt_tokens_qwen": 250},  # matches client_json's input_lens[0] == 250
+        {**TRACE_ROWS[1], "prompt_tokens_qwen": 999},  # deliberate mismatch
+        {**TRACE_ROWS[2]},  # no prompt_tokens_qwen key at all -> mismatch, not a KeyError
+        {**TRACE_ROWS[3], "prompt_tokens_qwen": 250},
+    ]
+    requests = write_requests(client_json, rows, _cfg(), tmp_path / "r.jsonl")
+    assert requests[0]["prompt_tokens_matches_trace"] is True
+    assert requests[1]["prompt_tokens_matches_trace"] is False
+    assert requests[2]["prompt_tokens_matches_trace"] is False
+    assert requests[3]["prompt_tokens_matches_trace"] is True
+
+
+def test_build_summary_prompt_token_mismatches_counts_the_tripwire(client_json, tmp_path):
+    rows = [
+        {**TRACE_ROWS[0], "prompt_tokens_qwen": 250},
+        {**TRACE_ROWS[1], "prompt_tokens_qwen": 999},
+        {**TRACE_ROWS[2], "prompt_tokens_qwen": 250},
+        {**TRACE_ROWS[3], "prompt_tokens_qwen": 250},
+    ]
+    cfg = _cfg(num_prompts=4)
+    requests = write_requests(client_json, rows, cfg, tmp_path / "r.jsonl")
+    timing = {"ready_s": 1.0, "warmup_s": 1.0, "client_s": 1.0, "cooldown_s": 1.0,
+              "vram_returned_mb": 0, "vram_leak_mb": 0, "clocks_pinned": True}
+    summary = build_summary(client_json, requests, [], [], cfg, timing)
+    assert summary["prompt_token_mismatches"] == 1
+
+
 def test_write_requests_tpot_derived_none_when_output_tokens_at_most_one(client_json, tmp_path):
     client_json["output_lens"] = [1, 0, 50, 50]
     requests = write_requests(client_json, TRACE_ROWS, _cfg(), tmp_path / "r.jsonl")
@@ -121,13 +153,16 @@ def test_build_summary_derived_percentiles_and_client_copies(client_json, tmp_pa
 
     summary = build_summary(client_json, requests, gpu_rows, metric_rows, cfg, timing)
 
-    assert summary["ttft_ms_client"]["p50"] == pytest.approx(
+    # Minor: named *_runner (the runner's own quantiles over the client's raw
+    # arrays) -- distinct from the *_client scalars the client tool itself
+    # reported, asserted separately just below.
+    assert summary["ttft_ms_runner"]["p50"] == pytest.approx(
         statistics.median([r["ttft_ms_client"] for r in requests])
     )
-    assert summary["tpot_ms_derived"]["p50"] == pytest.approx(
+    assert summary["tpot_ms_runner"]["p50"] == pytest.approx(
         statistics.median([r["tpot_ms_derived"] for r in requests])
     )
-    assert summary["e2e_ms_derived"]["p50"] == pytest.approx(
+    assert summary["e2e_ms_runner"]["p50"] == pytest.approx(
         statistics.median([r["e2e_ms_derived"] for r in requests])
     )
 
@@ -179,9 +214,9 @@ def test_build_summary_excludes_errored_requests_from_percentiles_but_counts_err
     timing = {"ready_s": 1.0, "warmup_s": 1.0, "client_s": 1.0, "cooldown_s": 1.0,
               "vram_returned_mb": 0, "vram_leak_mb": 0, "clocks_pinned": True}
     summary = build_summary(client_json, requests, [], [], cfg, timing)
-    assert summary["ttft_ms_client"]["n"] == 3
-    assert summary["tpot_ms_derived"]["n"] == 3
-    assert summary["e2e_ms_derived"]["n"] == 3
+    assert summary["ttft_ms_runner"]["n"] == 3
+    assert summary["tpot_ms_runner"]["n"] == 3
+    assert summary["e2e_ms_runner"]["n"] == 3
     assert summary["error_rate"] == pytest.approx(0.25)
 
 
