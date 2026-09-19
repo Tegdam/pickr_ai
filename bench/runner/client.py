@@ -11,19 +11,24 @@ import time
 from pathlib import Path
 
 from .config import RunConfig
-from .engine import EngineSpec
+from .engine import EngineSpec, hf_snapshot_dir
 from .schema import validate_client_output
 
 # Ruling P5 (doc §8): a derived image, not a per-run `pip install` (network +
 # nondeterminism). Built from bench/runner/client.Dockerfile.
 CLIENT_IMAGE = "bench-client:v0.29.0"
 
+_HF_CACHE_CONTAINER_PATH = "/root/.cache/huggingface"
+
 
 def build_client_image(docker) -> str:
     """Builds the derived client image and returns its digest (Task 4's
     Docker.image_digest falls back to `.Id` for locally built images that carry
-    no RepoDigests). Never invoked against a real docker daemon in tests."""
-    docker.build(CLIENT_IMAGE, "bench/runner/client.Dockerfile", "bench/runner")
+    no RepoDigests). Paths are derived from this file's own directory (not a
+    repo-root-relative literal) so the build works regardless of cwd. Never
+    invoked against a real docker daemon in tests."""
+    here = Path(__file__).resolve().parent
+    docker.build(CLIENT_IMAGE, str(here / "client.Dockerfile"), str(here))
     return docker.image_digest(CLIENT_IMAGE)
 
 
@@ -32,13 +37,17 @@ def build_client_command(cfg: RunConfig, base_url: str, result_dir_in_container:
     `bench serve` subcommand). doc §5/§8 flag-by-flag:
 
     - --backend openai --endpoint /v1/completions --base-url <base_url>       (doc §5 default backend/endpoint; §8 "Backend")
-    - --model / --tokenizer <cfg.model>                                       (doc §8 "Model/tokenizer": served name == cfg.model, same value engine.py's
-                                                                                 _served_name uses, so the client's --model always matches the /metrics label)
+    - --model <cfg.model> --tokenizer <HF snapshot dir for cfg.model/model_revision>
+                                                                               (doc §8 "Model/tokenizer": served name == cfg.model, matching engine.py's
+                                                                                 _served_name and the /metrics label; but the repo id itself cannot be
+                                                                                 resolved under HF_HUB_OFFLINE=1 -- doc §5 L409 -- so --tokenizer must be
+                                                                                 the snapshot directory, the same conversion engine.py uses for the SGLang
+                                                                                 draft model, doc §4.2/§8)
     - --dataset-name custom --dataset-path /traces/<basename>                 (doc §8 "Dataset")
     - --custom-output-len -1                                                  (doc §5: default is 256; -1 uses each row's output_tokens -- mandatory, never omit)
     - --skip-chat-template                                                    (doc §6.1: trace rows are pre-templated; server-side template must not re-apply)
     - --disable-shuffle --no-oversample                                      (doc §8 "Ordering guarantee"/"Dataset": row i <-> request i)
-    - --num-prompts / --seed
+    - --num-prompts / --seed / --request-id-prefix <run_id>-                  (doc §8 "Ordering guarantee": "use --request-id-prefix per run")
     - --temperature/--top-p/--top-k/--repetition-penalty always sent          (P9: the client is the sole source of sampling params, config.REQUIRED_SAMPLING_KEYS)
     - --ignore-eos when cfg.ignore_eos                                        (doc §8 "Termination")
     - --max-concurrency C --request-rate inf (concurrency) or
@@ -52,7 +61,7 @@ def build_client_command(cfg: RunConfig, base_url: str, result_dir_in_container:
         "--endpoint", "/v1/completions",
         "--base-url", base_url,
         "--model", cfg.model,
-        "--tokenizer", cfg.model,
+        "--tokenizer", hf_snapshot_dir(cfg.model, cfg.model_revision),
         "--dataset-name", "custom",
         "--dataset-path", f"/traces/{Path(cfg.trace_file).name}",
         "--custom-output-len", "-1",
@@ -61,6 +70,7 @@ def build_client_command(cfg: RunConfig, base_url: str, result_dir_in_container:
         "--no-oversample",
         "--num-prompts", str(cfg.num_prompts),
         "--seed", str(cfg.seed),
+        "--request-id-prefix", f"{cfg.run_id}-",
         "--temperature", str(cfg.sampling["temperature"]),
         "--top-p", str(cfg.sampling["top_p"]),
         "--top-k", str(cfg.sampling["top_k"]),
@@ -89,8 +99,8 @@ def build_client_command(cfg: RunConfig, base_url: str, result_dir_in_container:
     return args
 
 
-def run_client(docker, cfg: RunConfig, spec: EngineSpec, run_dir: Path, traces_dir: Path,
-                client_image: str = CLIENT_IMAGE, poll: float = 2.0, sleep=time.sleep,
+def run_client(docker, cfg: RunConfig, spec: EngineSpec, run_dir: Path, traces_dir: Path, hf_cache_dir: Path,
+                client_image: str = CLIENT_IMAGE, poll: float = 2.0, sleep=time.sleep, clock=time.monotonic,
                 client_timeout_s: float = 3600, result_filename: str = "client_raw.json",
                 container_name: str | None = None) -> dict:
     """Runs `vllm bench serve` in a GPU-less container of `client_image` against
@@ -100,9 +110,20 @@ def run_client(docker, cfg: RunConfig, spec: EngineSpec, run_dir: Path, traces_d
     doc §8 "Client" (Container): `--network host`, no `--gpus`, entrypoint
     `vllm`, `traces_dir:/traces:ro` and `run_dir:/results:rw` mounts. Results
     land on the bind mount -- nothing is copied out of the container.
+
+    doc §5 L409 / §8 (Container line, "-v <hf cache>:/root/.cache/huggingface:ro"):
+    `--tokenizer` resolves to a snapshot directory (build_client_command), which
+    only exists inside the container if the HF cache is mounted read-only and
+    HF_HUB_OFFLINE=1 is set -- both required here, same as every engine container.
+
+    The container is always removed (`docker.stop`) before this function
+    returns or raises, so a retried run with the same run_id never hits a name
+    conflict and a timed-out client never lingers; container logs for any
+    failure are captured before that removal happens.
     """
     run_dir = Path(run_dir)
     traces_dir = Path(traces_dir)
+    hf_cache_dir = Path(hf_cache_dir)
     base_url = f"http://localhost:{spec.port}"
     command = build_client_command(cfg, base_url, "/results", result_filename)
     name = container_name or f"{cfg.run_id}-client"
@@ -110,24 +131,32 @@ def run_client(docker, cfg: RunConfig, spec: EngineSpec, run_dir: Path, traces_d
     docker.run(
         client_image, name, ["bench", "serve", *command],
         gpus=False, network_host=True,
-        mounts=[(str(traces_dir), "/traces", "ro"), (str(run_dir), "/results", "rw")],
+        mounts=[
+            (str(traces_dir), "/traces", "ro"),
+            (str(run_dir), "/results", "rw"),
+            (str(hf_cache_dir), _HF_CACHE_CONTAINER_PATH, "ro"),
+        ],
+        env={"HF_HUB_OFFLINE": "1"},
         entrypoint="vllm", extra_args=[],
     )
 
-    t0 = time.monotonic()
-    while docker.is_running(name):
-        if time.monotonic() - t0 > client_timeout_s:
+    try:
+        t0 = clock()
+        while docker.is_running(name):
+            if clock() - t0 > client_timeout_s:
+                tail = "\n".join(docker.container_logs(name).splitlines()[-40:])
+                raise TimeoutError(f"client container {name!r} did not exit after {client_timeout_s}s\n{tail}")
+            sleep(poll)
+
+        exit_code = docker.exit_code(name)
+        result_path = run_dir / result_filename
+        if exit_code != 0 or not result_path.exists():
             tail = "\n".join(docker.container_logs(name).splitlines()[-40:])
-            raise TimeoutError(f"client container {name!r} did not exit after {client_timeout_s}s\n{tail}")
-        sleep(poll)
+            reason = f"exit code {exit_code}" if exit_code != 0 else f"missing result file {result_path}"
+            raise RuntimeError(f"client container {name!r} failed ({reason})\n{tail}")
 
-    exit_code = docker.exit_code(name)
-    result_path = run_dir / result_filename
-    if exit_code != 0 or not result_path.exists():
-        tail = "\n".join(docker.container_logs(name).splitlines()[-40:])
-        reason = f"exit code {exit_code}" if exit_code != 0 else f"missing result file {result_path}"
-        raise RuntimeError(f"client container {name!r} failed ({reason})\n{tail}")
-
-    data = json.loads(result_path.read_text(encoding="utf-8"))
-    validate_client_output(data)
-    return data
+        data = json.loads(result_path.read_text(encoding="utf-8"))
+        validate_client_output(data)
+        return data
+    finally:
+        docker.stop(name)

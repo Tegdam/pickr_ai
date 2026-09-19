@@ -76,7 +76,7 @@ def test_sglang_awq_maps_to_awq_marlin():
 
 def test_sglang_draft_requires_draft_model():
     """Fix round 1, item 2: a missing draft_model must raise ValueError, not
-    AttributeError, out of _hf_snapshot_dir's cfg.draft_model.replace(...)."""
+    AttributeError, out of hf_snapshot_dir's cfg.draft_model.replace(...)."""
     e = ENGINES["sglang"]
     with pytest.raises(ValueError, match="draft_model"):
         e.build_launch_args(_cfg(engine="sglang", spec_method="draft", draft_revision="def", spec_k=3), 0.8)

@@ -94,11 +94,13 @@ def _vllm_args(cfg: RunConfig, mem: float) -> list[str]:
 _SGLANG_QUANT_MAP = {"awq": "awq_marlin"}
 
 
-def _hf_snapshot_dir(repo_id: str, revision: str) -> str:
-    """HF hub cache layout inside every container (doc §2, §4.2): SGLang's draft
-    model must be resolved as its snapshot directory -- passing the repo id fails
-    offline (`get_config` is called without a revision, and the cache has no
-    refs/main), so this is the only launched/verified form for the SGLang draft."""
+def hf_snapshot_dir(repo_id: str, revision: str) -> str:
+    """HF hub cache layout inside every container (doc §2, §4.2, §5 L409):
+    SGLang's draft model AND the client's `--tokenizer` must be resolved as
+    their snapshot directory -- passing the repo id fails offline (`get_config`
+    / tokenizer resolution is called without a revision, and the cache has no
+    refs/main), so this is the only launched/verified form. Public because
+    bench/runner/client.py needs the same conversion for `--tokenizer`."""
     return f"/root/.cache/huggingface/hub/models--{repo_id.replace('/', '--')}/snapshots/{revision}"
 
 
@@ -132,7 +134,7 @@ def _sglang_args(cfg: RunConfig, mem: float) -> list[str]:
         draft_quant = cfg.draft_quantization or "unquant"
         args += [
             "--speculative-algorithm", "STANDALONE",                        # T1 (doc §8)
-            "--speculative-draft-model-path", _hf_snapshot_dir(cfg.draft_model, cfg.draft_revision),  # T1 (doc §4.2)
+            "--speculative-draft-model-path", hf_snapshot_dir(cfg.draft_model, cfg.draft_revision),  # T1 (doc §4.2)
             "--speculative-draft-model-quantization", draft_quant,          # T1 (doc §4.2)
             "--speculative-num-steps", str(cfg.spec_k),
             "--speculative-eagle-topk", "1",
