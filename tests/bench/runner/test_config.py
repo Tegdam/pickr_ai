@@ -12,6 +12,25 @@ def test_resolve_gpu_memory_fraction_uses_measured_free_vram():
     assert resolve_gpu_memory_fraction(total_mb=6141, host_used_mb=6000) == 0.0
 
 
+@pytest.mark.parametrize("engine_name, expected_fraction", [
+    ("vllm", 0.87),    # 6141 - 0 - (256+512) = 5373 -> 5373*100//6141 = 87
+    ("sglang", 0.74),  # 6141 - 0 - (256+1280) = 4605 -> 4605*100//6141 = 74 (<= its own 0.80 cap)
+    ("echo", 0.95),    # 6141 - 0 - (256+0) = 5885 -> 5885*100//6141 = 95
+])
+def test_per_engine_headroom_matches_the_calibration_brief_numbers(engine_name, expected_fraction):
+    """C2/P29: total 6141 MiB, host used 0, sweep gpu_headroom_mb=256 -- the
+    exact figures the final-fix brief itself worked through for each engine,
+    reproducing the headroom + cap computation lifecycle.run_one applies
+    (spec.mem_headroom_mb added to the sweep's own gpu_headroom_mb, then
+    capped at spec.max_mem_fraction)."""
+    from bench.runner.engine import ENGINES
+
+    spec = ENGINES[engine_name]
+    headroom_total = 256 + spec.mem_headroom_mb
+    frac = min(resolve_gpu_memory_fraction(6141, 0, headroom_total), spec.max_mem_fraction)
+    assert frac == pytest.approx(expected_fraction)
+
+
 def test_validate_checks_trace_sha(tmp_path):
     trace = tmp_path / "t.jsonl"
     trace.write_text('{"prompt": "x", "output_tokens": 1}\n')
