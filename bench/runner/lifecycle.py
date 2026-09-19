@@ -56,6 +56,12 @@ VRAM_RETURN_POLL_S = 2.0
 COOLDOWN_POLL_S = 5.0
 COOLDOWN_CAP_S = 15 * 60.0
 
+# Task 9 fix round 1, minor: `python -m bench.echo_server` must be launched
+# with the repo root as cwd -- `-m` resolves the package through sys.path[0],
+# which is the process's cwd, not this file's location, and the runner may be
+# invoked from anywhere.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 class PreflightError(RuntimeError):
     """Important 3: an environment-level failure -- step 1's bench-* guard, a
@@ -92,10 +98,36 @@ class EngineHandle:
     # Task 9: set for the echo engine (a local `python -m bench.echo_server`
     # subprocess, spec.image is None) and None for every docker-based engine.
     process: Popen | None = None
+    # Task 9 fix round 1: where the subprocess's stderr was redirected (a real
+    # file, not PIPE -- see start_engine). None for every docker-based engine.
+    stderr_path: Path | None = None
 
 
 def _quantization_kernel(log_text: str) -> str | None:
     return "marlin" if _KERNEL_RE.search(log_text or "") else None
+
+
+class _ProcessLivenessProbe:
+    """Task 9 fix round 1 (Important 2 of the review): a duck-typed stand-in
+    for the `docker` object so `readiness.py`'s existing per-poll liveness
+    check (`docker.is_running(container)` / `docker.container_logs(container)`)
+    works unmodified for the echo engine's subprocess -- a dead process is
+    then caught on the very next poll, with its real captured stderr, instead
+    of burning the full readiness timeout. `container` arguments are ignored
+    (there is only ever the one process this probe wraps)."""
+
+    def __init__(self, process: Popen, stderr_path: Path):
+        self.process = process
+        self.stderr_path = stderr_path
+
+    def is_running(self, _container: str) -> bool:
+        return self.process.poll() is None
+
+    def container_logs(self, _container: str) -> str:
+        try:
+            return Path(self.stderr_path).read_text(encoding="utf-8")
+        except Exception:
+            return ""
 
 
 def _isolate_previous_attempt(run_dir: Path) -> list[str] | None:
@@ -105,8 +137,11 @@ def _isolate_previous_attempt(run_dir: Path) -> list[str] | None:
     be computed over two engine processes' samples. If `run_dir` already
     holds anything from a prior attempt, move all of it into
     `run_dir/attempt-<N>/` (forensics kept, never deleted) before proceeding
-    with a clean directory. Returns the moved file names, or None if nothing
-    needed moving."""
+    with a clean directory -- this is a blanket "everything not an
+    attempt-*/ dir" scan, so a stale `preflight_error.txt`/`engine_stderr.txt`
+    from a prior failed attempt moves aside exactly like every other file,
+    with no special-casing needed. Returns the moved file names, or None if
+    nothing needed moving."""
     if not run_dir.exists():
         return None
     existing = [p for p in run_dir.iterdir() if not (p.is_dir() and p.name.startswith("attempt-"))]
@@ -158,14 +193,23 @@ def start_engine(cfg: RunConfig, spec: EngineSpec, docker, paths: RunPaths, *,
     launch_args = spec.build_launch_args(cfg, cfg.gpu_memory_utilization)
 
     if spec.image is None:
+        # Fix round 1, Important: stderr goes to a real file, not PIPE -- a
+        # pipe nobody drains while the subprocess is running is a deadlock
+        # class of its own, and (unlike a pipe) a file can be read from
+        # concurrently by the readiness probe below while the process is
+        # still writing to it.
+        stderr_path = Path(paths.run_dir) / "engine_stderr.txt"
         try:
-            process = popen([sys.executable, "-m", "bench.echo_server", *launch_args],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            with open(stderr_path, "w", encoding="utf-8") as stderr_file:
+                process = popen([sys.executable, "-m", "bench.echo_server", *launch_args],
+                                 stdout=subprocess.DEVNULL, stderr=stderr_file,
+                                 cwd=str(_REPO_ROOT), text=True)
         except Exception as e:
             raise PreflightError(f"failed to start echo engine subprocess: {e}") from e
         return EngineHandle(
             name=name, base_url=f"http://localhost:{spec.port}",
-            launch_args=launch_args, compile_cache_mounted=False, process=process,
+            launch_args=launch_args, compile_cache_mounted=False,
+            process=process, stderr_path=stderr_path,
         )
 
     docker.stop(name)  # best-effort: clear any leaked Created/Exited container from a prior failed attempt
@@ -395,18 +439,14 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     try:
         # --- 3. Readiness -> warmup -> cache reset -----------------------
         if spec.image is None:
-            # Task 9: no container to ask docker about -- a dead subprocess
-            # is caught here (process.poll() is not None) instead, with its
-            # captured stderr, rather than burning the full readiness budget
-            # polling a port nothing is listening on any more.
-            if handle.process is not None and handle.process.poll() is not None:
-                stderr = handle.process.stderr.read() if handle.process.stderr else ""
-                raise RuntimeError(
-                    f"echo engine process exited before becoming healthy "
-                    f"(code {handle.process.returncode})\n{stderr}"
-                )
+            # Fix round 1, Important: a duck-typed probe stands in for
+            # `docker` so readiness.py's own per-poll liveness check (already
+            # written for a docker container) catches a dead subprocess on
+            # the very next poll -- no change to readiness.py, and no more
+            # burning the full timeout on a launch that failed instantly.
+            liveness = _ProcessLivenessProbe(handle.process, handle.stderr_path)
             ready_s = wait_healthy(http, handle.base_url, spec.health_path, spec.readiness_timeout_s,
-                                    docker=None, container=None, ready_path=spec.ready_path)
+                                    docker=liveness, container=handle.name, ready_path=spec.ready_path)
         else:
             ready_s = wait_healthy(http, handle.base_url, spec.health_path, spec.readiness_timeout_s,
                                     docker=docker, container=handle.name, ready_path=spec.ready_path)
@@ -454,16 +494,15 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
         vram_returned_mb = vram_leak_mb = None
 
         if spec.image is None:
-            # Task 9: no container logs to fetch -- capture the subprocess's
-            # stderr only after it has actually exited (stop_engine first),
-            # since reading a live pipe with nothing consuming it can block
-            # forever on a long-running echo server.
-            stop_engine(handle, docker)
+            # Task 9: no container logs to fetch -- read the same stderr file
+            # the readiness probe reads from. Order doesn't matter here (unlike
+            # the docker path) since it's a real file, not a pipe -- reading it
+            # before or after stop_engine sees the same on-disk bytes either way.
             try:
-                engine_logs = (handle.process.stderr.read()
-                               if handle.process is not None and handle.process.stderr else "")
+                engine_logs = Path(handle.stderr_path).read_text(encoding="utf-8") if handle.stderr_path else ""
             except Exception:
                 engine_logs = ""
+            stop_engine(handle, docker)
         else:
             # Fix round 1, minor: wrapped so a container_logs failure can
             # never skip stop_engine below.

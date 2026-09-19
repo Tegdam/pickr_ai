@@ -15,7 +15,6 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -192,7 +191,11 @@ def test_run_one_warm_cache_skips_reset(tmp_path, monkeypatch, client_json):
 
 class _FakePopen:
     """Stands in for `subprocess.Popen` (Task 9): `poll()` is None until
-    `terminate()`/`kill()` sets a returncode, exactly like a real live process."""
+    `terminate()`/`kill()` sets a returncode, exactly like a real live
+    process. `kwargs["stderr"]` is the real, already-open file object
+    `start_engine` redirects the subprocess's stderr to (fix round 1: a file,
+    not PIPE) -- a subclass simulating a crash writes into it directly, the
+    same way a real crashing subprocess's own stderr would land there."""
 
     def __init__(self, args, **kwargs):
         self.args = list(args)
@@ -201,7 +204,6 @@ class _FakePopen:
         self.terminate_called = False
         self.wait_called = False
         self.kill_called = False
-        self.stderr = SimpleNamespace(read=lambda: "")
 
     def poll(self):
         return self.returncode
@@ -279,6 +281,12 @@ def test_run_one_echo_engine_is_a_subprocess_not_a_docker_container(tmp_path, mo
     proc = created_popens[0]
     assert proc.args[1:] == ["-m", "bench.echo_server", "--port", "8000", "--per-token-ms", "5"]
     assert proc.terminate_called and proc.wait_called, "stop_engine must terminate the subprocess"
+    # Fix round 1, minors: repo root as cwd (so `-m bench.echo_server`
+    # resolves regardless of the runner's own invocation directory), and
+    # stderr redirected to a real file (not PIPE).
+    assert proc.kwargs["cwd"] == str(lifecycle._REPO_ROOT)
+    assert hasattr(proc.kwargs["stderr"], "write")  # a real file object, not subprocess.PIPE
+    assert (paths.run_dir / "engine_stderr.txt").exists()
 
     assert summary["valid"] is True
     assert summary["cooldown_skipped"] == "echo"
@@ -293,23 +301,47 @@ def test_run_one_echo_engine_is_a_subprocess_not_a_docker_container(tmp_path, mo
 
 
 def test_run_one_echo_engine_crash_before_healthy_raises_with_stderr(tmp_path, monkeypatch, client_json):
-    """Task 9: a dead subprocess (poll() is not None) must fail fast with its
-    captured stderr, rather than burning the full readiness timeout polling a
-    port nothing is listening on any more."""
+    """Fix round 1 (Important): the readiness probe's per-poll liveness check
+    (readiness.py's existing `docker.is_running`/`container_logs` logic,
+    unmodified) must catch a subprocess that dies mid-poll well before the
+    readiness timeout, and surface its real captured stderr -- not a single
+    poll()-right-after-Popen check that would otherwise burn the full budget."""
+    import bench.runner.readiness as readiness_mod
+    monkeypatch.setattr(readiness_mod.time, "sleep", lambda s: None)  # no real waits between polls
+
     cfg, paths, fake_docker, fake_http = _setup(
         tmp_path, monkeypatch, client_json, cfg_over={"engine": "echo", "image": None},
     )
+    fake_http.healthy_after = 10**6  # never becomes healthy on its own -- only the dead-process check should fire
 
-    class _DeadPopen(_FakePopen):
+    class _DiesOnThirdPoll(_FakePopen):
+        """poll() -> None, None, 1, ... : alive for the first two liveness
+        checks, dead on the third -- and writes its "crash" into the real
+        stderr file `start_engine` opened and handed it, exactly as a real
+        crashing subprocess would."""
+
         def __init__(self, args, **kwargs):
             super().__init__(args, **kwargs)
-            self.returncode = 1
-            self.stderr = SimpleNamespace(read=lambda: "Traceback: boom")
+            self._polls = 0
+            stderr_file = kwargs.get("stderr")
+            if stderr_file is not None:
+                stderr_file.write("Traceback: boom")
+                stderr_file.flush()
 
-    with pytest.raises(RuntimeError, match="Traceback: boom"):
+        def poll(self):
+            self._polls += 1
+            return None if self._polls <= 2 else 1
+
+    with pytest.raises(RuntimeError) as excinfo:
         run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["echo"],
                 gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
-                popen=_DeadPopen)
+                popen=_DiesOnThirdPoll)
+
+    assert "exited during startup" in str(excinfo.value)
+    assert "Traceback: boom" in str(excinfo.value)
+    # And log.txt gets the same stderr text (read from the same file).
+    log_text = (paths.run_dir / "log.txt").read_text(encoding="utf-8")
+    assert "Traceback: boom" in log_text
 
 
 class _NoopGpuSampler:
@@ -396,6 +428,23 @@ def test_run_one_preflight_failure_writes_preflight_error_txt(tmp_path, monkeypa
 
     text = (paths.run_dir / "preflight_error.txt").read_text(encoding="utf-8")
     assert "bench-leaked" in text
+
+
+def test_isolate_previous_attempt_moves_preflight_error_txt(tmp_path):
+    """Fix round 1, minor: a stale `preflight_error.txt` left over from a
+    prior failed attempt must move aside with everything else -- it is just
+    another plain file in `run_dir`, so `_isolate_previous_attempt`'s
+    existing "everything not an attempt-*/ dir" scan already covers it; this
+    locks that down explicitly rather than leaving it implicit."""
+    run_dir = tmp_path / "r1"
+    run_dir.mkdir()
+    (run_dir / "preflight_error.txt").write_text("boom", encoding="utf-8")
+
+    moved = lifecycle._isolate_previous_attempt(run_dir)
+
+    assert moved is not None and "preflight_error.txt" in moved
+    assert (run_dir / "attempt-1" / "preflight_error.txt").read_text(encoding="utf-8") == "boom"
+    assert not (run_dir / "preflight_error.txt").exists()
 
 
 class _StaticMetricsScraper:

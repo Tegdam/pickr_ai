@@ -20,7 +20,7 @@ class RunConfig:
     phase: str
     rq_tag: str
     engine: str
-    image: str
+    image: str | None  # Task 9: None for the echo engine (a local subprocess, no docker image)
     model: str
     model_revision: str
     quantization: str | None

@@ -6,10 +6,18 @@ Routes:
 - `GET /health` -> 200 (always; there is nothing to warm up).
 - `POST /v1/completions` -> accepts the OpenAI payload (`prompt`, `max_tokens`,
   `stream`, `model`, anything else ignored); streams `max_tokens` SSE chunks
-  (one `"x"`-token each) with `per_token_ms` between them when `stream: true`,
-  then a final chunk carrying `finish_reason: "length"` and `usage`, then
-  `data: [DONE]`. A non-streaming request sleeps the same total delay
-  (`max_tokens * per_token_ms`) and returns the whole completion at once.
+  (one `"x"`-token each) with `per_token_ms` between them when `stream: true`.
+  The LAST content chunk carries `finish_reason: "length"`; a separate final
+  chunk then carries `usage` with an EMPTY `choices: []`, then `data: [DONE]`.
+  Fix round 1 (Important): this is deliberate, not a stray field -- vLLM's own
+  client parses each SSE payload as `if choices := data.get("choices"): ...
+  elif usage := data.get("usage"): ...` (contract doc line 508: real engines
+  also send `"choices": []` on their usage chunk), so a non-empty `choices`
+  alongside `usage` would make the client's `if` branch win and it would
+  never read `usage.completion_tokens` at all -- derived output_tokens,
+  throughput and TPOT would all be silently wrong. A non-streaming request
+  sleeps the same total delay (`max_tokens * per_token_ms`) and returns the
+  whole completion (and its `usage`) in one response.
 - `POST /reset_prefix_cache` -> 200 `{"success": true}` (nothing to reset).
 - `GET /metrics` -> a tiny Prometheus-style exposition with one counter,
   `echo:requests_total` (bumped once per `/v1/completions` call) -- see
@@ -71,11 +79,12 @@ async def _completions(request: web.Request) -> web.Response:
     max_tokens = int(payload.get("max_tokens") or 0)
     stream = bool(payload.get("stream", False))
     per_token_s = state["per_token_ms"] / 1000.0
+    prompt_tokens = _prompt_token_count(prompt)  # computed once, reused below
 
     usage = {
-        "prompt_tokens": _prompt_token_count(prompt),
+        "prompt_tokens": prompt_tokens,
         "completion_tokens": max_tokens,
-        "total_tokens": _prompt_token_count(prompt) + max_tokens,
+        "total_tokens": prompt_tokens + max_tokens,
     }
 
     if not stream:
@@ -90,20 +99,22 @@ async def _completions(request: web.Request) -> web.Response:
     response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
     await response.prepare(request)
 
-    for _ in range(max_tokens):
+    for i in range(max_tokens):
         await asyncio.sleep(per_token_s)
+        # Fix round 1: finish_reason lands on this, the LAST content chunk --
+        # not on a trailing chunk that also carries usage (see module docstring).
         chunk = {
             "id": "echo", "object": "text_completion",
-            "choices": [{"index": 0, "text": "x", "finish_reason": None}],
+            "choices": [{"index": 0, "text": "x", "finish_reason": "length" if i == max_tokens - 1 else None}],
         }
         await response.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
 
-    final_chunk = {
+    usage_chunk = {
         "id": "echo", "object": "text_completion",
-        "choices": [{"index": 0, "text": "", "finish_reason": "length"}],
+        "choices": [],  # empty, not omitted or non-empty -- see module docstring
         "usage": usage,
     }
-    await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode("utf-8"))
+    await response.write(f"data: {json.dumps(usage_chunk)}\n\n".encode("utf-8"))
     await response.write(b"data: [DONE]\n\n")
     await response.write_eof()
     return response

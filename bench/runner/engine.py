@@ -154,6 +154,12 @@ def _sglang_args(cfg: RunConfig, mem: float) -> list[str]:
     return args
 
 
+# Task 9 fix round 1, minor: single source of truth for the echo engine's
+# port, shared between EngineSpec.port (what the runner connects to) and the
+# --port launch arg (what the subprocess is told to bind) so they can never
+# drift apart.
+ECHO_PORT = 8000
+
 ENGINES: dict[str, EngineSpec] = {
     "vllm": EngineSpec(
         name="vllm", image="vllm/vllm-openai:v0.29.0", verified_against="vllm/vllm-openai:v0.29.0",  # T1 (doc §1, §8)
@@ -224,7 +230,7 @@ ENGINES: dict[str, EngineSpec] = {
         # engine in the loop at all. "verified_against" is "local" rather
         # than an image tag/digest since there is nothing pinned to verify.
         name="echo", image=None, verified_against="local",
-        port=8000,
+        port=ECHO_PORT,
         health_path="/health",
         ready_path=None,                                                    # no separate readiness route
         readiness_timeout_s=60,                                             # a subprocess starts far faster than a container
@@ -248,6 +254,6 @@ ENGINES: dict[str, EngineSpec] = {
         },
         env={},
         docker_extra_args=[],
-        _launch=lambda cfg, mem: ["--port", "8000", "--per-token-ms", "5"],
+        _launch=lambda cfg, mem: ["--port", str(ECHO_PORT), "--per-token-ms", "5"],
     ),
 }

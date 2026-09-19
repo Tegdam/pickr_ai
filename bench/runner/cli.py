@@ -69,6 +69,12 @@ def check_env(sweep_path: str | None, results_root: Path, hf_cache_dir: Path) ->
             engines_needed = set(axes_engines)
     for name in sorted(engines_needed):
         spec = ENGINES[name]
+        if spec.image is None:
+            # Task 9 fix round 1: the echo engine is a local subprocess, not
+            # a docker image -- there is nothing to `docker image inspect`
+            # (and passing None into it raises TypeError).
+            record(f"image_present:{name}", True, "local subprocess, no image")
+            continue
         record(f"image_present:{name}", _image_present(spec.image), spec.image)
 
     if sweep_dict is not None:
