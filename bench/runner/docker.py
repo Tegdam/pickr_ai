@@ -38,6 +38,18 @@ class Docker:
     def is_running(self, name: str) -> bool:
         return self._run("docker", "inspect", "-f", "{{.State.Running}}", name, check=False) == "true"
 
+    def exit_code(self, name: str) -> int:
+        out = self._run("docker", "inspect", "-f", "{{.State.ExitCode}}", name, check=False)
+        try:
+            return int(out)
+        except ValueError:
+            return -1
+
+    def build(self, tag: str, dockerfile: str, context: str) -> str:
+        """Derived-image build (ruling P5, e.g. bench-client:v0.29.0). Never
+        invoked against a real docker daemon in tests."""
+        return self._run("docker", "build", "-t", tag, "-f", dockerfile, context)
+
     def image_digest(self, image: str) -> str:
         digest = self._run("docker", "image", "inspect", image, "--format", "{{index .RepoDigests 0}}", check=False)
         if digest:

@@ -5,25 +5,48 @@ import pytest
 
 
 class FakeDocker:
-    """Records calls; returns canned outputs. `running` tracks container names."""
+    """Records calls; returns canned outputs. `running` tracks container names.
+
+    Client lifecycle knobs (task 6): a `run()` container exits immediately
+    (removed from `running`) unless `keep_running` is set, so a poll loop that
+    waits on `is_running` finishes on the very next check by default -- set
+    `keep_running = True` to simulate a container that never exits (timeout
+    tests). `fail_next` makes the *next* `run()` record a non-zero exit code,
+    read back via `exit_code(name)`.
+    """
 
     def __init__(self):
         self.calls = []
         self.running = set()
         self.logs = {}
         self.digest = "sha256:" + "ab" * 32
+        self.exit_codes = {}
+        self.fail_next = False
+        self.keep_running = False
 
     def run(self, image, name, args, gpus=True, network_host=True, mounts=(), env=None, entrypoint=None, extra_args=None):
-        self.calls.append(("run", image, name, list(args), list(extra_args or [])))
-        self.running.add(name)
+        self.calls.append({
+            "op": "run", "image": image, "name": name, "args": list(args),
+            "gpus": gpus, "network_host": network_host, "mounts": list(mounts),
+            "env": dict(env or {}), "entrypoint": entrypoint, "extra_args": list(extra_args or []),
+        })
+        if self.keep_running:
+            self.running.add(name)
+        else:
+            self.running.discard(name)
+        self.exit_codes[name] = 1 if self.fail_next else self.exit_codes.get(name, 0)
+        self.fail_next = False
         return "cid-" + name
 
     def stop(self, name, timeout=30):
-        self.calls.append(("stop", name))
+        self.calls.append({"op": "stop", "name": name, "timeout": timeout})
         self.running.discard(name)
 
     def is_running(self, name):
         return name in self.running
+
+    def exit_code(self, name):
+        return self.exit_codes.get(name, 0)
 
     def image_digest(self, image):
         return self.digest
@@ -33,6 +56,10 @@ class FakeDocker:
 
     def container_logs(self, name):
         return self.logs.get(name, "")
+
+    def build(self, tag, dockerfile, context):
+        self.calls.append({"op": "build", "tag": tag, "dockerfile": dockerfile, "context": context})
+        return "build output"
 
 
 class FakeHTTP:
@@ -97,4 +124,5 @@ def client_json():
         "input_lens": [250, 250, 250, 250], "output_lens": [50, 50, 50, 50],
         "ttfts": [0.048, 0.050, 0.049, 0.053], "itls": [[0.02] * 49, [0.02] * 49, [0.02] * 49, [0.02] * 49],
         "generated_texts": ["a", "b", "c", "d"], "errors": ["", "", "", ""],
+        "start_times": [0.0, 0.01, 0.02, 0.03],
     }
