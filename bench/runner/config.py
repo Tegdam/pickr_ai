@@ -64,7 +64,7 @@ def resolve_gpu_memory_fraction(total_mb: int, host_used_mb: int, headroom_mb: i
     """Fraction of TOTAL memory the engine may claim, derived from what is
     actually free (spec §3.1: never 0.9 by reflex on a shared GPU)."""
     usable = max(0, total_mb - host_used_mb - headroom_mb)
-    return int(usable / total_mb * 100) / 100
+    return (usable * 100 // total_mb) / 100
 
 
 def validate(cfg: RunConfig) -> None:
@@ -80,6 +80,10 @@ def validate(cfg: RunConfig) -> None:
         raise ValueError("spec_k is required when speculation is on")
     if cfg.spec_method == "draft" and not cfg.draft_model:
         raise ValueError("draft_model is required for spec_method=draft")
+    if cfg.spec_method == "draft" and not cfg.draft_revision:
+        raise ValueError("draft_revision is required for spec_method=draft")
+    if cfg.spec_method == "ngram" and not cfg.ngram_lookup_max:
+        raise ValueError("ngram_lookup_max is required for spec_method=ngram")
     if not cfg.cudagraph_capture_sizes:
         raise ValueError("cudagraph_capture_sizes must be explicit (enforce-eager is prohibited)")
     if cfg.load_mode == "concurrency" and not cfg.concurrency:

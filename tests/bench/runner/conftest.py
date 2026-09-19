@@ -1,5 +1,4 @@
 """Fakes at the two boundaries the runner talks through: the docker CLI and HTTP."""
-import json
 from types import SimpleNamespace
 
 import pytest

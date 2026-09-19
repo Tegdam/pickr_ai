@@ -23,9 +23,18 @@ def test_engines_are_verified_and_complete():
     for name, e in ENGINES.items():
         assert isinstance(e, EngineSpec) and e.name == name
         assert e.verified_against, f"{name} table must carry the image tag it was verified against (Task 1)"
-        for k in ("kv_usage", "running", "waiting", "spec_accepted", "spec_draft", "prefix_hits", "prefix_queries"):
+        for k in ("kv_usage", "running", "waiting", "spec_accepted", "spec_draft", "spec_drafts", "prefix_hits", "prefix_queries"):
             assert k in e.metric_names, (name, k)
         assert e.health_path.startswith("/") and e.reset_cache_path.startswith("/") and e.metrics_path == "/metrics"
+
+
+def test_readiness_route_and_timeout():
+    """Fix round 1, item 3: SGLang's /ready route and both engines' 900s
+    readiness budget (ruling P4; doc §4.3, §6.3) must be represented on EngineSpec."""
+    assert ENGINES["vllm"].ready_path is None
+    assert ENGINES["sglang"].ready_path == "/ready"
+    assert ENGINES["vllm"].readiness_timeout_s == 900
+    assert ENGINES["sglang"].readiness_timeout_s == 900
 
 
 def test_vllm_launch_args_off_and_draft():
@@ -65,6 +74,140 @@ def test_sglang_awq_maps_to_awq_marlin():
     assert "--quantization awq " not in joined and not joined.endswith("--quantization awq")
 
 
+def test_sglang_draft_requires_draft_model():
+    """Fix round 1, item 2: a missing draft_model must raise ValueError, not
+    AttributeError, out of _hf_snapshot_dir's cfg.draft_model.replace(...)."""
+    e = ENGINES["sglang"]
+    with pytest.raises(ValueError, match="draft_model"):
+        e.build_launch_args(_cfg(engine="sglang", spec_method="draft", draft_revision="def", spec_k=3), 0.8)
+
+
 def test_unknown_spec_method_raises():
     with pytest.raises(ValueError):
         ENGINES["vllm"].build_launch_args(_cfg(spec_method="eagle"), 0.8)
+
+
+def test_vllm_exact_args_off():
+    """Exact-args regression guard (fix round 1): the argument spellings pinned
+    here are the main regression guard for the whole study."""
+    e = ENGINES["vllm"]
+    args = e.build_launch_args(_cfg(), mem_fraction=0.83)
+    assert args == [
+        "--model", "Qwen/Qwen2.5-3B-Instruct-AWQ", "--revision", "abc",
+        "--served-model-name", "Qwen/Qwen2.5-3B-Instruct-AWQ",
+        "--max-model-len", "2048", "--max-num-seqs", "64",
+        "--enable-chunked-prefill", "--max-num-batched-tokens", "1024",
+        "--gpu-memory-utilization", "0.83", "--seed", "0", "--port", "8000",
+        "--cudagraph-capture-sizes", "1", "2", "4", "8", "16", "32",
+        "--generation-config", "vllm",
+        "--quantization", "awq",
+        "--enable-prefix-caching",
+    ]
+
+
+def test_vllm_exact_args_draft():
+    e = ENGINES["vllm"]
+    args = e.build_launch_args(
+        _cfg(spec_method="draft", draft_model="Qwen/Qwen2.5-0.5B-Instruct", draft_revision="def", spec_k=3),
+        mem_fraction=0.83,
+    )
+    assert args == [
+        "--model", "Qwen/Qwen2.5-3B-Instruct-AWQ", "--revision", "abc",
+        "--served-model-name", "Qwen/Qwen2.5-3B-Instruct-AWQ",
+        "--max-model-len", "2048", "--max-num-seqs", "64",
+        "--enable-chunked-prefill", "--max-num-batched-tokens", "1024",
+        "--gpu-memory-utilization", "0.83", "--seed", "0", "--port", "8000",
+        "--cudagraph-capture-sizes", "1", "2", "4", "8", "16", "32",
+        "--generation-config", "vllm",
+        "--quantization", "awq",
+        "--enable-prefix-caching",
+        "--speculative-config",
+        '{"method": "draft_model", "model": "Qwen/Qwen2.5-0.5B-Instruct", "num_speculative_tokens": 3, "revision": "def"}',
+    ]
+
+
+def test_vllm_exact_args_ngram():
+    e = ENGINES["vllm"]
+    args = e.build_launch_args(_cfg(spec_method="ngram", spec_k=5, ngram_lookup_max=4), mem_fraction=0.83)
+    assert args == [
+        "--model", "Qwen/Qwen2.5-3B-Instruct-AWQ", "--revision", "abc",
+        "--served-model-name", "Qwen/Qwen2.5-3B-Instruct-AWQ",
+        "--max-model-len", "2048", "--max-num-seqs", "64",
+        "--enable-chunked-prefill", "--max-num-batched-tokens", "1024",
+        "--gpu-memory-utilization", "0.83", "--seed", "0", "--port", "8000",
+        "--cudagraph-capture-sizes", "1", "2", "4", "8", "16", "32",
+        "--generation-config", "vllm",
+        "--quantization", "awq",
+        "--enable-prefix-caching",
+        "--speculative-config",
+        '{"method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_max": 4}',
+    ]
+
+
+def test_sglang_exact_args_off():
+    e = ENGINES["sglang"]
+    args = e.build_launch_args(_cfg(engine="sglang"), mem_fraction=0.8)
+    assert args == [
+        "python", "-m", "sglang.launch_server",
+        "--model-path", "Qwen/Qwen2.5-3B-Instruct-AWQ", "--revision", "abc",
+        "--served-model-name", "Qwen/Qwen2.5-3B-Instruct-AWQ",
+        "--context-length", "2048", "--max-running-requests", "64",
+        "--chunked-prefill-size", "1024", "--max-prefill-tokens", "1024",
+        "--mem-fraction-static", "0.80",
+        "--random-seed", "0", "--port", "30000", "--host", "0.0.0.0",
+        "--cuda-graph-bs-decode", "1", "2", "4", "8", "16", "32",
+        "--sampling-defaults", "openai",
+        "--enable-metrics", "--enable-cache-report",
+        "--quantization", "awq_marlin",
+    ]
+
+
+def test_sglang_exact_args_standalone():
+    e = ENGINES["sglang"]
+    args = e.build_launch_args(
+        _cfg(engine="sglang", spec_method="draft", draft_model="Qwen/Qwen2.5-0.5B-Instruct", draft_revision="def", spec_k=3),
+        mem_fraction=0.8,
+    )
+    assert args == [
+        "python", "-m", "sglang.launch_server",
+        "--model-path", "Qwen/Qwen2.5-3B-Instruct-AWQ", "--revision", "abc",
+        "--served-model-name", "Qwen/Qwen2.5-3B-Instruct-AWQ",
+        "--context-length", "2048", "--max-running-requests", "64",
+        "--chunked-prefill-size", "1024", "--max-prefill-tokens", "1024",
+        "--mem-fraction-static", "0.80",
+        "--random-seed", "0", "--port", "30000", "--host", "0.0.0.0",
+        "--cuda-graph-bs-decode", "1", "2", "4", "8", "16", "32",
+        "--sampling-defaults", "openai",
+        "--enable-metrics", "--enable-cache-report",
+        "--quantization", "awq_marlin",
+        "--speculative-algorithm", "STANDALONE",
+        "--speculative-draft-model-path",
+        "/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/def",
+        "--speculative-draft-model-quantization", "unquant",
+        "--speculative-num-steps", "3",
+        "--speculative-eagle-topk", "1",
+        "--speculative-num-draft-tokens", "4",
+    ]
+
+
+def test_sglang_exact_args_ngram():
+    e = ENGINES["sglang"]
+    args = e.build_launch_args(_cfg(engine="sglang", spec_method="ngram", spec_k=5, ngram_lookup_max=4), mem_fraction=0.8)
+    assert args == [
+        "python", "-m", "sglang.launch_server",
+        "--model-path", "Qwen/Qwen2.5-3B-Instruct-AWQ", "--revision", "abc",
+        "--served-model-name", "Qwen/Qwen2.5-3B-Instruct-AWQ",
+        "--context-length", "2048", "--max-running-requests", "64",
+        "--chunked-prefill-size", "1024", "--max-prefill-tokens", "1024",
+        "--mem-fraction-static", "0.80",
+        "--random-seed", "0", "--port", "30000", "--host", "0.0.0.0",
+        "--cuda-graph-bs-decode", "1", "2", "4", "8", "16", "32",
+        "--sampling-defaults", "openai",
+        "--enable-metrics", "--enable-cache-report",
+        "--quantization", "awq_marlin",
+        "--speculative-algorithm", "NGRAM",
+        "--speculative-num-steps", "5",
+        "--speculative-num-draft-tokens", "6",
+        "--speculative-ngram-max-bfs-breadth", "1",
+        "--speculative-ngram-max-trie-depth", "4",
+    ]
