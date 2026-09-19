@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -37,6 +38,7 @@ from .engine import ENGINES, EngineSpec
 from .env_capture import capture_env
 from .gpu_monitor import GpuSampler, WIN_SMI, WSL_SMI, read_gpu
 from .metrics_scraper import MetricsScraper
+from .paths import REPO_ROOT as _REPO_ROOT
 from .readiness import reset_cache, wait_healthy, warmup
 from .schema import CLIENT_OUTPUT_SCHEMA_VERSION
 from .state import SweepState
@@ -59,8 +61,38 @@ COOLDOWN_CAP_S = 15 * 60.0
 # Task 9 fix round 1, minor: `python -m bench.echo_server` must be launched
 # with the repo root as cwd -- `-m` resolves the package through sys.path[0],
 # which is the process's cwd, not this file's location, and the runner may be
-# invoked from anywhere.
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+# invoked from anywhere. C1/P28: `_REPO_ROOT` itself now lives in `.paths`
+# (imported above) so `cli.py`/`probes.py`/`sweep.py` share the exact same
+# value instead of each re-deriving it.
+
+
+def _retry(fn, attempts: int, sleep, sleep_s: float = 2.0):
+    """I5/P34: up to `attempts` tries of `fn()`, sleeping `sleep_s` (injectable
+    `sleep`) between tries, re-raising the last exception once `attempts` is
+    exhausted. A single flaky pre-flight read (docker ps / nvidia-smi) must
+    not fail an entire sweep -- but a *systematically* broken environment
+    still must, hence the cap rather than an unbounded retry."""
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - deliberately broad: any reader failure is retried the same way
+            last_exc = e
+            if attempt < attempts - 1:
+                sleep(sleep_s)
+    raise last_exc
+
+
+def _default_port_free(port: int) -> bool:
+    """I4/P33: a real TCP connect that succeeds means something is already
+    listening on 127.0.0.1:<port> -- used only as `run_one`'s production
+    default; every test injects a fake so no test ever touches a real
+    socket."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return False
+    except OSError:
+        return True
 
 
 class PreflightError(RuntimeError):
@@ -77,13 +109,30 @@ class PreflightError(RuntimeError):
 @dataclass
 class RunPaths:
     """Filesystem layout one run/sweep needs (ruling: `RunPaths` carries no
-    sweep-runtime options -- those travel through `opts`, see module docstring)."""
+    sweep-runtime options -- those travel through `opts`, see module docstring).
+
+    C1/P28: every path is resolved to absolute (`expanduser().resolve()`) in
+    `__post_init__` -- these paths end up as docker `-v` mount sources
+    (`hf_cache_dir`, `compile_cache_root`, `traces_dir`, `run_dir`), and
+    docker rejects a relative one outright. Resolving here means every
+    caller (real CLI usage and every test fixture that builds a `RunPaths`
+    with a relative or tmp-path directory) gets an absolute path with no
+    special-casing at the call site.
+    """
     results_root: Path
     sweep_dir: Path
     run_dir: Path
     traces_dir: Path
     hf_cache_dir: Path
     compile_cache_root: Path
+
+    def __post_init__(self) -> None:
+        self.results_root = Path(self.results_root).expanduser().resolve()
+        self.sweep_dir = Path(self.sweep_dir).expanduser().resolve()
+        self.run_dir = Path(self.run_dir).expanduser().resolve()
+        self.traces_dir = Path(self.traces_dir).expanduser().resolve()
+        self.hf_cache_dir = Path(self.hf_cache_dir).expanduser().resolve()
+        self.compile_cache_root = Path(self.compile_cache_root).expanduser().resolve()
 
 
 @dataclass
@@ -289,22 +338,44 @@ def _wait_vram_return(gpu_reader, pre_used_mb, clock, sleep,
 def _cooldown(gpu_reader, cooldown_temp_c: int, cooldown_min_s: int, clock, sleep,
               poll_s: float = COOLDOWN_POLL_S, cap_s: float = COOLDOWN_CAP_S) -> dict:
     """Step 9: sleep until Windows-side temp <= threshold AND the minimum
-    wall gap has elapsed, capped at `cap_s` (spec §6 step 9)."""
+    wall gap has elapsed, capped at `cap_s` (spec §6 step 9).
+
+    I5/P34: a reader exception on any single poll is caught here and counted
+    (`cooldown_reader_errors`) rather than aborting the whole wait -- the
+    previous behaviour let one flaky nvidia-smi call anywhere in a 15-minute
+    cooldown window blow away the entire measurement (recorded as a single
+    opaque `cooldown_error` and no cooldown timing at all). The last known-
+    good temperature reading is kept across a failed poll; only running out
+    of `cap_s` gives up.
+    """
     t0 = clock()
-    start_temp = gpu_reader(WIN_SMI).get("temp_c")
+    reader_errors = 0
+
+    def _read_temp():
+        nonlocal reader_errors
+        try:
+            return gpu_reader(WIN_SMI).get("temp_c")
+        except Exception:  # noqa: BLE001 - counted, never raised -- see docstring
+            reader_errors += 1
+            return None
+
+    start_temp = _read_temp()
     end_temp = start_temp
     while True:
-        win = gpu_reader(WIN_SMI)
-        end_temp = win.get("temp_c")
+        reading = _read_temp()
+        if reading is not None:
+            end_temp = reading
         elapsed = clock() - t0
         cool_enough = end_temp is not None and end_temp <= cooldown_temp_c
         long_enough = elapsed >= cooldown_min_s
         if cool_enough and long_enough:
             return {"cooldown_observed_s": elapsed, "cooldown_start_temp_c": start_temp,
-                    "cooldown_end_temp_c": end_temp, "cooldown_capped": False}
+                    "cooldown_end_temp_c": end_temp, "cooldown_capped": False,
+                    "cooldown_reader_errors": reader_errors}
         if elapsed >= cap_s:
             return {"cooldown_observed_s": elapsed, "cooldown_start_temp_c": start_temp,
-                    "cooldown_end_temp_c": end_temp, "cooldown_capped": True}
+                    "cooldown_end_temp_c": end_temp, "cooldown_capped": True,
+                    "cooldown_reader_errors": reader_errors}
         sleep(poll_s)
 
 
@@ -355,7 +426,8 @@ def _record_run(cfg, spec, docker, handle, client, trace_rows, run_dir, kernel, 
 
 def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
             gpu_reader=read_gpu, clock=time.monotonic, sleep=time.sleep,
-            opts: dict | None = None, popen=subprocess.Popen) -> dict:
+            opts: dict | None = None, popen=subprocess.Popen,
+            port_free=_default_port_free) -> dict:
     """Executes spec §6 steps 1-9 end to end and writes every artifact spec §7
     names into `paths.run_dir`. Returns the `summary.json` dict.
 
@@ -365,6 +437,7 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     environmental failures (see its docstring) -- callers must not treat
     those like an ordinary measurement failure. `popen` is Task 9's seam for
     the echo engine's subprocess launch, threaded through to `start_engine`.
+    `port_free` (I4/P33) is injectable so tests never touch a real socket.
     """
     opts = dict(opts or {})
     gpu_headroom_mb = opts.get("gpu_headroom_mb", 256)
@@ -390,16 +463,34 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     mono_anchor = clock()
 
     # --- 1. Pre-flight (spec §6 step 1) ---------------------------------
+    # I5/P34: a single flaky docker ps / nvidia-smi call must not fail the
+    # whole run -- 3 attempts, 2s apart, before this counts as a real
+    # PreflightError.
     try:
-        already_running = [n for n in docker.ps_names() if n.startswith("bench-")]
+        already_running = [n for n in _retry(docker.ps_names, 3, sleep) if n.startswith("bench-")]
     except Exception as e:
         _preflight_fail(f"docker ps failed: {e}", e)
     if already_running:
         _preflight_fail(f"refusing to start: bench-* container(s) already running: {already_running}")
 
+    # I4/P33: both images present before anything is launched -- a missing
+    # image is an environmental failure, not a measurement one. Skipped for
+    # the echo engine (spec.image is None, Task 9: a local subprocess).
+    if spec.image is not None and not docker.image_present(spec.image):
+        _preflight_fail(f"engine image not present: {spec.image!r} -- run check-env / pull it first")
+    if not docker.image_present(CLIENT_IMAGE):
+        _preflight_fail(f"client image not present: {CLIENT_IMAGE!r} -- run check-env / build it first")
+
+    # I4/P33: refuse to start if something is already listening on the
+    # engine's port -- a stale process from outside docker's own view (the
+    # bench-* guard above only sees containers) would otherwise silently eat
+    # every request this run thinks it is sending to a fresh engine.
+    if not port_free(spec.port):
+        _preflight_fail(f"port {spec.port} already in use")
+
     try:
-        win_pre = gpu_reader(WIN_SMI)
-        wsl_pre = gpu_reader(WSL_SMI)
+        win_pre = _retry(lambda: gpu_reader(WIN_SMI), 3, sleep)
+        wsl_pre = _retry(lambda: gpu_reader(WSL_SMI), 3, sleep)
     except Exception as e:
         _preflight_fail(f"gpu reader failed: {e}", e)
 
@@ -408,8 +499,25 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     if total_mb is None or host_used_mb is None:
         _preflight_fail(f"gpu reader returned no usable total_mb/used_mb: {win_pre}")
 
+    # I3/P32: a non-idle GPU at the very start of a run means a previous
+    # run's context never actually tore down (a WDDM/driver-level leak the
+    # VRAM-return check at the END of the previous run can't always catch) --
+    # refuse to start rather than layer a fresh engine on top of a leaked one.
+    wsl_used_mb = wsl_pre.get("used_mb")
+    if wsl_used_mb is not None and wsl_used_mb > 150:
+        _preflight_fail(f"GPU not idle (used {wsl_used_mb} MiB) -- leaked context?")
+
     cfg.free_vram_mb_at_start = total_mb - host_used_mb
-    cfg.gpu_memory_utilization = resolve_gpu_memory_fraction(total_mb, host_used_mb, gpu_headroom_mb)
+    # C2/P29: per-engine headroom on top of the sweep's own gpu_headroom_mb,
+    # then capped at the engine's own max_mem_fraction -- SGLang's static
+    # allocation plus CUDA-graph capture needs materially more slack than
+    # vLLM's (doc §7 smoke footprints; EngineSpec.mem_headroom_mb/
+    # max_mem_fraction docstring).
+    cfg.mem_headroom_mb_total = gpu_headroom_mb + spec.mem_headroom_mb
+    cfg.gpu_memory_utilization = min(
+        resolve_gpu_memory_fraction(total_mb, host_used_mb, cfg.mem_headroom_mb_total),
+        spec.max_mem_fraction,
+    )
 
     clocks_pinned = False
     if try_clock_pin:
@@ -424,7 +532,17 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
         f"free={cfg.free_vram_mb_at_start}MiB frac={cfg.gpu_memory_utilization} "
         f"clocks_pinned={clocks_pinned}")
 
-    validate(cfg)
+    # I4/P33: a bad config is an environmental failure (fix it and re-run),
+    # not a measurement one -- must not burn the sweep's retry budget.
+    try:
+        validate(cfg)
+    except ValueError as e:
+        _preflight_fail(f"validate failed: {e}", e)
+
+    # Minor: written now (in addition to _record_run's later write, which
+    # carries the resolved fraction too and wins) so a run that fails before
+    # ever reaching _record_run still leaves a config.yaml behind.
+    (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg.to_dict(), sort_keys=False), encoding="utf-8")
 
     # --- 2. Launch the engine (PreflightError on a failed launch) --------
     handle = start_engine(cfg, spec, docker, paths, popen=popen)
@@ -583,7 +701,19 @@ def _load_sweep_state(sweep_path, results_root: Path, *, resume: bool) -> tuple[
     """Shared setup for `run_sweep`'s resume and fresh-start paths: load the
     sweep dict, resolve `sweep_dir`, and produce a `SweepState` plus the
     schedule's original run-id order. Fresh starts also write `sweep.yaml`/
-    `schedule.json` and refuse to clobber an existing sweep (Important 4)."""
+    `schedule.json` and refuse to clobber an existing sweep (Important 4).
+
+    I2/P31: the `sweep.yaml` a fresh start writes into `sweep_dir` is the
+    MERGED dict (base applied, `base`/`_source` stripped, `traces_dir`
+    resolved absolute) -- NOT a verbatim copy of the source sweep file. A
+    verbatim copy still carries `base: <live base.yaml path>`, so a later
+    `resume` (which loads sweep_dir's own frozen `sweep.yaml` through
+    `load_sweep`) would re-merge against whatever the live base.yaml
+    happens to say by then, silently producing different configs for the
+    sweep's remaining runs than the ones already on disk from before the
+    edit. Because the frozen file carries no `base:` key at all, `load_sweep`
+    on resume is a straight load with no merge to go wrong.
+    """
     sweep_dict = load_sweep(sweep_path)
     sweep_id = sweep_dict["sweep_id"]
     sweep_dir = results_root / sweep_id
@@ -607,7 +737,10 @@ def _load_sweep_state(sweep_path, results_root: Path, *, resume: bool) -> tuple[
     ordered = schedule_configs(expand(sweep_dict, sweep_id), opts["schedule_seed"])
     original_order = [c.run_id for c in ordered]
     state = SweepState(state_path, original_order, max_retries_total=opts["max_retries_total"])
-    (sweep_dir / "sweep.yaml").write_text(Path(sweep_path).read_text(encoding="utf-8"), encoding="utf-8")
+
+    frozen = {k: v for k, v in sweep_dict.items() if k not in ("base", "_source")}
+    frozen["traces_dir"] = str(Path(opts["traces_dir"]).expanduser().resolve())
+    (sweep_dir / "sweep.yaml").write_text(yaml.safe_dump(frozen, sort_keys=False), encoding="utf-8")
     (sweep_dir / "schedule.json").write_text(
         json.dumps({"order": original_order, "seed": opts["schedule_seed"]}, indent=2), encoding="utf-8")
     return sweep_dict, sweep_id, sweep_dir, state, original_order
@@ -616,7 +749,8 @@ def _load_sweep_state(sweep_path, results_root: Path, *, resume: bool) -> tuple[
 def run_sweep(sweep_path, results_root, *, resume: bool = False,
               docker, http_factory, spec_for=lambda cfg: ENGINES[cfg.engine],
               gpu_reader=read_gpu, clock=time.monotonic, sleep=time.sleep,
-              hf_cache_dir=None, compile_cache_root=None) -> SweepReport:
+              hf_cache_dir=None, compile_cache_root=None,
+              port_free=_default_port_free) -> SweepReport:
     """Drives every run in a sweep through `run_one`, resuming from
     `state.json` when `resume=True` (spec §6/§7, ruling: sweep loop).
 
@@ -629,6 +763,19 @@ def run_sweep(sweep_path, results_root, *, resume: bool = False,
     A `PreflightError` from `run_one` (Important 3) is not requeued: the run
     is left `running` (so `reset_stale()` recovers it on the next `resume`)
     and the error propagates out of `run_sweep` so the process exits non-zero.
+
+    I3/P32: a run whose `summary["timing"]["vram_leak_mb"]` exceeds 512 MiB
+    is still marked `done` (its own data is fine), but `run_sweep` then
+    raises `PreflightError` anyway -- a leak this size means later runs'
+    memory-fraction math (measured "free" VRAM) is already wrong, so the
+    sweep must stop and be inspected rather than silently keep shrinking
+    every subsequent run's fraction against a phantom shortage.
+
+    I5/P34: 3 consecutive FIRST-ATTEMPT failures (an exception, or an invalid
+    result, on a run whose `opts["attempt"] == 1`, with no success in
+    between) raise `PreflightError` -- a systematic problem (bad model
+    revision, broken image, wrong config) should stop the sweep rather than
+    grind through every remaining run on the way to the same failure.
     """
     results_root = Path(results_root)
     sweep_dict, sweep_id, sweep_dir, state, original_order = _load_sweep_state(
@@ -645,6 +792,7 @@ def run_sweep(sweep_path, results_root, *, resume: bool = False,
     # seeded permutation never changes even after it is requeued to the end
     # of the live queue (state.order mutates on requeue; this does not).
     schedule_index_by_id = {rid: i for i, rid in enumerate(original_order)}
+    consecutive_first_attempt_failures = 0
 
     while state.pending():
         run_id = state.pending()[0]
@@ -657,13 +805,15 @@ def run_sweep(sweep_path, results_root, *, resume: bool = False,
         run_opts["schedule_index"] = schedule_index_by_id.get(run_id)
         run_opts["attempt"] = state.runs[run_id]["attempts"] + 1
         run_opts["requeued_from"] = state.runs[run_id].get("reason") if state.runs[run_id]["status"] == "requeued" else None
+        is_first_attempt = run_opts["attempt"] == 1
 
         state.mark(run_id, "running")
         spec = spec_for(cfg)
         http = http_factory()
         try:
             summary = run_one(cfg, paths, docker=docker, http=http, spec=spec,
-                               gpu_reader=gpu_reader, clock=clock, sleep=sleep, opts=run_opts)
+                               gpu_reader=gpu_reader, clock=clock, sleep=sleep, opts=run_opts,
+                               port_free=port_free)
         except PreflightError as e:
             # Important 3: not a measurement failure -- leave the run
             # `running` (reset_stale() on the next resume recovers it) and do
@@ -675,16 +825,35 @@ def run_sweep(sweep_path, results_root, *, resume: bool = False,
             state.mark(run_id, "invalid", reason=str(e))
             requeued = state.requeue(run_id)
             print(f"[{run_id}] EXCEPTION: {e} -> {'requeued to end' if requeued else 'retry budget exhausted'}")
+            if is_first_attempt:
+                consecutive_first_attempt_failures += 1
+                if consecutive_first_attempt_failures >= 3:
+                    raise PreflightError("3 consecutive first-attempt failures -- systematic; stopping")
             continue
 
         summaries[run_id] = summary
+
+        # I3/P32: halt the sweep on a big leak regardless of this run's own
+        # validity -- its own measurement is unaffected, but every later
+        # run's "free VRAM" math is now built on a false premise.
+        leak_mb = (summary.get("timing") or {}).get("vram_leak_mb") or 0
+        if leak_mb > 512:
+            state.mark(run_id, "done")
+            print(f"[{run_id}] done, but VRAM leak {leak_mb} MiB -- halting sweep")
+            raise PreflightError(f"VRAM leak of {leak_mb} MiB after run {run_id}; stop and inspect")
+
         if summary.get("valid"):
             state.mark(run_id, "done")
+            consecutive_first_attempt_failures = 0
             print(f"[{run_id}] done")
         else:
             reason = summary.get("invalid_reason")
             state.mark(run_id, "invalid", reason=reason)
             requeued = state.requeue(run_id)
             print(f"[{run_id}] invalid ({reason}) -> {'requeued to end' if requeued else 'retry budget exhausted'}")
+            if is_first_attempt:
+                consecutive_first_attempt_failures += 1
+                if consecutive_first_attempt_failures >= 3:
+                    raise PreflightError("3 consecutive first-attempt failures -- systematic; stopping")
 
     return SweepReport(sweep_id=sweep_id, sweep_dir=sweep_dir, state=state, summaries=summaries)

@@ -6,8 +6,9 @@ No real docker or nvidia-smi is invoked: `gpu_reader` here stands in for
 is currently in `fake_docker.running` -- WSL-side usage is 0 before the
 engine container starts (or after it is stopped) and 3000 while it runs,
 Windows-side total/used/temp are fixed, matching the brief's calibration
-numbers (total 6141, host used 0 -> resolved fraction 0.95; temp 45 <= the
-default cooldown_temp_c 55).
+numbers (total 6141, host used 0 -> resolved fraction 0.87 for vLLM: C2/P29's
+per-engine headroom is 256 (sweep default) + 512 (vLLM) = 768, so
+(6141-0-768)*100 // 6141 == 87; temp 45 <= the default cooldown_temp_c 55).
 """
 from __future__ import annotations
 
@@ -69,6 +70,12 @@ def _no_sleep(_seconds):
     return None
 
 
+def _free_port(_port):
+    """I4/P33: `run_one`'s port-free pre-flight check, faked so tests never
+    touch a real socket -- every port is "free" unless a test says otherwise."""
+    return True
+
+
 def _write_trace(path: Path, n: int = 4) -> str:
     rows = [
         {"record_id": f"q{i}", "call_role": "chat", "workload": "A", "prompt": f"hello {i}", "output_tokens": 50}
@@ -119,7 +126,7 @@ def test_run_one_happy_path_writes_every_artifact_and_is_valid(tmp_path, monkeyp
 
     summary = run_one(
         cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
-        gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+        gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep, port_free=_free_port,
         opts={"schedule_index": 2, "attempt": 1, "gpu_headroom_mb": 256, "try_clock_pin": False},
     )
 
@@ -136,7 +143,7 @@ def test_run_one_happy_path_writes_every_artifact_and_is_valid(tmp_path, monkeyp
     assert run_call["gpus"] is True and run_call["network_host"] is True
     assert run_call["env"] == ENGINES["vllm"].env
     assert run_call["extra_args"] == ["--shm-size", "2g"]
-    assert "--gpu-memory-utilization 0.95" in " ".join(run_call["args"])
+    assert "--gpu-memory-utilization 0.87" in " ".join(run_call["args"])  # C2/P29: vLLM headroom 256+512=768
     assert (str(paths.hf_cache_dir), "/root/.cache/huggingface", "ro") in run_call["mounts"]
     assert (str(paths.compile_cache_root / "vllm"), "/root/.cache/vllm", "rw") in run_call["mounts"]
 
@@ -154,7 +161,7 @@ def test_run_one_happy_path_writes_every_artifact_and_is_valid(tmp_path, monkeyp
     assert summary["valid"] is True
 
     config_yaml = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8"))
-    assert config_yaml["gpu_memory_utilization"] == pytest.approx(0.95)
+    assert config_yaml["gpu_memory_utilization"] == pytest.approx(0.87)
     assert config_yaml["free_vram_mb_at_start"] == WIN_TOTAL_MB - WIN_USED_MB
 
     meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
@@ -184,7 +191,7 @@ def test_run_one_warm_cache_skips_reset(tmp_path, monkeypatch, client_json):
     cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json, cfg_over={"cache_state": "warm"})
 
     run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
-            gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
+            gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep, port_free=_free_port)
 
     assert not any(u.endswith("/reset_prefix_cache") for u, _ in fake_http.posts)
 
@@ -268,7 +275,7 @@ def test_run_one_echo_engine_is_a_subprocess_not_a_docker_container(tmp_path, mo
         return p
 
     summary = run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["echo"],
-                       gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+                       gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep, port_free=_free_port,
                        popen=fake_popen)
 
     # No docker `run` for the engine -- the only docker.run call is the client.
@@ -334,7 +341,7 @@ def test_run_one_echo_engine_crash_before_healthy_raises_with_stderr(tmp_path, m
 
     with pytest.raises(RuntimeError) as excinfo:
         run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["echo"],
-                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep, port_free=_free_port,
                 popen=_DiesOnThirdPoll)
 
     assert "exited during startup" in str(excinfo.value)
@@ -362,10 +369,10 @@ class _NoopGpuSampler:
 
 
 def test_run_one_cooldown_reader_failure_is_recorded_not_raised(tmp_path, monkeypatch, client_json):
-    """Carried from Task 8 re-review: a gpu_reader flake during the post-run
-    cooldown wait must never raise out of run_one's `finally` -- that would
-    mask an otherwise-valid run's own result. `cooldown_error` is recorded on
-    meta.json instead and the run stays valid."""
+    """I5/P34: a gpu_reader flake during the post-run cooldown wait is caught
+    and counted (`cooldown_reader_errors`) INSIDE `_cooldown` itself, which
+    keeps waiting rather than aborting the whole cooldown measurement -- the
+    run stays valid and still gets a normal `cooldown_observed_s`."""
     cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
     monkeypatch.setattr(lifecycle, "GpuSampler", _NoopGpuSampler)
 
@@ -381,14 +388,15 @@ def test_run_one_cooldown_reader_failure_is_recorded_not_raised(tmp_path, monkey
         return base_reader(cmd)
 
     summary = run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
-                       gpu_reader=flaky_reader, clock=_make_clock(), sleep=_no_sleep)
+                       gpu_reader=flaky_reader, clock=_make_clock(), sleep=_no_sleep, port_free=_free_port)
 
     assert summary["valid"] is True
     assert summary["timing"]["vram_leak_mb"] == 0  # the VRAM-return check itself never saw the flake
 
     meta = json.loads((paths.run_dir / "meta.json").read_text(encoding="utf-8"))
-    assert "cooldown_error" in meta and "nvidia-smi flaked" in meta["cooldown_error"]
-    assert "cooldown_observed_s" not in meta  # _cooldown raised before returning its normal dict
+    assert "cooldown_error" not in meta
+    assert meta["cooldown_reader_errors"] >= 1
+    assert meta["cooldown_observed_s"] is not None  # _cooldown returned normally despite the flakes
 
 
 def test_run_one_vram_return_reader_failure_is_recorded_not_raised(tmp_path, monkeypatch, client_json):
@@ -405,7 +413,7 @@ def test_run_one_vram_return_reader_failure_is_recorded_not_raised(tmp_path, mon
         return _make_gpu_reader(fake_docker)(cmd)
 
     summary = run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
-                       gpu_reader=flaky_reader, clock=_make_clock(), sleep=_no_sleep)
+                       gpu_reader=flaky_reader, clock=_make_clock(), sleep=_no_sleep, port_free=_free_port)
 
     assert summary["valid"] is True
     assert summary["timing"]["vram_returned_mb"] is None
@@ -424,7 +432,7 @@ def test_run_one_preflight_failure_writes_preflight_error_txt(tmp_path, monkeypa
 
     with pytest.raises(PreflightError):
         run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
-                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep, port_free=_free_port)
 
     text = (paths.run_dir / "preflight_error.txt").read_text(encoding="utf-8")
     assert "bench-leaked" in text
@@ -482,7 +490,7 @@ def test_run_one_draft_spec_never_advances_is_invalid_with_acceptance_reason(tmp
     monkeypatch.setattr(lifecycle, "MetricsScraper", _StaticMetricsScraper)
 
     summary = run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
-                       gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
+                       gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep, port_free=_free_port)
 
     assert summary["valid"] is False
     assert "acceptance" in summary["invalid_reason"]
@@ -504,7 +512,7 @@ def test_run_one_isolates_previous_attempt_artifacts(tmp_path, monkeypatch, clie
     (run_dir / "summary.json").write_text("{}", encoding="utf-8")
 
     summary = run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
-                       gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
+                       gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep, port_free=_free_port)
 
     assert (run_dir / "attempt-1" / "gpu_samples.jsonl").exists()
     assert (run_dir / "attempt-1" / "summary.json").exists()
@@ -527,7 +535,104 @@ def test_run_one_preflight_error_on_none_gpu_totals(tmp_path, monkeypatch, clien
 
     with pytest.raises(PreflightError):
         run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
-                gpu_reader=bad_reader, clock=_make_clock(), sleep=_no_sleep)
+                gpu_reader=bad_reader, clock=_make_clock(), sleep=_no_sleep, port_free=_free_port)
+
+
+def test_run_one_preflight_fails_when_gpu_not_idle(tmp_path, monkeypatch, client_json):
+    """I3/P32: a non-idle WSL-side reading at the very start of a run (>150
+    MiB used, no bench-* container running yet) means a previous run's
+    context never actually tore down -- refuse to start rather than layer a
+    fresh engine on top of a leaked one."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+
+    def not_idle_reader(cmd):
+        if list(cmd) == list(WSL_SMI):
+            return {"used_mb": 500, "total_mb": WIN_TOTAL_MB}
+        return {"used_mb": WIN_USED_MB, "total_mb": WIN_TOTAL_MB}
+
+    with pytest.raises(PreflightError, match="GPU not idle"):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                gpu_reader=not_idle_reader, clock=_make_clock(), sleep=_no_sleep, port_free=_free_port)
+
+    # No engine container was ever launched for this preflight failure.
+    assert not any(c["op"] == "run" for c in fake_docker.calls)
+
+
+def test_run_one_preflight_fails_when_engine_image_missing(tmp_path, monkeypatch, client_json):
+    """I4/P33: a missing engine image is an environmental failure -- caught
+    before anything is launched, not surfaced as a measurement failure."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    fake_docker.images_present[ENGINES["vllm"].image] = False
+
+    with pytest.raises(PreflightError, match="image not present"):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+                port_free=_free_port)
+
+
+def test_run_one_preflight_fails_when_client_image_missing(tmp_path, monkeypatch, client_json):
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    fake_docker.images_present[CLIENT_IMAGE] = False
+
+    with pytest.raises(PreflightError, match="client image not present"):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+                port_free=_free_port)
+
+
+def test_run_one_preflight_skips_engine_image_check_for_echo(tmp_path, monkeypatch, client_json):
+    """I4/P33: the echo engine has no image at all (Task 9) -- must not call
+    docker.image_present(None)."""
+    cfg, paths, fake_docker, fake_http = _setup(
+        tmp_path, monkeypatch, client_json, cfg_over={"engine": "echo", "image": None},
+    )
+
+    image_present_calls = []
+    real_image_present = fake_docker.image_present
+
+    def tracking_image_present(image):
+        image_present_calls.append(image)
+        assert image is not None, "must not be called for image=None"
+        return real_image_present(image)
+
+    fake_docker.image_present = tracking_image_present
+
+    run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["echo"],
+            gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+            port_free=_free_port, popen=_FakePopen)
+
+    # Only the client image was checked -- echo's own spec.image is None.
+    assert image_present_calls == [CLIENT_IMAGE]
+
+
+def test_run_one_preflight_fails_when_port_not_free(tmp_path, monkeypatch, client_json):
+    """I4/P33: something already listening on the engine's port must refuse
+    the run before anything is launched."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+
+    with pytest.raises(PreflightError, match="already in use"):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+                port_free=lambda p: False)
+
+    assert not any(c["op"] == "run" for c in fake_docker.calls)
+
+
+def test_run_one_writes_config_yaml_early_right_after_validate(tmp_path, monkeypatch, client_json):
+    """Minor: config.yaml is written as soon as validate() succeeds (step 1),
+    not only after the full run -- so a run that fails before _record_run
+    still leaves a config.yaml with the resolved fraction behind."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    fake_http.healthy_after = 10**6  # never becomes healthy -- fails after step 1
+
+    with pytest.raises(TimeoutError):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http,
+                spec=replace(ENGINES["vllm"], readiness_timeout_s=0.01),
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+                port_free=_free_port)
+
+    config_yaml = yaml.safe_load((paths.run_dir / "config.yaml").read_text(encoding="utf-8"))
+    assert config_yaml["gpu_memory_utilization"] == pytest.approx(0.87)
 
 
 def test_run_one_wait_healthy_timeout_stops_engine_and_writes_log(tmp_path, monkeypatch, client_json):
@@ -540,7 +645,7 @@ def test_run_one_wait_healthy_timeout_stops_engine_and_writes_log(tmp_path, monk
 
     with pytest.raises(TimeoutError):
         run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=tiny_timeout_spec,
-                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep, port_free=_free_port)
 
     assert f"bench-{cfg.run_id}" not in fake_docker.running
     stop_calls = [c for c in fake_docker.calls if c["op"] == "stop" and c["name"] == f"bench-{cfg.run_id}"]
@@ -583,7 +688,7 @@ def test_run_one_client_exception_stops_engine_and_samplers(tmp_path, monkeypatc
 
     with pytest.raises(RuntimeError, match="client blew up"):
         run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
-                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep, port_free=_free_port)
 
     assert f"bench-{cfg.run_id}" not in fake_docker.running
     assert created, "expected sampler/scraper instances to have been created"
@@ -627,7 +732,7 @@ def _write_sweep_files(tmp_path, sweep_id="sw1", max_retries_total=2):
 def _sweep_kwargs(fake_docker, http_factory, tmp_path):
     return dict(
         docker=fake_docker, http_factory=http_factory, spec_for=lambda cfg: ENGINES["vllm"],
-        gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+        gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep, port_free=_free_port,
         hf_cache_dir=tmp_path / "hfcache", compile_cache_root=tmp_path / "compile_cache",
     )
 
@@ -776,3 +881,149 @@ def test_run_sweep_fresh_start_refuses_to_clobber_existing_sweep(tmp_path, monke
 
     with pytest.raises(FileExistsError, match="resume"):
         run_sweep(sweep_path, results_root, resume=False, **_sweep_kwargs(fake_docker, http_factory, tmp_path))
+
+
+def test_resume_loads_frozen_sweep_yaml_not_the_edited_live_base(tmp_path, monkeypatch, client_json):
+    """I2/P31: the sweep.yaml a fresh start freezes into sweep_dir carries no
+    `base:` key -- resuming must load it directly, never re-merging against
+    whatever the live base.yaml says by the time resume runs. Edits the base
+    after the first run, then resumes a run that got reset to `running`
+    (simulating a crash), and asserts its config comes back unchanged."""
+    monkeypatch.setattr(env_capture, "_host_lines", lambda: {})
+    sweep_path = _write_sweep_files(tmp_path)
+    results_root = tmp_path / "results"
+
+    fake_docker = FakeDocker()
+    fake_docker.keep_running = True
+
+    def fake_run_client(docker, cfg, spec, run_dir, traces_dir, hf_cache_dir, **kw):
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        (Path(run_dir) / "client_raw.json").write_text(json.dumps(client_json), encoding="utf-8")
+        return client_json
+
+    monkeypatch.setattr(lifecycle, "run_client", fake_run_client)
+
+    def http_factory():
+        h = FakeHTTP()
+        h.reset_responses = [{"status": 200, "json": {"success": True}}]
+        return h
+
+    first = run_sweep(sweep_path, results_root, resume=False, **_sweep_kwargs(fake_docker, http_factory, tmp_path))
+    target = next(iter(first.state.order))
+    original_max_num_seqs = yaml.safe_load(
+        (first.sweep_dir / target / "config.yaml").read_text(encoding="utf-8"))["max_num_seqs"]
+    assert original_max_num_seqs == 64
+
+    # The frozen sweep.yaml carries the merged fields directly -- no `base:`.
+    frozen_sweep_path = results_root / first.sweep_id / "sweep.yaml"
+    frozen = yaml.safe_load(frozen_sweep_path.read_text(encoding="utf-8"))
+    assert "base" not in frozen and frozen["max_num_seqs"] == 64
+
+    # Edit the LIVE base.yaml after the fact -- must have zero effect on resume.
+    base_path = tmp_path / "base.yaml"
+    base_dict = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+    base_dict["max_num_seqs"] = 999
+    base_path.write_text(yaml.safe_dump(base_dict), encoding="utf-8")
+
+    # Simulate a crash: one run left "running" for resume to redo.
+    state = SweepState.load(first.sweep_dir / "state.json")
+    state.mark(target, "running")
+
+    resumed = run_sweep(frozen_sweep_path, results_root, resume=True,
+                         **_sweep_kwargs(fake_docker, http_factory, tmp_path))
+
+    resumed_cfg = yaml.safe_load((resumed.sweep_dir / target / "config.yaml").read_text(encoding="utf-8"))
+    assert resumed_cfg["max_num_seqs"] == 64  # unchanged despite the live base.yaml edit
+
+
+def test_run_sweep_halts_on_a_vram_leak_but_still_marks_the_run_done(tmp_path, monkeypatch, client_json):
+    """I3/P32: a run reporting a >512 MiB VRAM leak is still marked `done`
+    (its own measurement is fine) but the sweep halts -- every later run's
+    "free VRAM" math would otherwise be built on a false premise."""
+    monkeypatch.setattr(env_capture, "_host_lines", lambda: {})
+    sweep_path = _write_sweep_files(tmp_path)
+    results_root = tmp_path / "results"
+
+    fake_docker = FakeDocker()
+    fake_docker.keep_running = True
+
+    def fake_run_client(docker, cfg, spec, run_dir, traces_dir, hf_cache_dir, **kw):
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        (Path(run_dir) / "client_raw.json").write_text(json.dumps(client_json), encoding="utf-8")
+        return client_json
+
+    monkeypatch.setattr(lifecycle, "run_client", fake_run_client)
+
+    def http_factory():
+        h = FakeHTTP()
+        h.reset_responses = [{"status": 200, "json": {"success": True}}]
+        return h
+
+    # A WSL-side reader that looks idle (0) until the engine has launched at
+    # least once, then reports high usage EVEN AFTER the container stops --
+    # i.e. the VRAM-return check at the end of the run sees a leak, while the
+    # run's own preflight (before anything launches) still sees an idle GPU.
+    base_reader = _make_gpu_reader(fake_docker)
+
+    def leaking_reader(cmd):
+        if list(cmd) != list(WSL_SMI):
+            return base_reader(cmd)
+        engine_ever_launched = any(
+            c["op"] == "run" and c["name"].startswith("bench-") and not c["name"].endswith("-client")
+            for c in fake_docker.calls
+        )
+        engine_running_now = any(
+            n.startswith("bench-") and not n.endswith("-client") for n in fake_docker.running
+        )
+        if engine_ever_launched and not engine_running_now:
+            return {**base_reader(cmd), "used_mb": 1000}
+        return base_reader(cmd)
+
+    kwargs = _sweep_kwargs(fake_docker, http_factory, tmp_path)
+    kwargs["gpu_reader"] = leaking_reader
+
+    with pytest.raises(PreflightError, match="VRAM leak"):
+        run_sweep(sweep_path, results_root, resume=False, **kwargs)
+
+    state_json = json.loads((results_root / "sw1" / "state.json").read_text(encoding="utf-8"))
+    statuses = [r["status"] for r in state_json["runs"].values()]
+    assert statuses.count("done") == 1  # the leaking run's own data is fine
+    assert statuses.count("running") == 0 and statuses.count("invalid") == 0
+
+
+def test_run_sweep_halts_after_three_consecutive_first_attempt_failures(tmp_path, monkeypatch, client_json):
+    """I5/P34: 3 consecutive first-attempt failures (no success in between)
+    signal a systematic problem -- the sweep halts rather than grinding
+    through every remaining run toward the same failure."""
+    monkeypatch.setattr(env_capture, "_host_lines", lambda: {})
+    # No retries: every failure below is a distinct run's first (and only) attempt.
+    sweep_path = _write_sweep_files(tmp_path, max_retries_total=0)
+    results_root = tmp_path / "results"
+
+    fake_docker = FakeDocker()
+    fake_docker.keep_running = True
+
+    def always_short_run_client(docker, cfg, spec, run_dir, traces_dir, hf_cache_dir, **kw):
+        # Short by 3 of num_prompts=4 -> attempted != num_prompts -> invalid.
+        data = json.loads(json.dumps(client_json))
+        data["completed"] = 1
+        for key in ("ttfts", "itls", "input_lens", "output_lens", "generated_texts", "errors", "start_times"):
+            data[key] = data[key][:1]
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        (Path(run_dir) / "client_raw.json").write_text(json.dumps(data), encoding="utf-8")
+        return data
+
+    monkeypatch.setattr(lifecycle, "run_client", always_short_run_client)
+
+    def http_factory():
+        h = FakeHTTP()
+        h.reset_responses = [{"status": 200, "json": {"success": True}}]
+        return h
+
+    with pytest.raises(PreflightError, match="3 consecutive first-attempt failures"):
+        run_sweep(sweep_path, results_root, resume=False, **_sweep_kwargs(fake_docker, http_factory, tmp_path))
+
+    state_json = json.loads((results_root / "sw1" / "state.json").read_text(encoding="utf-8"))
+    attempted_runs = [r for r in state_json["runs"].values() if r["attempts"] > 0]
+    assert len(attempted_runs) == 3  # the sweep's 3 configs, never a requeued 4th attempt
+    assert all(r["status"] == "invalid" for r in attempted_runs)
