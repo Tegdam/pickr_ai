@@ -21,10 +21,13 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from subprocess import Popen
 
 import yaml
 
@@ -86,6 +89,9 @@ class EngineHandle:
     base_url: str
     launch_args: list[str]
     compile_cache_mounted: bool
+    # Task 9: set for the echo engine (a local `python -m bench.echo_server`
+    # subprocess, spec.image is None) and None for every docker-based engine.
+    process: Popen | None = None
 
 
 def _quantization_kernel(log_text: str) -> str | None:
@@ -130,21 +136,40 @@ def _compile_cache_mount(spec: EngineSpec, paths: RunPaths):
     return (str(host_dir), "/root/.cache/vllm", "rw"), True
 
 
-def start_engine(cfg: RunConfig, spec: EngineSpec, docker, paths: RunPaths) -> EngineHandle:
-    """Step 2 (spec §6): launch the engine container. Does not block for
-    readiness -- that is the caller's job (`wait_healthy`).
+def start_engine(cfg: RunConfig, spec: EngineSpec, docker, paths: RunPaths, *,
+                  popen=subprocess.Popen) -> EngineHandle:
+    """Step 2 (spec §6): launch the engine. Does not block for readiness --
+    that is the caller's job (`wait_healthy`).
+
+    Task 9: `spec.image is None` (the echo "engine") launches a local
+    `python -m bench.echo_server` subprocess instead of a docker container --
+    no image to pull, no defensive stop, no mounts/env/extra_args. `popen` is
+    injectable so tests never spawn a real subprocess.
 
     Important 2: a failed `docker run` can leave a `Created` container behind
     that no other path removes, so every retry after that fails on a name
     conflict -- `docker.stop(name)` (rm -f, best-effort) runs defensively
     BEFORE `docker.run`, and any exception from `docker.run` itself triggers
     the same cleanup before re-raising as a `PreflightError` (Important 3:
-    a failed launch is environmental, not a measurement failure).
+    a failed launch is environmental, not a measurement failure). The same
+    "environmental failure" treatment applies to a failed subprocess launch.
     """
     name = f"bench-{cfg.run_id}"
+    launch_args = spec.build_launch_args(cfg, cfg.gpu_memory_utilization)
+
+    if spec.image is None:
+        try:
+            process = popen([sys.executable, "-m", "bench.echo_server", *launch_args],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        except Exception as e:
+            raise PreflightError(f"failed to start echo engine subprocess: {e}") from e
+        return EngineHandle(
+            name=name, base_url=f"http://localhost:{spec.port}",
+            launch_args=launch_args, compile_cache_mounted=False, process=process,
+        )
+
     docker.stop(name)  # best-effort: clear any leaked Created/Exited container from a prior failed attempt
 
-    launch_args = spec.build_launch_args(cfg, cfg.gpu_memory_utilization)
     mounts = [(str(paths.hf_cache_dir), "/root/.cache/huggingface", "ro")]
     compile_mount, compile_cache_mounted = _compile_cache_mount(spec, paths)
     if compile_mount:
@@ -164,6 +189,16 @@ def start_engine(cfg: RunConfig, spec: EngineSpec, docker, paths: RunPaths) -> E
 
 
 def stop_engine(handle: EngineHandle, docker) -> None:
+    """Task 9: a subprocess handle (echo) is terminated in-process; every
+    other engine is a docker container stopped through `docker`."""
+    if handle.process is not None:
+        handle.process.terminate()
+        try:
+            handle.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            handle.process.kill()
+            handle.process.wait(timeout=10)
+        return
     docker.stop(handle.name)
 
 
@@ -276,7 +311,7 @@ def _record_run(cfg, spec, docker, handle, client, trace_rows, run_dir, kernel, 
 
 def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
             gpu_reader=read_gpu, clock=time.monotonic, sleep=time.sleep,
-            opts: dict | None = None) -> dict:
+            opts: dict | None = None, popen=subprocess.Popen) -> dict:
     """Executes spec §6 steps 1-9 end to end and writes every artifact spec §7
     names into `paths.run_dir`. Returns the `summary.json` dict.
 
@@ -284,7 +319,8 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     and the sweep-loop's per-attempt bookkeeping (`schedule_index`, `attempt`,
     `requeued_from`) that lands in `meta.json`. Raises `PreflightError` for
     environmental failures (see its docstring) -- callers must not treat
-    those like an ordinary measurement failure.
+    those like an ordinary measurement failure. `popen` is Task 9's seam for
+    the echo engine's subprocess launch, threaded through to `start_engine`.
     """
     opts = dict(opts or {})
     gpu_headroom_mb = opts.get("gpu_headroom_mb", 256)
@@ -299,6 +335,13 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     def log(msg: str) -> None:
         log_lines.append(msg)
 
+    def _preflight_fail(msg: str, cause: BaseException | None = None):
+        # Carried from Task 8 re-review: a step-1 (environmental) failure
+        # leaves a human-readable breadcrumb in the run's own directory,
+        # separate from log.txt (which is engine output, not runner state).
+        (run_dir / "preflight_error.txt").write_text(msg, encoding="utf-8")
+        raise PreflightError(msg) from cause
+
     wall_start = datetime.now(timezone.utc).isoformat()
     mono_anchor = clock()
 
@@ -306,20 +349,20 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     try:
         already_running = [n for n in docker.ps_names() if n.startswith("bench-")]
     except Exception as e:
-        raise PreflightError(f"docker ps failed: {e}") from e
+        _preflight_fail(f"docker ps failed: {e}", e)
     if already_running:
-        raise PreflightError(f"refusing to start: bench-* container(s) already running: {already_running}")
+        _preflight_fail(f"refusing to start: bench-* container(s) already running: {already_running}")
 
     try:
         win_pre = gpu_reader(WIN_SMI)
         wsl_pre = gpu_reader(WSL_SMI)
     except Exception as e:
-        raise PreflightError(f"gpu reader failed: {e}") from e
+        _preflight_fail(f"gpu reader failed: {e}", e)
 
     total_mb = win_pre.get("total_mb")
     host_used_mb = win_pre.get("used_mb")
     if total_mb is None or host_used_mb is None:
-        raise PreflightError(f"gpu reader returned no usable total_mb/used_mb: {win_pre}")
+        _preflight_fail(f"gpu reader returned no usable total_mb/used_mb: {win_pre}")
 
     cfg.free_vram_mb_at_start = total_mb - host_used_mb
     cfg.gpu_memory_utilization = resolve_gpu_memory_fraction(total_mb, host_used_mb, gpu_headroom_mb)
@@ -340,7 +383,7 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     validate(cfg)
 
     # --- 2. Launch the engine (PreflightError on a failed launch) --------
-    handle = start_engine(cfg, spec, docker, paths)
+    handle = start_engine(cfg, spec, docker, paths, popen=popen)
     log(f"launched {handle.name}: {' '.join(handle.launch_args)}")
 
     timing: dict = {}
@@ -351,10 +394,24 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
 
     try:
         # --- 3. Readiness -> warmup -> cache reset -----------------------
-        ready_s = wait_healthy(http, handle.base_url, spec.health_path, spec.readiness_timeout_s,
-                                docker=docker, container=handle.name, ready_path=spec.ready_path)
+        if spec.image is None:
+            # Task 9: no container to ask docker about -- a dead subprocess
+            # is caught here (process.poll() is not None) instead, with its
+            # captured stderr, rather than burning the full readiness budget
+            # polling a port nothing is listening on any more.
+            if handle.process is not None and handle.process.poll() is not None:
+                stderr = handle.process.stderr.read() if handle.process.stderr else ""
+                raise RuntimeError(
+                    f"echo engine process exited before becoming healthy "
+                    f"(code {handle.process.returncode})\n{stderr}"
+                )
+            ready_s = wait_healthy(http, handle.base_url, spec.health_path, spec.readiness_timeout_s,
+                                    docker=None, container=None, ready_path=spec.ready_path)
+        else:
+            ready_s = wait_healthy(http, handle.base_url, spec.health_path, spec.readiness_timeout_s,
+                                    docker=docker, container=handle.name, ready_path=spec.ready_path)
         timing["ready_s"] = ready_s
-        kernel = _quantization_kernel(docker.container_logs(handle.name))
+        kernel = None if spec.image is None else _quantization_kernel(docker.container_logs(handle.name))
 
         trace_rows = _read_trace_rows(cfg)
         warmup_prompts = [r["prompt"] for r in trace_rows[: cfg.warmup_requests]]
@@ -391,24 +448,59 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
         log(f"run interrupted: {e!r}")
         raise
     finally:
-        # Fix round 1, minor: wrapped so a container_logs failure can never
-        # skip stop_engine below.
-        try:
-            engine_logs = docker.container_logs(handle.name)
-        except Exception:
-            engine_logs = ""
-
         # --- 8. Stop the engine; verify VRAM returned -----------------------
-        stop_engine(handle, docker)
+        timing_extra: dict = {}
+        cooldown_info: dict = {}
+        vram_returned_mb = vram_leak_mb = None
+
+        if spec.image is None:
+            # Task 9: no container logs to fetch -- capture the subprocess's
+            # stderr only after it has actually exited (stop_engine first),
+            # since reading a live pipe with nothing consuming it can block
+            # forever on a long-running echo server.
+            stop_engine(handle, docker)
+            try:
+                engine_logs = (handle.process.stderr.read()
+                               if handle.process is not None and handle.process.stderr else "")
+            except Exception:
+                engine_logs = ""
+        else:
+            # Fix round 1, minor: wrapped so a container_logs failure can
+            # never skip stop_engine below.
+            try:
+                engine_logs = docker.container_logs(handle.name)
+            except Exception:
+                engine_logs = ""
+            stop_engine(handle, docker)
 
         # Fix round 1, minor: a Ctrl-C mid-run should not be delayed by a
         # VRAM-settle poll or a full cooldown wait -- clean the container and
         # get out.
         if base_exc is None:
-            vram_returned_mb, vram_leak_mb = _wait_vram_return(gpu_reader, wsl_pre.get("used_mb"), clock, sleep)
-            cooldown_info = _cooldown(gpu_reader, cfg.cooldown_temp_c, cfg.cooldown_min_s, clock, sleep)
+            if spec.image is None:
+                # Task 9: no engine container VRAM to verify and no GPU heat
+                # of our own doing to wait out for a local-process engine.
+                cooldown_info = {"cooldown_skipped": "echo"}
+            else:
+                # Carried from Task 8 re-review: a reader flake here must
+                # never raise out of this `finally` -- that would mask the
+                # run's own exception (if any) or, on a healthy run, crash
+                # a result that was otherwise perfectly valid.
+                try:
+                    vram_returned_mb, vram_leak_mb = _wait_vram_return(
+                        gpu_reader, wsl_pre.get("used_mb"), clock, sleep)
+                except Exception as e:
+                    timing_extra["vram_return_error"] = str(e)
+                try:
+                    cooldown_info = _cooldown(gpu_reader, cfg.cooldown_temp_c, cfg.cooldown_min_s, clock, sleep)
+                except Exception as e:
+                    cooldown_info = {"cooldown_error": str(e)}
 
-    (run_dir / "log.txt").write_text(engine_logs + "\n" + "\n".join(log_lines), encoding="utf-8")
+        # Written inside `finally` (not after the try/finally statement) so a
+        # KeyboardInterrupt/BaseException -- which re-raises out of the
+        # `except BaseException` clause above -- still gets a log.txt instead
+        # of skipping straight past it.
+        (run_dir / "log.txt").write_text(engine_logs + "\n" + "\n".join(log_lines), encoding="utf-8")
 
     if exc is not None:
         minimal_meta = {
@@ -429,6 +521,9 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     summary["timing"]["vram_leak_mb"] = vram_leak_mb
     summary["timing"]["wsl_pre_used_mb"] = wsl_pre.get("used_mb")
     summary["timing"]["win_pre_used_mb"] = win_pre.get("used_mb")
+    summary["timing"].update(timing_extra)
+    if "cooldown_skipped" in meta:
+        summary["cooldown_skipped"] = meta["cooldown_skipped"]
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     if vram_leak_mb:

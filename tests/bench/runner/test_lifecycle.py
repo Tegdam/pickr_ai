@@ -15,12 +15,14 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 import bench.runner.env_capture as env_capture
 import bench.runner.lifecycle as lifecycle
+from bench.runner.client import CLIENT_IMAGE
 from bench.runner.engine import ENGINES
 from bench.runner.gpu_monitor import GpuSampler, WIN_SMI, WSL_SMI
 from bench.runner.lifecycle import PreflightError, RunPaths, run_one, run_sweep
@@ -186,6 +188,214 @@ def test_run_one_warm_cache_skips_reset(tmp_path, monkeypatch, client_json):
             gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
 
     assert not any(u.endswith("/reset_prefix_cache") for u, _ in fake_http.posts)
+
+
+class _FakePopen:
+    """Stands in for `subprocess.Popen` (Task 9): `poll()` is None until
+    `terminate()`/`kill()` sets a returncode, exactly like a real live process."""
+
+    def __init__(self, args, **kwargs):
+        self.args = list(args)
+        self.kwargs = kwargs
+        self.returncode = None
+        self.terminate_called = False
+        self.wait_called = False
+        self.kill_called = False
+        self.stderr = SimpleNamespace(read=lambda: "")
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminate_called = True
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        self.wait_called = True
+        return self.returncode
+
+    def kill(self):
+        self.kill_called = True
+        self.returncode = -9
+
+
+def test_run_one_echo_engine_is_a_subprocess_not_a_docker_container(tmp_path, monkeypatch, client_json):
+    """Task 9: ENGINES["echo"] has spec.image=None -- start_engine must launch
+    a local subprocess instead of a docker container, while the *client*
+    container is unaffected (still runs on --network host so it can reach
+    localhost:8000)."""
+    monkeypatch.setattr(env_capture, "_host_lines", lambda: {})
+
+    traces_dir = tmp_path / "traces"
+    traces_dir.mkdir()
+    trace_file = traces_dir / "chat_v1.jsonl"
+    sha = _write_trace(trace_file, n=4)
+
+    results_root = tmp_path / "results"
+    sweep_dir = results_root / "s1"
+    cfg = _cfg(engine="echo", image=None, num_prompts=4, trace_file=str(trace_file), trace_sha256=sha)
+    paths = RunPaths(
+        results_root=results_root, sweep_dir=sweep_dir, run_dir=sweep_dir / cfg.run_id,
+        traces_dir=traces_dir, hf_cache_dir=tmp_path / "hfcache",
+        compile_cache_root=tmp_path / "compile_cache",
+    )
+
+    fake_docker = FakeDocker()
+    fake_http = FakeHTTP()
+    fake_http.reset_responses = [{"status": 200, "json": {"success": True}}]
+
+    # Real (non-monkeypatched) run_client is exercised here so the client
+    # container's own docker.run call can be asserted directly -- seed the
+    # result file docker.run would otherwise produce inside the container.
+    real_docker_run = fake_docker.run
+
+    def run_and_seed_client_result(image, name, args, **kw):
+        cid = real_docker_run(image, name, args, **kw)
+        if image == CLIENT_IMAGE:
+            paths.run_dir.mkdir(parents=True, exist_ok=True)
+            (paths.run_dir / "client_raw.json").write_text(json.dumps(client_json), encoding="utf-8")
+        return cid
+
+    fake_docker.run = run_and_seed_client_result
+
+    created_popens: list[_FakePopen] = []
+
+    def fake_popen(args, **kwargs):
+        p = _FakePopen(args, **kwargs)
+        created_popens.append(p)
+        return p
+
+    summary = run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["echo"],
+                       gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+                       popen=fake_popen)
+
+    # No docker `run` for the engine -- the only docker.run call is the client.
+    run_calls = [c for c in fake_docker.calls if c["op"] == "run"]
+    assert len(run_calls) == 1
+    assert run_calls[0]["image"] == CLIENT_IMAGE
+    assert run_calls[0]["network_host"] is True and run_calls[0]["gpus"] is False
+
+    assert len(created_popens) == 1
+    proc = created_popens[0]
+    assert proc.args[1:] == ["-m", "bench.echo_server", "--port", "8000", "--per-token-ms", "5"]
+    assert proc.terminate_called and proc.wait_called, "stop_engine must terminate the subprocess"
+
+    assert summary["valid"] is True
+    assert summary["cooldown_skipped"] == "echo"
+
+    meta = json.loads((paths.run_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["cooldown_skipped"] == "echo"
+
+    env = json.loads((paths.run_dir / "env.json").read_text(encoding="utf-8"))
+    assert env["image"] is None and env["image_digest"] is None and env["pip_freeze"] is None
+    # The client image's own digest is still captured (unaffected by the engine having none).
+    assert env["client_image_digest"] == fake_docker.digest
+
+
+def test_run_one_echo_engine_crash_before_healthy_raises_with_stderr(tmp_path, monkeypatch, client_json):
+    """Task 9: a dead subprocess (poll() is not None) must fail fast with its
+    captured stderr, rather than burning the full readiness timeout polling a
+    port nothing is listening on any more."""
+    cfg, paths, fake_docker, fake_http = _setup(
+        tmp_path, monkeypatch, client_json, cfg_over={"engine": "echo", "image": None},
+    )
+
+    class _DeadPopen(_FakePopen):
+        def __init__(self, args, **kwargs):
+            super().__init__(args, **kwargs)
+            self.returncode = 1
+            self.stderr = SimpleNamespace(read=lambda: "Traceback: boom")
+
+    with pytest.raises(RuntimeError, match="Traceback: boom"):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["echo"],
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+                popen=_DeadPopen)
+
+
+class _NoopGpuSampler:
+    """Deterministic stand-in for `GpuSampler` (Task 9's wrapped-reader test
+    below): the point of that test is to control exactly which `gpu_reader`
+    call fails, which a real background-thread sampler's timing would make
+    nondeterministic."""
+
+    def __init__(self, out_path, interval_s=1.0, reader=None, **kw):
+        self.out_path = Path(out_path)
+
+    def start(self) -> None:
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.out_path.write_text("", encoding="utf-8")
+
+    def stop(self) -> None:
+        pass
+
+
+def test_run_one_cooldown_reader_failure_is_recorded_not_raised(tmp_path, monkeypatch, client_json):
+    """Carried from Task 8 re-review: a gpu_reader flake during the post-run
+    cooldown wait must never raise out of run_one's `finally` -- that would
+    mask an otherwise-valid run's own result. `cooldown_error` is recorded on
+    meta.json instead and the run stays valid."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    monkeypatch.setattr(lifecycle, "GpuSampler", _NoopGpuSampler)
+
+    base_reader = _make_gpu_reader(fake_docker)
+    calls = {"n": 0}
+
+    def flaky_reader(cmd):
+        calls["n"] += 1
+        # Calls 1-2: pre-flight. Call 3: the VRAM-return check (succeeds).
+        # Call 4 onward: _cooldown's own reads -- fail those.
+        if calls["n"] >= 4:
+            raise RuntimeError("nvidia-smi flaked")
+        return base_reader(cmd)
+
+    summary = run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                       gpu_reader=flaky_reader, clock=_make_clock(), sleep=_no_sleep)
+
+    assert summary["valid"] is True
+    assert summary["timing"]["vram_leak_mb"] == 0  # the VRAM-return check itself never saw the flake
+
+    meta = json.loads((paths.run_dir / "meta.json").read_text(encoding="utf-8"))
+    assert "cooldown_error" in meta and "nvidia-smi flaked" in meta["cooldown_error"]
+    assert "cooldown_observed_s" not in meta  # _cooldown raised before returning its normal dict
+
+
+def test_run_one_vram_return_reader_failure_is_recorded_not_raised(tmp_path, monkeypatch, client_json):
+    """Same ruling as above, for the VRAM-return check specifically."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    monkeypatch.setattr(lifecycle, "GpuSampler", _NoopGpuSampler)
+
+    calls = {"n": 0}
+
+    def flaky_reader(cmd):
+        calls["n"] += 1
+        if calls["n"] == 3:  # the VRAM-return check's own read
+            raise RuntimeError("nvidia-smi flaked")
+        return _make_gpu_reader(fake_docker)(cmd)
+
+    summary = run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                       gpu_reader=flaky_reader, clock=_make_clock(), sleep=_no_sleep)
+
+    assert summary["valid"] is True
+    assert summary["timing"]["vram_returned_mb"] is None
+    assert summary["timing"]["vram_leak_mb"] is None
+    assert "nvidia-smi flaked" in summary["timing"]["vram_return_error"]
+    # cooldown still ran normally (it is a separate wrapped call).
+    meta = json.loads((paths.run_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta["cooldown_observed_s"] is not None
+
+
+def test_run_one_preflight_failure_writes_preflight_error_txt(tmp_path, monkeypatch, client_json):
+    """Task 8 re-review, carried into Task 9: a step-1 PreflightError leaves a
+    human-readable breadcrumb in the run's own directory."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    fake_docker.running.add("bench-leaked")
+
+    with pytest.raises(PreflightError):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
+
+    text = (paths.run_dir / "preflight_error.txt").read_text(encoding="utf-8")
+    assert "bench-leaked" in text
 
 
 class _StaticMetricsScraper:

@@ -18,7 +18,8 @@ from .config import RunConfig
 @dataclass(frozen=True)
 class EngineSpec:
     name: str
-    image: str
+    # Task 9: None for the echo engine (a local subprocess, no docker image).
+    image: str | None
     verified_against: str | None
     port: int
     health_path: str
@@ -213,5 +214,40 @@ ENGINES: dict[str, EngineSpec] = {
         },
         docker_extra_args=["--shm-size", "2g"],                             # T1 (doc §8: used in all SGLang smokes)
         _launch=_sglang_args,
+    ),
+    "echo": EngineSpec(
+        # Task 9: not a real inference engine -- an OpenAI-compatible echo
+        # server (bench/echo_server/) that returns canned tokens at a fixed
+        # per-token delay, run as a local `python -m bench.echo_server`
+        # subprocess (image=None, see lifecycle.start_engine) so a sweep can
+        # measure the client/harness's own overhead ceiling with no GPU
+        # engine in the loop at all. "verified_against" is "local" rather
+        # than an image tag/digest since there is nothing pinned to verify.
+        name="echo", image=None, verified_against="local",
+        port=8000,
+        health_path="/health",
+        ready_path=None,                                                    # no separate readiness route
+        readiness_timeout_s=60,                                             # a subprocess starts far faster than a container
+        reset_cache_path="/reset_prefix_cache", reset_cache_method="POST",
+        metrics_path="/metrics",
+        metric_names={  # placeholders: the echo server keeps exactly one counter
+            # ("echo:requests_total"); every key maps to it so metrics_scraper.py
+            # needs no echo-specific branch -- it resolves the name to that
+            # counter (or None if /metrics is unreachable) exactly as for a
+            # real engine. The values are meaningless for kv/spec/prefix
+            # accounting, but cfg.spec_method is always "off" for this engine
+            # so assertions.check never looks at them.
+            "kv_usage": "echo:requests_total",
+            "running": "echo:requests_total",
+            "waiting": "echo:requests_total",
+            "spec_accepted": "echo:requests_total",
+            "spec_draft": "echo:requests_total",
+            "spec_drafts": "echo:requests_total",
+            "prefix_hits": "echo:requests_total",
+            "prefix_queries": "echo:requests_total",
+        },
+        env={},
+        docker_extra_args=[],
+        _launch=lambda cfg, mem: ["--port", "8000", "--per-token-ms", "5"],
     ),
 }

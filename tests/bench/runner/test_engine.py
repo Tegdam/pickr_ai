@@ -190,6 +190,31 @@ def test_sglang_exact_args_standalone():
     ]
 
 
+def test_echo_engine_is_a_local_subprocess_with_a_complete_spec():
+    """Task 9: the echo engine carries image=None (a local `python -m
+    bench.echo_server` subprocess, not a docker image) but is otherwise a
+    normal, complete EngineSpec -- test_engines_are_verified_and_complete
+    already asserts this for every engine in the table; this locks down the
+    echo-specific values the brief calls out."""
+    e = ENGINES["echo"]
+    assert e.image is None
+    assert e.verified_against == "local"
+    assert e.port == 8000
+    assert e.health_path == "/health" and e.ready_path is None
+    assert e.reset_cache_path == "/reset_prefix_cache" and e.reset_cache_method == "POST"
+    assert e.metrics_path == "/metrics"
+    assert e.env == {} and e.docker_extra_args == []
+    assert set(e.metric_names.values()) == {"echo:requests_total"}
+    assert e.served_model_name(_cfg(engine="echo")) == "Qwen/Qwen2.5-3B-Instruct-AWQ"
+
+
+def test_echo_launch_args():
+    e = ENGINES["echo"]
+    assert e.build_launch_args(_cfg(engine="echo"), mem_fraction=0.83) == [
+        "--port", "8000", "--per-token-ms", "5",
+    ]
+
+
 def test_sglang_exact_args_ngram():
     e = ENGINES["sglang"]
     args = e.build_launch_args(_cfg(engine="sglang", spec_method="ngram", spec_k=5, ngram_lookup_max=4), mem_fraction=0.8)

@@ -45,6 +45,26 @@ def test_capture_env_seeds_spec_defaults_without_extra(fake_docker, monkeypatch)
     assert env["compile_cache_mounted"] is False
 
 
+def test_capture_env_tolerates_no_image_for_echo(fake_docker, monkeypatch):
+    """Task 9: the echo engine's spec.image is None (a local subprocess, not
+    a docker image) -- image_digest/pip_freeze must come back None instead of
+    calling docker.image_digest(None)/docker.pip_freeze(None)."""
+    import bench.runner.env_capture as ec
+    monkeypatch.setattr(ec, "_PIP_FREEZE_CACHE", {})
+    monkeypatch.setattr(ec, "_host_lines", lambda: {})
+
+    def boom(image):
+        raise AssertionError(f"must not be called for image=None, got {image!r}")
+
+    fake_docker.image_digest = boom
+    fake_docker.pip_freeze = boom
+
+    env = capture_env(_cfg(engine="echo"), fake_docker, ENGINES["echo"], ["--port", "8000"], client_image="c")
+    assert env["image"] is None
+    assert env["image_digest"] is None
+    assert env["pip_freeze"] is None
+
+
 def test_pip_freeze_is_cached_per_image(fake_docker, monkeypatch):
     import bench.runner.env_capture as ec
     monkeypatch.setattr(ec, "_PIP_FREEZE_CACHE", {})

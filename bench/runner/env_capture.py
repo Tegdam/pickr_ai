@@ -100,10 +100,12 @@ def capture_env(cfg, docker, spec: EngineSpec, launch_args: list[str], client_im
     except Exception:
         transformers_version = None
 
+    # Task 9: the echo engine carries spec.image=None (a local subprocess,
+    # not a docker image) -- there is no digest and nothing to pip-freeze.
     env: dict = {
         "image": spec.image,
-        "image_digest": docker.image_digest(spec.image),
-        "pip_freeze": _cached_pip_freeze(docker, spec.image),
+        "image_digest": docker.image_digest(spec.image) if spec.image else None,
+        "pip_freeze": _cached_pip_freeze(docker, spec.image) if spec.image else None,
         "served_model_name": spec.served_model_name(cfg),
         "engine_env": dict(spec.env),
         "docker_extra_args": list(spec.docker_extra_args),
