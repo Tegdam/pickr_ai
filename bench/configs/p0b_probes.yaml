@@ -9,13 +9,15 @@ oom_signal:
   baseline_fraction: 0.85
   requests: 20
 cudagraph_cost:
+  # bench.runner.probes._probe_cudagraph_cost always appends base.yaml's own
+  # pinned cudagraph_capture_sizes as the last list (read live, fix round 1
+  # item 7) -- list it here too only if a size between these two and the
+  # pinned list is wanted.
   capture_lists:
     - [1]
     - [1, 2, 4, 8]
-    - [1, 2, 4, 8, 16, 32]
 host_reservation:
   idle_seconds: 60
   load_seconds: 60
-  load_concurrency: 8
 clock_pin:
   sm_mhz: 2055
