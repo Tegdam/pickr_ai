@@ -51,6 +51,8 @@ class GpuSampler:
     `wsl_error`/`win_error` instead of killing the sampler.
     """
 
+    JOIN_TIMEOUT_S = 5.0
+
     def __init__(self, out_path, interval_s: float = 1.0, wsl_cmd: list[str] = WSL_SMI,
                  win_cmd: list[str] = WIN_SMI, reader=read_gpu):
         self.out_path = Path(out_path)
@@ -62,6 +64,8 @@ class GpuSampler:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError("GpuSampler already started")
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -70,7 +74,11 @@ class GpuSampler:
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=self.JOIN_TIMEOUT_S)
+            if self._thread.is_alive():
+                # Still writing a sample -- block for real so the caller never
+                # reads a torn last line off the tail of the file.
+                self._thread.join()
 
     def _sample(self) -> dict:
         t = time.monotonic()
