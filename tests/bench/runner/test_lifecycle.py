@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -21,12 +22,12 @@ import yaml
 import bench.runner.env_capture as env_capture
 import bench.runner.lifecycle as lifecycle
 from bench.runner.engine import ENGINES
-from bench.runner.gpu_monitor import WIN_SMI, WSL_SMI
-from bench.runner.lifecycle import RunPaths, run_one, run_sweep
+from bench.runner.gpu_monitor import GpuSampler, WIN_SMI, WSL_SMI
+from bench.runner.lifecycle import PreflightError, RunPaths, run_one, run_sweep
+from bench.runner.metrics_scraper import MetricsScraper
 from bench.runner.state import SweepState
 from tests.bench.runner.conftest import FakeDocker, FakeHTTP
 from tests.bench.runner.test_engine import _cfg
-from tests.bench.runner.test_metrics_scraper import PROM
 
 WIN_TOTAL_MB = 6141
 WIN_USED_MB = 0
@@ -121,6 +122,11 @@ def test_run_one_happy_path_writes_every_artifact_and_is_valid(tmp_path, monkeyp
         opts={"schedule_index": 2, "attempt": 1, "gpu_headroom_mb": 256, "try_clock_pin": False},
     )
 
+    # Important 2: start_engine defensively stops any leaked container of the
+    # same name BEFORE docker.run -- so the very first two calls are stop, run.
+    assert fake_docker.calls[0]["op"] == "stop" and fake_docker.calls[0]["name"] == f"bench-{cfg.run_id}"
+    assert fake_docker.calls[1]["op"] == "run"
+
     # docker run call: launch args, env, --shm-size 2g, HF mount, vLLM compile-cache mount.
     run_calls = [c for c in fake_docker.calls if c["op"] == "run"]
     assert len(run_calls) == 1
@@ -160,10 +166,17 @@ def test_run_one_happy_path_writes_every_artifact_and_is_valid(tmp_path, monkeyp
     # VRAM-return check: container stopped -> WSL usage back to the pre-run
     # baseline immediately -> no leak recorded.
     assert summary["timing"]["vram_leak_mb"] == 0
+    assert summary["timing"]["wsl_pre_used_mb"] == WIN_USED_MB
+    assert summary["timing"]["win_pre_used_mb"] == WIN_USED_MB
+    assert "clocks_pinned" not in summary["timing"]  # moved to env.json only
 
-    # engine container was stopped exactly once.
+    env = json.loads((run_dir / "env.json").read_text(encoding="utf-8"))
+    assert env["client_image_digest"] == fake_docker.digest
+
+    # engine container was stopped twice: the defensive pre-run stop
+    # (Important 2) and the real end-of-run cleanup.
     stop_calls = [c for c in fake_docker.calls if c["op"] == "stop"]
-    assert stop_calls == [{"op": "stop", "name": f"bench-{cfg.run_id}", "timeout": 30}]
+    assert stop_calls == [{"op": "stop", "name": f"bench-{cfg.run_id}", "timeout": 30}] * 2
 
 
 def test_run_one_warm_cache_skips_reset(tmp_path, monkeypatch, client_json):
@@ -175,21 +188,148 @@ def test_run_one_warm_cache_skips_reset(tmp_path, monkeypatch, client_json):
     assert not any(u.endswith("/reset_prefix_cache") for u, _ in fake_http.posts)
 
 
+class _StaticMetricsScraper:
+    """Fix round 1, minor: a deterministic stand-in for `MetricsScraper` that
+    writes >=2 IDENTICAL rows synchronously instead of racing a real
+    background-thread scrape against the mocked, near-instant client phase --
+    the previous version of this test could get 0 or 1 real samples depending
+    on thread scheduling, which happened to still prove the point (both
+    `None` and a zero delta invalidate) but never actually exercised "the
+    counters moved across two samples and the delta is zero"."""
+
+    def __init__(self, http, base_url, spec, out_path, interval_s=1.0):
+        self.out_path = Path(out_path)
+
+    def start(self) -> None:
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"t": 0.0, "wall": "x", "engine": "vllm", "raw": {},
+               "kv_usage": None, "running": None, "waiting": None,
+               "spec_accepted": 120.0, "spec_draft": 200.0, "spec_drafts": 40.0,
+               "prefix_hits": None, "prefix_queries": None}
+        with self.out_path.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+            f.write(json.dumps(row) + "\n")
+
+    def stop(self) -> None:
+        pass
+
+
 def test_run_one_draft_spec_never_advances_is_invalid_with_acceptance_reason(tmp_path, monkeypatch, client_json):
     cfg, paths, fake_docker, fake_http = _setup(
         tmp_path, monkeypatch, client_json,
         cfg_over={"spec_method": "draft", "draft_model": "Qwen/Qwen2.5-0.5B-Instruct",
                   "draft_revision": "def", "spec_k": 3},
     )
-    # PROM's spec_decode counters never move across scrapes (same text every
-    # poll) -- acceptance never advances.
-    fake_http.metrics_text = PROM
+    monkeypatch.setattr(lifecycle, "MetricsScraper", _StaticMetricsScraper)
 
     summary = run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
                        gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
 
     assert summary["valid"] is False
     assert "acceptance" in summary["invalid_reason"]
+    metric_rows = [json.loads(l) for l in
+                   (paths.run_dir / "engine_metrics.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(metric_rows) >= 2
+
+
+def test_run_one_isolates_previous_attempt_artifacts(tmp_path, monkeypatch, client_json):
+    """Critical 1: a retried run reuses `run_dir`; anything already there from
+    a prior attempt must be moved aside (never deleted, never left in place
+    to bleed into this attempt's append-mode sampler files)."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    run_dir = paths.run_dir
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stale_row = {"used_ours_mb": 999999, "used_host_mb": 1, "sm_clock": 1000,
+                 "power_w": 1.0, "throttle_reasons": "0x0"}
+    (run_dir / "gpu_samples.jsonl").write_text(json.dumps(stale_row) + "\n", encoding="utf-8")
+    (run_dir / "summary.json").write_text("{}", encoding="utf-8")
+
+    summary = run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                       gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
+
+    assert (run_dir / "attempt-1" / "gpu_samples.jsonl").exists()
+    assert (run_dir / "attempt-1" / "summary.json").exists()
+    moved = json.loads((run_dir / "attempt-1" / "gpu_samples.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert moved["used_ours_mb"] == 999999
+
+    new_rows = [json.loads(l) for l in
+                (run_dir / "gpu_samples.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert all(r.get("used_ours_mb") != 999999 for r in new_rows)
+    assert summary["peak_used_ours_mb"] != 999999
+
+
+def test_run_one_preflight_error_on_none_gpu_totals(tmp_path, monkeypatch, client_json):
+    """Important 3 / minor: a reader returning None must raise PreflightError,
+    never a bare TypeError from `total_mb - host_used_mb`."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+
+    def bad_reader(cmd):
+        return {"used_mb": None, "total_mb": None}
+
+    with pytest.raises(PreflightError):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                gpu_reader=bad_reader, clock=_make_clock(), sleep=_no_sleep)
+
+
+def test_run_one_wait_healthy_timeout_stops_engine_and_writes_log(tmp_path, monkeypatch, client_json):
+    """Important 7(a): a readiness timeout stops the engine, never starts the
+    samplers, still writes log.txt with the engine's own logs, and propagates."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    fake_http.healthy_after = 10**6  # never becomes healthy
+    fake_docker.logs[f"bench-{cfg.run_id}"] = "engine boot log line"
+    tiny_timeout_spec = replace(ENGINES["vllm"], readiness_timeout_s=0.01)
+
+    with pytest.raises(TimeoutError):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=tiny_timeout_spec,
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
+
+    assert f"bench-{cfg.run_id}" not in fake_docker.running
+    stop_calls = [c for c in fake_docker.calls if c["op"] == "stop" and c["name"] == f"bench-{cfg.run_id}"]
+    # one defensive pre-run stop (Important 2) + one real cleanup after the failure.
+    assert len(stop_calls) == 2
+
+    log_text = (paths.run_dir / "log.txt").read_text(encoding="utf-8")
+    assert "engine boot log line" in log_text
+    assert not (paths.run_dir / "gpu_samples.jsonl").exists()
+    assert not (paths.run_dir / "engine_metrics.jsonl").exists()
+
+    meta = json.loads((paths.run_dir / "meta.json").read_text(encoding="utf-8"))
+    assert "not healthy" in meta["error"]
+
+
+def test_run_one_client_exception_stops_engine_and_samplers(tmp_path, monkeypatch, client_json):
+    """Important 7(b): a run_client failure still stops the engine and the
+    sampler/scraper background threads, then propagates."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+
+    created = []
+
+    class TrackingSampler(GpuSampler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            created.append(self)
+
+    class TrackingScraper(MetricsScraper):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            created.append(self)
+
+    monkeypatch.setattr(lifecycle, "GpuSampler", TrackingSampler)
+    monkeypatch.setattr(lifecycle, "MetricsScraper", TrackingScraper)
+
+    def failing_run_client(*a, **kw):
+        raise RuntimeError("client blew up")
+
+    monkeypatch.setattr(lifecycle, "run_client", failing_run_client)
+
+    with pytest.raises(RuntimeError, match="client blew up"):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep)
+
+    assert f"bench-{cfg.run_id}" not in fake_docker.running
+    assert created, "expected sampler/scraper instances to have been created"
+    for obj in created:
+        assert obj._thread is None or not obj._thread.is_alive()
 
 
 def _base_sweep_dict(traces_dir: Path) -> dict:
@@ -265,9 +405,22 @@ def test_run_sweep_requeues_invalid_run_to_end_and_finishes_all_done(tmp_path, m
         h.reset_responses = [{"status": 200, "json": {"success": True}}]
         return h
 
+    # Important 7(c): the flaky run must land LAST in state.order right after
+    # its requeue -- spy on SweepState.requeue to capture that snapshot.
+    orders_after_requeue: list[list[str]] = []
+    orig_requeue = SweepState.requeue
+
+    def spy_requeue(self, run_id):
+        result = orig_requeue(self, run_id)
+        orders_after_requeue.append(list(self.order))
+        return result
+
+    monkeypatch.setattr(SweepState, "requeue", spy_requeue)
+
     report = run_sweep(sweep_path, results_root, resume=False, **_sweep_kwargs(fake_docker, http_factory, tmp_path))
 
     assert attempts[flaky_run_id] == 2  # failed once, then re-run
+    assert orders_after_requeue and orders_after_requeue[0][-1] == flaky_run_id
     state_json = json.loads((report.sweep_dir / "state.json").read_text(encoding="utf-8"))
     statuses = [r["status"] for r in state_json["runs"].values()]
     assert statuses.count("done") == 3
@@ -307,3 +460,60 @@ def test_run_sweep_resume_resets_stale_running_run_and_completes_it(tmp_path, mo
     final_state = json.loads((resumed.sweep_dir / "state.json").read_text(encoding="utf-8"))
     assert final_state["runs"][target]["status"] == "done"
     assert all(r["status"] == "done" for r in final_state["runs"].values())
+
+
+def test_run_sweep_preflight_failure_raises_and_leaves_run_running(tmp_path, monkeypatch, client_json):
+    """Important 3: a bench-* container already present (e.g. a leaked
+    container from an unrelated crash) must not be treated as a per-run
+    invalidity -- run_sweep re-raises PreflightError, and the run stays
+    'running' (never marked invalid/requeued) so a resume's reset_stale()
+    recovers it."""
+    monkeypatch.setattr(env_capture, "_host_lines", lambda: {})
+    sweep_path = _write_sweep_files(tmp_path)
+    results_root = tmp_path / "results"
+
+    fake_docker = FakeDocker()
+    fake_docker.keep_running = True
+    fake_docker.running.add("bench-leaked-from-elsewhere")
+
+    def http_factory():
+        h = FakeHTTP()
+        h.reset_responses = [{"status": 200, "json": {"success": True}}]
+        return h
+
+    with pytest.raises(PreflightError):
+        run_sweep(sweep_path, results_root, resume=False, **_sweep_kwargs(fake_docker, http_factory, tmp_path))
+
+    state_json = json.loads((results_root / "sw1" / "state.json").read_text(encoding="utf-8"))
+    statuses = {rid: r["status"] for rid, r in state_json["runs"].items()}
+    assert list(statuses.values()).count("running") == 1
+    assert "invalid" not in statuses.values() and "requeued" not in statuses.values()
+
+
+def test_run_sweep_fresh_start_refuses_to_clobber_existing_sweep(tmp_path, monkeypatch, client_json):
+    """Important 4: `run` (resume=False) on an existing sweep id must not
+    silently clobber state.json/schedule.json/sweep.yaml -- it should point
+    the caller at `resume` instead."""
+    monkeypatch.setattr(env_capture, "_host_lines", lambda: {})
+    sweep_path = _write_sweep_files(tmp_path)
+    results_root = tmp_path / "results"
+
+    fake_docker = FakeDocker()
+    fake_docker.keep_running = True
+
+    def fake_run_client(docker, cfg, spec, run_dir, traces_dir, hf_cache_dir, **kw):
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        (Path(run_dir) / "client_raw.json").write_text(json.dumps(client_json), encoding="utf-8")
+        return client_json
+
+    monkeypatch.setattr(lifecycle, "run_client", fake_run_client)
+
+    def http_factory():
+        h = FakeHTTP()
+        h.reset_responses = [{"status": 200, "json": {"success": True}}]
+        return h
+
+    run_sweep(sweep_path, results_root, resume=False, **_sweep_kwargs(fake_docker, http_factory, tmp_path))
+
+    with pytest.raises(FileExistsError, match="resume"):
+        run_sweep(sweep_path, results_root, resume=False, **_sweep_kwargs(fake_docker, http_factory, tmp_path))

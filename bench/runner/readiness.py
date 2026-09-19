@@ -19,18 +19,25 @@ def wait_healthy(http, base_url, health_path, timeout_s, poll_s=2.0, docker=None
                   ready_path=None) -> float:
     t0 = time.monotonic()
 
+    def _tail() -> str:
+        if docker is not None and container:
+            return "\n".join(docker.container_logs(container).splitlines()[-40:])
+        return ""
+
     def _poll(path: str) -> None:
         while True:
+            # Fix round 1, item 6: a crashed launch must not cost the full
+            # readiness budget -- if the engine container has already exited,
+            # no amount of further polling will ever see a 200, so fail now.
+            if docker is not None and container and not docker.is_running(container):
+                raise RuntimeError(f"engine container exited during startup\n{_tail()}")
             try:
                 if http.get(base_url + path, timeout=5).status_code == 200:
                     return
             except Exception:
                 pass
             if time.monotonic() - t0 > timeout_s:
-                tail = ""
-                if docker is not None and container:
-                    tail = "\n".join(docker.container_logs(container).splitlines()[-40:])
-                raise TimeoutError(f"{base_url}{path} not healthy after {timeout_s}s\n{tail}")
+                raise TimeoutError(f"{base_url}{path} not healthy after {timeout_s}s\n{_tail()}")
             time.sleep(poll_s)
 
     _poll(health_path)

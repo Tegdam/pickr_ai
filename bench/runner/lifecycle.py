@@ -9,6 +9,13 @@ see the module docstrings this file imports for the contract each one keeps.
 different things, sweep.py's own `_NON_RUNCONFIG_KEYS` docstring says the
 same) -- it travels to `run_one` as a plain dict, the way `sweep_options()`
 already hands it to callers.
+
+Fix round 1 (verbatim rulings from review): attempt isolation (Critical 1),
+a `PreflightError` that keeps environmental failures out of the retry budget
+(Important 3), artifacts recorded right after the client phase rather than
+after cooldown (Important 5), and a defensively-cleaned engine container
+name (Important 2). See each helper's docstring for the specific ruling it
+implements.
 """
 from __future__ import annotations
 
@@ -34,13 +41,28 @@ from .summary import build_summary, write_requests
 from .sweep import expand, load_sweep, schedule as schedule_configs, sweep_options
 
 _CLOCK_PIN_NOTE_DEFAULT = "not attempted (requires Administrator; deferred to the user)"
-_KERNEL_RE = re.compile(r"awq_marlin|MarlinLinearKernel")
+# Fix round 1, minor: match the doc's literal log lines (P10) -- vLLM's
+# "Using MarlinLinearKernel for AutoAWQMarlinLinearMethod" and SGLang's
+# "Using awq_marlin kernel." -- not our own launch-arg echo, which merely
+# repeats the CLI flag "--quantization awq" back and would false-positive.
+_KERNEL_RE = re.compile(r"Using awq_marlin kernel\.|MarlinLinearKernel")
 
 VRAM_RETURN_TOLERANCE_MB = 200
 VRAM_RETURN_TIMEOUT_S = 60.0
 VRAM_RETURN_POLL_S = 2.0
 COOLDOWN_POLL_S = 5.0
 COOLDOWN_CAP_S = 15 * 60.0
+
+
+class PreflightError(RuntimeError):
+    """Important 3: an environment-level failure -- step 1's bench-* guard, a
+    `None`/failing nvidia-smi reader, or a failed `docker run` in
+    `start_engine` -- as opposed to a per-run measurement failure. These are
+    not requeued (a leaked container or one flaky nvidia-smi call must not
+    silently burn the sweep's retry budget): `run_sweep` leaves the run
+    `running` for `reset_stale()` to recover on resume, and re-raises so the
+    process exits non-zero instead of ploughing on.
+    """
 
 
 @dataclass
@@ -70,6 +92,32 @@ def _quantization_kernel(log_text: str) -> str | None:
     return "marlin" if _KERNEL_RE.search(log_text or "") else None
 
 
+def _isolate_previous_attempt(run_dir: Path) -> list[str] | None:
+    """Critical 1: samplers open `gpu_samples.jsonl`/`engine_metrics.jsonl` in
+    append mode, and a retried run reuses the same `run_dir` -- without this,
+    attempt 2's summary (drift, peaks, clock_cv, delta-based acceptance) would
+    be computed over two engine processes' samples. If `run_dir` already
+    holds anything from a prior attempt, move all of it into
+    `run_dir/attempt-<N>/` (forensics kept, never deleted) before proceeding
+    with a clean directory. Returns the moved file names, or None if nothing
+    needed moving."""
+    if not run_dir.exists():
+        return None
+    existing = [p for p in run_dir.iterdir() if not (p.is_dir() and p.name.startswith("attempt-"))]
+    if not existing:
+        return None
+    n = 1
+    while (run_dir / f"attempt-{n}").exists():
+        n += 1
+    dest = run_dir / f"attempt-{n}"
+    dest.mkdir(parents=True)
+    moved = []
+    for p in existing:
+        p.rename(dest / p.name)
+        moved.append(p.name)
+    return moved
+
+
 def _compile_cache_mount(spec: EngineSpec, paths: RunPaths):
     """Ruling P13: vLLM's torch.compile cache is mounted read-write so repeat
     launches of the same shapes don't pay compile time again; SGLang names no
@@ -82,17 +130,33 @@ def _compile_cache_mount(spec: EngineSpec, paths: RunPaths):
     return (str(host_dir), "/root/.cache/vllm", "rw"), True
 
 
-def start_engine(cfg: RunConfig, spec: EngineSpec, docker, paths: RunPaths, opts: dict) -> EngineHandle:
+def start_engine(cfg: RunConfig, spec: EngineSpec, docker, paths: RunPaths) -> EngineHandle:
     """Step 2 (spec §6): launch the engine container. Does not block for
-    readiness -- that is the caller's job (`wait_healthy`)."""
+    readiness -- that is the caller's job (`wait_healthy`).
+
+    Important 2: a failed `docker run` can leave a `Created` container behind
+    that no other path removes, so every retry after that fails on a name
+    conflict -- `docker.stop(name)` (rm -f, best-effort) runs defensively
+    BEFORE `docker.run`, and any exception from `docker.run` itself triggers
+    the same cleanup before re-raising as a `PreflightError` (Important 3:
+    a failed launch is environmental, not a measurement failure).
+    """
     name = f"bench-{cfg.run_id}"
+    docker.stop(name)  # best-effort: clear any leaked Created/Exited container from a prior failed attempt
+
     launch_args = spec.build_launch_args(cfg, cfg.gpu_memory_utilization)
     mounts = [(str(paths.hf_cache_dir), "/root/.cache/huggingface", "ro")]
     compile_mount, compile_cache_mounted = _compile_cache_mount(spec, paths)
     if compile_mount:
         mounts.append(compile_mount)
-    docker.run(spec.image, name, launch_args, gpus=True, network_host=True,
-               mounts=mounts, env=spec.env, extra_args=spec.docker_extra_args)
+
+    try:
+        docker.run(spec.image, name, launch_args, gpus=True, network_host=True,
+                   mounts=mounts, env=spec.env, extra_args=spec.docker_extra_args)
+    except Exception as e:
+        docker.stop(name)
+        raise PreflightError(f"failed to start engine container {name!r}: {e}") from e
+
     return EngineHandle(
         name=name, base_url=f"http://localhost:{spec.port}",
         launch_args=launch_args, compile_cache_mounted=compile_cache_mounted,
@@ -165,6 +229,51 @@ def _cooldown(gpu_reader, cooldown_temp_c: int, cooldown_min_s: int, clock, slee
         sleep(poll_s)
 
 
+def _record_run(cfg, spec, docker, handle, client, trace_rows, run_dir, kernel, clock_pin_note,
+                 clocks_pinned, timing, opts, wall_start, mono_anchor) -> tuple[dict, dict]:
+    """Important 5: `write_requests`/`build_summary`/`capture_env`/
+    `config.yaml`/`meta.json` are written immediately after the samplers stop
+    -- NOT after `docker.stop` + the VRAM-return check + cooldown, which used
+    to mean the artifacts didn't exist until minutes later and `wall_end`
+    silently included cooldown. Returns `(summary, meta)` so `run_one` can
+    later amend both in place with the post-cooldown/VRAM fields once those
+    steps finish, without recomputing anything here.
+    """
+    requests = write_requests(client, trace_rows, cfg, run_dir / "requests.jsonl")
+    gpu_rows = _read_jsonl(run_dir / "gpu_samples.jsonl")
+    metric_rows = _read_jsonl(run_dir / "engine_metrics.jsonl")
+    summary = build_summary(client, requests, gpu_rows, metric_rows, cfg, timing)
+
+    env = capture_env(cfg, docker, spec, handle.launch_args, CLIENT_IMAGE, extra={
+        "quantization_kernel": kernel,
+        "clocks_pinned": clocks_pinned,
+        "clock_pin_note": clock_pin_note,
+        "compile_cache_mounted": handle.compile_cache_mounted,
+        "client_output_schema_version": CLIENT_OUTPUT_SCHEMA_VERSION,
+        # Fix round 1, minor: the client image's own digest, distinct from
+        # the engine image's (already carried as env["image_digest"]).
+        "client_image_digest": docker.image_digest(CLIENT_IMAGE),
+    })
+
+    wall_end = datetime.now(timezone.utc).isoformat()
+    meta = {
+        "run_id": cfg.run_id, "sweep_id": cfg.sweep_id, "phase": cfg.phase, "rq_tag": cfg.rq_tag,
+        "schedule_index": opts.get("schedule_index"), "attempt": opts.get("attempt"),
+        "requeued_from": opts.get("requeued_from"),
+        "wall_start": wall_start, "wall_end": wall_end,
+        "mono_to_wall_anchor": {"mono": mono_anchor, "wall": wall_start},
+    }
+
+    (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg.to_dict(), sort_keys=False), encoding="utf-8")
+    (run_dir / "env.json").write_text(json.dumps(env, indent=2), encoding="utf-8")
+    # client_raw.json is NOT rewritten here (spec §7: "the tool's own output,
+    # untouched") -- run_client already wrote it via the /results bind mount.
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    return summary, meta
+
+
 def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
             gpu_reader=read_gpu, clock=time.monotonic, sleep=time.sleep,
             opts: dict | None = None) -> dict:
@@ -173,7 +282,9 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
 
     `opts` (see module docstring) carries `gpu_headroom_mb`, `try_clock_pin`,
     and the sweep-loop's per-attempt bookkeeping (`schedule_index`, `attempt`,
-    `requeued_from`) that lands in `meta.json`.
+    `requeued_from`) that lands in `meta.json`. Raises `PreflightError` for
+    environmental failures (see its docstring) -- callers must not treat
+    those like an ordinary measurement failure.
     """
     opts = dict(opts or {})
     gpu_headroom_mb = opts.get("gpu_headroom_mb", 256)
@@ -181,6 +292,8 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
 
     run_dir = Path(paths.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    _isolate_previous_attempt(run_dir)
+
     log_lines: list[str] = []
 
     def log(msg: str) -> None:
@@ -190,14 +303,24 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     mono_anchor = clock()
 
     # --- 1. Pre-flight (spec §6 step 1) ---------------------------------
-    already_running = [n for n in docker.ps_names() if n.startswith("bench-")]
+    try:
+        already_running = [n for n in docker.ps_names() if n.startswith("bench-")]
+    except Exception as e:
+        raise PreflightError(f"docker ps failed: {e}") from e
     if already_running:
-        raise RuntimeError(f"refusing to start: bench-* container(s) already running: {already_running}")
+        raise PreflightError(f"refusing to start: bench-* container(s) already running: {already_running}")
 
-    win_pre = gpu_reader(WIN_SMI)
-    wsl_pre = gpu_reader(WSL_SMI)
+    try:
+        win_pre = gpu_reader(WIN_SMI)
+        wsl_pre = gpu_reader(WSL_SMI)
+    except Exception as e:
+        raise PreflightError(f"gpu reader failed: {e}") from e
+
     total_mb = win_pre.get("total_mb")
     host_used_mb = win_pre.get("used_mb")
+    if total_mb is None or host_used_mb is None:
+        raise PreflightError(f"gpu reader returned no usable total_mb/used_mb: {win_pre}")
+
     cfg.free_vram_mb_at_start = total_mb - host_used_mb
     cfg.gpu_memory_utilization = resolve_gpu_memory_fraction(total_mb, host_used_mb, gpu_headroom_mb)
 
@@ -216,14 +339,15 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
 
     validate(cfg)
 
-    # --- 2. Launch the engine --------------------------------------------
-    handle = start_engine(cfg, spec, docker, paths, opts)
+    # --- 2. Launch the engine (PreflightError on a failed launch) --------
+    handle = start_engine(cfg, spec, docker, paths)
     log(f"launched {handle.name}: {' '.join(handle.launch_args)}")
 
     timing: dict = {}
     kernel = None
     exc: Exception | None = None
-    client = requests = gpu_rows = metric_rows = None
+    base_exc: BaseException | None = None
+    summary = meta = None
 
     try:
         # --- 3. Readiness -> warmup -> cache reset -----------------------
@@ -242,10 +366,8 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
             reset_cache(http, handle.base_url, spec, sleep=sleep)
 
         # --- 4. Start samplers --------------------------------------------
-        gpu_samples_path = run_dir / "gpu_samples.jsonl"
-        metrics_path = run_dir / "engine_metrics.jsonl"
-        sampler = GpuSampler(gpu_samples_path, reader=gpu_reader)
-        scraper = MetricsScraper(http, handle.base_url, spec, metrics_path)
+        sampler = GpuSampler(run_dir / "gpu_samples.jsonl", reader=gpu_reader)
+        scraper = MetricsScraper(http, handle.base_url, spec, run_dir / "engine_metrics.jsonl")
         sampler.start()
         scraper.start()
 
@@ -258,59 +380,59 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
             scraper.stop()
         timing["client_s"] = clock() - t0
 
-        # --- 7. Assertions before recording ---------------------------------
-        requests = write_requests(client, trace_rows, cfg, run_dir / "requests.jsonl")
-        gpu_rows = _read_jsonl(gpu_samples_path)
-        metric_rows = _read_jsonl(metrics_path)
+        # --- 7. Record artifacts NOW (Important 5) --------------------------
+        summary, meta = _record_run(cfg, spec, docker, handle, client, trace_rows, run_dir, kernel,
+                                     clock_pin_note, clocks_pinned, timing, opts, wall_start, mono_anchor)
     except Exception as e:  # noqa: BLE001 - deliberately broad: any failure still needs cleanup below
         exc = e
         log(f"run failed: {e!r}")
+    except BaseException as e:  # KeyboardInterrupt/SystemExit: clean up, then let it propagate
+        base_exc = e
+        log(f"run interrupted: {e!r}")
+        raise
     finally:
-        # Captured before the container is removed -- `docker.stop()` does a
-        # `docker rm -f`, after which `docker logs` can no longer see it.
-        engine_logs = docker.container_logs(handle.name)
+        # Fix round 1, minor: wrapped so a container_logs failure can never
+        # skip stop_engine below.
+        try:
+            engine_logs = docker.container_logs(handle.name)
+        except Exception:
+            engine_logs = ""
 
         # --- 8. Stop the engine; verify VRAM returned -----------------------
         stop_engine(handle, docker)
-        vram_returned_mb, vram_leak_mb = _wait_vram_return(gpu_reader, wsl_pre.get("used_mb"), clock, sleep)
-        timing["vram_returned_mb"] = vram_returned_mb
-        timing["vram_leak_mb"] = vram_leak_mb
-        timing["clocks_pinned"] = clocks_pinned
 
-        # --- 9. Cooldown -----------------------------------------------------
-        cooldown_info = _cooldown(gpu_reader, cfg.cooldown_temp_c, cfg.cooldown_min_s, clock, sleep)
+        # Fix round 1, minor: a Ctrl-C mid-run should not be delayed by a
+        # VRAM-settle poll or a full cooldown wait -- clean the container and
+        # get out.
+        if base_exc is None:
+            vram_returned_mb, vram_leak_mb = _wait_vram_return(gpu_reader, wsl_pre.get("used_mb"), clock, sleep)
+            cooldown_info = _cooldown(gpu_reader, cfg.cooldown_temp_c, cfg.cooldown_min_s, clock, sleep)
 
-    wall_end = datetime.now(timezone.utc).isoformat()
+    (run_dir / "log.txt").write_text(engine_logs + "\n" + "\n".join(log_lines), encoding="utf-8")
 
     if exc is not None:
-        (run_dir / "log.txt").write_text(engine_logs + "\n" + "\n".join(log_lines), encoding="utf-8")
+        minimal_meta = {
+            "run_id": cfg.run_id, "sweep_id": cfg.sweep_id, "phase": cfg.phase, "rq_tag": cfg.rq_tag,
+            "schedule_index": opts.get("schedule_index"), "attempt": opts.get("attempt"),
+            "requeued_from": opts.get("requeued_from"),
+            "wall_start": wall_start, "wall_end": datetime.now(timezone.utc).isoformat(),
+            "error": str(exc),
+        }
+        (run_dir / "meta.json").write_text(json.dumps(minimal_meta, indent=2), encoding="utf-8")
         raise exc
 
-    summary = build_summary(client, requests, gpu_rows, metric_rows, cfg, timing)
-
-    env = capture_env(cfg, docker, spec, handle.launch_args, CLIENT_IMAGE, extra={
-        "quantization_kernel": kernel,
-        "clocks_pinned": clocks_pinned,
-        "clock_pin_note": clock_pin_note,
-        "compile_cache_mounted": handle.compile_cache_mounted,
-        "client_output_schema_version": CLIENT_OUTPUT_SCHEMA_VERSION,
-    })
-
-    meta = {
-        "run_id": cfg.run_id, "sweep_id": cfg.sweep_id, "phase": cfg.phase, "rq_tag": cfg.rq_tag,
-        "schedule_index": opts.get("schedule_index"), "attempt": opts.get("attempt"),
-        "requeued_from": opts.get("requeued_from"),
-        "wall_start": wall_start, "wall_end": wall_end,
-        **cooldown_info,
-        "mono_to_wall_anchor": {"mono": mono_anchor, "wall": wall_start},
-    }
-
-    (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg.to_dict(), sort_keys=False), encoding="utf-8")
-    (run_dir / "env.json").write_text(json.dumps(env, indent=2), encoding="utf-8")
-    (run_dir / "client_raw.json").write_text(json.dumps(client, indent=2), encoding="utf-8")
-    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    # --- 9. Amend meta.json/summary.json with the post-cooldown/VRAM fields
+    meta.update(cooldown_info)
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    (run_dir / "log.txt").write_text(engine_logs + "\n" + "\n".join(log_lines), encoding="utf-8")
+
+    summary["timing"]["vram_returned_mb"] = vram_returned_mb
+    summary["timing"]["vram_leak_mb"] = vram_leak_mb
+    summary["timing"]["wsl_pre_used_mb"] = wsl_pre.get("used_mb")
+    summary["timing"]["win_pre_used_mb"] = win_pre.get("used_mb")
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    if vram_leak_mb:
+        print(f"[{cfg.run_id}] VRAM LEAK {vram_leak_mb} MB")
 
     return summary
 
@@ -321,6 +443,40 @@ class SweepReport:
     sweep_dir: Path
     state: SweepState
     summaries: dict[str, dict]
+
+
+def _load_sweep_state(sweep_path, results_root: Path, *, resume: bool) -> tuple[dict, str, Path, SweepState, list[str]]:
+    """Shared setup for `run_sweep`'s resume and fresh-start paths: load the
+    sweep dict, resolve `sweep_dir`, and produce a `SweepState` plus the
+    schedule's original run-id order. Fresh starts also write `sweep.yaml`/
+    `schedule.json` and refuse to clobber an existing sweep (Important 4)."""
+    sweep_dict = load_sweep(sweep_path)
+    sweep_id = sweep_dict["sweep_id"]
+    sweep_dir = results_root / sweep_id
+    state_path = sweep_dir / "state.json"
+
+    if resume:
+        state = SweepState.load(state_path)
+        reset = state.reset_stale()
+        if reset:
+            print(f"resume: reset {len(reset)} stale running run(s) to pending: {reset}")
+        original_order = json.loads((sweep_dir / "schedule.json").read_text(encoding="utf-8"))["order"]
+        return sweep_dict, sweep_id, sweep_dir, state, original_order
+
+    if state_path.exists():
+        raise FileExistsError(
+            f"sweep {sweep_id!r} already has state at {state_path} -- pass resume=True "
+            f"(or `python -m bench.runner resume {sweep_id}`) instead of starting it fresh"
+        )
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+    opts = sweep_options(sweep_dict)
+    ordered = schedule_configs(expand(sweep_dict, sweep_id), opts["schedule_seed"])
+    original_order = [c.run_id for c in ordered]
+    state = SweepState(state_path, original_order, max_retries_total=opts["max_retries_total"])
+    (sweep_dir / "sweep.yaml").write_text(Path(sweep_path).read_text(encoding="utf-8"), encoding="utf-8")
+    (sweep_dir / "schedule.json").write_text(
+        json.dumps({"order": original_order, "seed": opts["schedule_seed"]}, indent=2), encoding="utf-8")
+    return sweep_dict, sweep_id, sweep_dir, state, original_order
 
 
 def run_sweep(sweep_path, results_root, *, resume: bool = False,
@@ -335,38 +491,17 @@ def run_sweep(sweep_path, results_root, *, resume: bool = False,
     shared across runs). `spec_for(cfg)` resolves the `EngineSpec` for a
     config's engine -- injectable so tests need not depend on `ENGINES`
     carrying every engine they exercise.
+
+    A `PreflightError` from `run_one` (Important 3) is not requeued: the run
+    is left `running` (so `reset_stale()` recovers it on the next `resume`)
+    and the error propagates out of `run_sweep` so the process exits non-zero.
     """
     results_root = Path(results_root)
-
-    if resume:
-        sweep_dict = load_sweep(sweep_path)
-        sweep_id = sweep_dict["sweep_id"]
-        sweep_dir = results_root / sweep_id
-        state = SweepState.load(sweep_dir / "state.json")
-        reset = state.reset_stale()
-        if reset:
-            print(f"resume: reset {len(reset)} stale running run(s) to pending: {reset}")
-        schedule_json = json.loads((sweep_dir / "schedule.json").read_text(encoding="utf-8"))
-        original_order = schedule_json["order"]
-        configs_by_id = {c.run_id: c for c in expand(sweep_dict, sweep_id)}
-    else:
-        sweep_dict = load_sweep(sweep_path)
-        sweep_id = sweep_dict["sweep_id"]
-        sweep_dir = results_root / sweep_id
-        sweep_dir.mkdir(parents=True, exist_ok=True)
-        opts = sweep_options(sweep_dict)
-        configs = expand(sweep_dict, sweep_id)
-        ordered = schedule_configs(configs, opts["schedule_seed"])
-        original_order = [c.run_id for c in ordered]
-        configs_by_id = {c.run_id: c for c in ordered}
-        state = SweepState(sweep_dir / "state.json", original_order,
-                            max_retries_total=opts["max_retries_total"])
-        (sweep_dir / "sweep.yaml").write_text(Path(sweep_path).read_text(encoding="utf-8"), encoding="utf-8")
-        (sweep_dir / "schedule.json").write_text(
-            json.dumps({"order": original_order, "seed": opts["schedule_seed"]}, indent=2),
-            encoding="utf-8")
+    sweep_dict, sweep_id, sweep_dir, state, original_order = _load_sweep_state(
+        sweep_path, results_root, resume=resume)
 
     opts = sweep_options(sweep_dict)
+    configs_by_id = {c.run_id: c for c in expand(sweep_dict, sweep_id)}
     traces_dir = Path(opts["traces_dir"])
     hf_cache_dir = Path(hf_cache_dir) if hf_cache_dir else Path.home() / ".cache" / "huggingface"
     compile_cache_root = Path(compile_cache_root) if compile_cache_root else (results_root / ".cache")
@@ -380,9 +515,8 @@ def run_sweep(sweep_path, results_root, *, resume: bool = False,
     while state.pending():
         run_id = state.pending()[0]
         cfg = configs_by_id[run_id]
-        run_dir = sweep_dir / run_id
         paths = RunPaths(
-            results_root=results_root, sweep_dir=sweep_dir, run_dir=run_dir,
+            results_root=results_root, sweep_dir=sweep_dir, run_dir=sweep_dir / run_id,
             traces_dir=traces_dir, hf_cache_dir=hf_cache_dir, compile_cache_root=compile_cache_root,
         )
         run_opts = dict(opts)
@@ -396,6 +530,13 @@ def run_sweep(sweep_path, results_root, *, resume: bool = False,
         try:
             summary = run_one(cfg, paths, docker=docker, http=http, spec=spec,
                                gpu_reader=gpu_reader, clock=clock, sleep=sleep, opts=run_opts)
+        except PreflightError as e:
+            # Important 3: not a measurement failure -- leave the run
+            # `running` (reset_stale() on the next resume recovers it) and do
+            # not touch the retry budget. Re-raise so the caller/process
+            # notices instead of silently limping through the rest of the sweep.
+            print(f"[{run_id}] PREFLIGHT FAILURE: {e} -- left 'running' for the next resume to recover")
+            raise
         except Exception as e:  # noqa: BLE001 - a failed run must be requeued, not crash the sweep
             state.mark(run_id, "invalid", reason=str(e))
             requeued = state.requeue(run_id)

@@ -12,10 +12,33 @@ def test_wait_healthy_polls_until_200(fake_http):
 
 def test_wait_healthy_times_out_with_logs(fake_http, fake_docker):
     fake_http.healthy_after = 10**6
+    fake_docker.running.add("c")  # container is alive and slow, not crashed -- a genuine timeout
     fake_docker.logs["c"] = "\n".join(f"line{i}" for i in range(100))
     with pytest.raises(TimeoutError) as e:
         wait_healthy(fake_http, "http://localhost:8000", "/health", timeout_s=0.01, poll_s=0.0, docker=fake_docker, container="c")
     assert "line99" in str(e.value) and "line10" not in str(e.value)   # last 40 lines only
+
+
+def test_wait_healthy_raises_when_container_exits_during_startup(fake_http, fake_docker):
+    """Fix round 1, item 6: wait_healthy cannot see a dead engine from HTTP
+    alone -- a crashed launch must not cost the full readiness timeout. The
+    container is running for the first 2 polls, then gone (simulating a
+    crash after the process starts but before it ever answers /health)."""
+    fake_http.healthy_after = 10**6  # never becomes healthy via HTTP
+    fake_docker.running.add("c")
+    fake_docker.logs["c"] = "\n".join(f"line{i}" for i in range(50))
+    calls = {"n": 0}
+
+    def flaky_is_running(name):
+        calls["n"] += 1
+        return calls["n"] <= 2
+
+    fake_docker.is_running = flaky_is_running
+
+    with pytest.raises(RuntimeError, match="engine container exited during startup") as e:
+        wait_healthy(fake_http, "http://localhost:8000", "/health", timeout_s=600, poll_s=0.0,
+                     docker=fake_docker, container="c")
+    assert "line49" in str(e.value)
 
 
 def test_wait_healthy_polls_ready_path_after_health(fake_http):
@@ -45,6 +68,7 @@ def test_wait_healthy_ready_path_times_out_with_logs(fake_http, fake_docker):
     """Health passes immediately but /ready never does -- still times out with log tail."""
     fake_http.healthy_after = 0
     fake_http.ready_after = 10**6
+    fake_docker.running.add("c")  # container is alive and slow, not crashed -- a genuine timeout
     fake_docker.logs["c"] = "\n".join(f"line{i}" for i in range(100))
     with pytest.raises(TimeoutError) as e:
         wait_healthy(

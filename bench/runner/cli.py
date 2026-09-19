@@ -100,8 +100,11 @@ def check_env(sweep_path: str | None, results_root: Path, hf_cache_dir: Path) ->
         except Exception as e:  # noqa: BLE001
             record("client_image_present", False, str(e))
 
-    results_root.mkdir(parents=True, exist_ok=True)
-    (results_root / "check_env.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    # Fix round 1, minor: land check_env.json next to the sweep it checked
+    # (results/<sweep_id>/) when a --sweep was given, not always the results root.
+    out_dir = results_root / sweep_dict["sweep_id"] if sweep_dict is not None else results_root
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "check_env.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 
 
@@ -116,25 +119,22 @@ def _cmd_check_env(a) -> int:
     return 0 if result["ok"] else 1
 
 
-def _cmd_run(a) -> int:
-    docker = Docker()
+def _run_sweep_cmd(sweep_path, a, *, resume: bool) -> int:
     report = run_sweep(
-        a.sweep, a.results, resume=False, docker=docker, http_factory=_http_module,
+        sweep_path, a.results, resume=resume, docker=Docker(), http_factory=_http_module,
         hf_cache_dir=a.hf_cache, compile_cache_root=a.compile_cache,
     )
-    print(f"sweep {report.sweep_id}: {len(report.summaries)} run(s) recorded this session")
+    verb = "resumed sweep" if resume else "sweep"
+    print(f"{verb} {report.sweep_id}: {len(report.summaries)} run(s) recorded this session")
     return 0
+
+
+def _cmd_run(a) -> int:
+    return _run_sweep_cmd(a.sweep, a, resume=False)
 
 
 def _cmd_resume(a) -> int:
-    docker = Docker()
-    sweep_path = Path(a.results) / a.sweep_id / "sweep.yaml"
-    report = run_sweep(
-        sweep_path, a.results, resume=True, docker=docker, http_factory=_http_module,
-        hf_cache_dir=a.hf_cache, compile_cache_root=a.compile_cache,
-    )
-    print(f"resumed sweep {report.sweep_id}: {len(report.summaries)} run(s) recorded this session")
-    return 0
+    return _run_sweep_cmd(Path(a.results) / a.sweep_id / "sweep.yaml", a, resume=True)
 
 
 def _cmd_probe(a) -> int:
