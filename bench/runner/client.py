@@ -120,13 +120,22 @@ def run_client(docker, cfg: RunConfig, spec: EngineSpec, run_dir: Path, traces_d
     returns or raises, so a retried run with the same run_id never hits a name
     conflict and a timed-out client never lingers; container logs for any
     failure are captured before that removal happens.
+
+    I4/P33: the container is named `bench-<run_id>-client` (not
+    `<run_id>-client`) so the `bench-*` pre-flight guard in
+    `lifecycle.run_one` actually sees a leaked one; `docker.stop(name)` runs
+    defensively before `docker.run`, the same "clear any leaked Created/
+    Exited container from a prior failed attempt" treatment `start_engine`
+    already gives the engine container.
     """
     run_dir = Path(run_dir)
     traces_dir = Path(traces_dir)
     hf_cache_dir = Path(hf_cache_dir)
     base_url = f"http://localhost:{spec.port}"
     command = build_client_command(cfg, base_url, "/results", result_filename)
-    name = container_name or f"{cfg.run_id}-client"
+    name = container_name or f"bench-{cfg.run_id}-client"
+
+    docker.stop(name)  # best-effort: clear any leaked client container from a prior failed attempt
 
     docker.run(
         client_image, name, ["bench", "serve", *command],

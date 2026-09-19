@@ -127,9 +127,13 @@ def test_run_client_returns_validated_dict_uses_gpuless_container_and_stops_it(t
     result = _run_client(fake_docker, cfg, spec, run_dir, traces_dir, hf_cache_dir)
 
     assert result == client_json
-    name = f"{cfg.run_id}-client"
-    run_call = fake_docker.calls[0]
-    assert run_call["op"] == "run"
+    # I4/P33: bench-<run_id>-client, not <run_id>-client, so the bench-*
+    # pre-flight guard actually sees a leaked client container.
+    name = f"bench-{cfg.run_id}-client"
+    run_calls = [c for c in fake_docker.calls if c["op"] == "run"]
+    assert len(run_calls) == 1
+    run_call = run_calls[0]
+    assert run_call["name"] == name
     assert run_call["gpus"] is False
     assert run_call["network_host"] is True
     assert run_call["entrypoint"] == "vllm"
@@ -139,8 +143,11 @@ def test_run_client_returns_validated_dict_uses_gpuless_container_and_stops_it(t
     assert (str(hf_cache_dir), "/root/.cache/huggingface", "ro") in run_call["mounts"]
     assert run_call["env"] == {"HF_HUB_OFFLINE": "1"}
 
+    # I4/P33: a defensive docker.stop before docker.run (clears a leaked
+    # container from a prior failed attempt), plus the real end-of-run
+    # cleanup -- both against the same name.
     stop_calls = [c for c in fake_docker.calls if c["op"] == "stop"]
-    assert stop_calls == [{"op": "stop", "name": name, "timeout": 30}]
+    assert stop_calls == [{"op": "stop", "name": name, "timeout": 30}] * 2
 
 
 def test_run_client_raises_with_logs_on_nonzero_exit_and_still_stops(tmp_path, fake_docker):
@@ -152,7 +159,7 @@ def test_run_client_raises_with_logs_on_nonzero_exit_and_still_stops(tmp_path, f
     hf_cache_dir.mkdir()
     cfg = _cfg()
     spec = ENGINES["vllm"]
-    name = f"{cfg.run_id}-client"
+    name = f"bench-{cfg.run_id}-client"
     fake_docker.logs[name] = "\n".join(f"line{i}" for i in range(50))
     fake_docker.fail_next = True
 
@@ -162,7 +169,7 @@ def test_run_client_raises_with_logs_on_nonzero_exit_and_still_stops(tmp_path, f
     assert "line0" not in str(e.value)  # last 40 lines only
 
     stop_calls = [c for c in fake_docker.calls if c["op"] == "stop"]
-    assert stop_calls == [{"op": "stop", "name": name, "timeout": 30}]
+    assert stop_calls == [{"op": "stop", "name": name, "timeout": 30}] * 2
 
 
 def test_run_client_raises_when_result_file_missing(tmp_path, fake_docker):
@@ -188,7 +195,7 @@ def test_run_client_times_out_and_stops_the_lingering_container(tmp_path, fake_d
     hf_cache_dir.mkdir()
     cfg = _cfg()
     spec = ENGINES["vllm"]
-    name = f"{cfg.run_id}-client"
+    name = f"bench-{cfg.run_id}-client"
     fake_docker.logs[name] = "\n".join(f"line{i}" for i in range(50))
     fake_docker.keep_running = True
 
@@ -202,4 +209,4 @@ def test_run_client_times_out_and_stops_the_lingering_container(tmp_path, fake_d
     assert "line49" in str(e.value)
 
     stop_calls = [c for c in fake_docker.calls if c["op"] == "stop"]
-    assert stop_calls == [{"op": "stop", "name": name, "timeout": 30}]
+    assert stop_calls == [{"op": "stop", "name": name, "timeout": 30}] * 2
