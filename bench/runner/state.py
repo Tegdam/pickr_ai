@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,6 +32,8 @@ class SweepState:
         return s
 
     def mark(self, run_id: str, status: str, reason: str | None = None) -> None:
+        if status not in STATUSES:
+            raise ValueError(f"unknown status {status!r}; must be one of {STATUSES}")
         r = self.runs[run_id]
         r["status"] = status
         r["reason"] = reason
@@ -42,6 +45,8 @@ class SweepState:
     def requeue(self, run_id: str) -> bool:
         """Move run_id to the end of the queue as `requeued`. Returns False (no-op)
         once the sweep's total retry budget is exhausted."""
+        if run_id not in self.runs:
+            raise KeyError(run_id)
         if self.retries_used >= self.max_retries_total:
             return False
         self.retries_used += 1
@@ -50,6 +55,18 @@ class SweepState:
         self.runs[run_id]["status"] = "requeued"
         self._save()
         return True
+
+    def reset_stale(self) -> list[str]:
+        """Flip every `running` run back to `pending` (attempts preserved) and
+        persist. Not called automatically by `load()` -- a run left `running`
+        only means the process died mid-run, so the lifecycle calls this
+        explicitly on resume and logs the ids it returns."""
+        stale = [r for r in self.order if self.runs[r]["status"] == "running"]
+        for r in stale:
+            self.runs[r]["status"] = "pending"
+            self.runs[r]["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self._save()
+        return stale
 
     def pending(self) -> list[str]:
         return [r for r in self.order if self.runs[r]["status"] in ("pending", "requeued")]
@@ -64,4 +81,6 @@ class SweepState:
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)

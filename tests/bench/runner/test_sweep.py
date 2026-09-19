@@ -2,7 +2,8 @@ import json
 
 import yaml
 
-from bench.runner.sweep import expand, load_sweep, schedule
+from bench.runner.engine import ENGINES
+from bench.runner.sweep import expand, load_sweep, schedule, sweep_options
 
 
 def _traces(tmp_path):
@@ -21,7 +22,7 @@ def test_expand_crosses_axes_and_reps_and_resolves_traces(tmp_path):
         "max_num_seqs": 64, "chunked_prefill_tokens": 1024, "cudagraph_capture_sizes": [1, 2], "sampling": {},
         "ignore_eos": True, "max_tokens_cap": None, "warmup_requests": 2, "cooldown_temp_c": 55, "cooldown_min_s": 1,
         "gpu_headroom_mb": 256, "seed": 0, "extra_body": {}, "draft_model": None, "draft_revision": None,
-        "draft_quantization": None, "traces_dir": str(tmp_path)}))
+        "draft_quantization": None, "traces_dir": str(tmp_path), "try_clock_pin": False}))
     sweep = tmp_path / "s.yaml"
     sweep.write_text(yaml.safe_dump({"base": str(base), "sweep_id": "t", "rq_tag": "x", "schedule_seed": 1,
         "max_retries_total": 2, "reps": 2, "axes": {"engine": ["vllm", "sglang"], "workload": ["A", "B"], "concurrency": [1, 8]}}))
@@ -34,6 +35,7 @@ def test_expand_crosses_axes_and_reps_and_resolves_traces(tmp_path):
     assert b.trace_sha256 == "e" * 64
     assert {c.engine for c in cfgs} == {"vllm", "sglang"} and {c.concurrency for c in cfgs} == {1, 8}
     assert all(c.gpu_memory_utilization == 0.0 and c.free_vram_mb_at_start == 0 for c in cfgs)  # resolved at run time
+    assert cfgs[0].image == ENGINES["vllm"].image
 
 
 def test_schedule_is_a_seeded_permutation(tmp_path):
@@ -43,3 +45,28 @@ def test_schedule_is_a_seeded_permutation(tmp_path):
     s1 = schedule(cfgs, seed=7); s2 = schedule(cfgs, seed=7); s3 = schedule(cfgs, seed=8)
     assert [c.run_id for c in s1] == [c.run_id for c in s2] != [c.run_id for c in s3]
     assert sorted(c.run_id for c in s1) == sorted(c.run_id for c in cfgs)
+
+
+def test_sweep_options_defaults_and_overrides():
+    assert sweep_options({}) == {
+        "gpu_headroom_mb": 256,
+        "try_clock_pin": False,
+        "max_retries_total": 0,
+        "schedule_seed": 0,
+        "traces_dir": "bench/traces",
+    }
+    overrides = {
+        "gpu_headroom_mb": 512,
+        "try_clock_pin": True,
+        "max_retries_total": 5,
+        "schedule_seed": 42,
+        "traces_dir": "/tmp/traces",
+        "axes": {"engine": ["vllm"]},  # unrelated sweep keys must be ignored
+    }
+    assert sweep_options(overrides) == {
+        "gpu_headroom_mb": 512,
+        "try_clock_pin": True,
+        "max_retries_total": 5,
+        "schedule_seed": 42,
+        "traces_dir": "/tmp/traces",
+    }

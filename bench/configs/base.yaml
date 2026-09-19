@@ -7,6 +7,7 @@ draft_model: Qwen/Qwen2.5-0.5B-Instruct
 draft_revision: "7ae557604adf67be50417f59c2c2f167def9a775"
 draft_quantization: null
 spec_method: "off"  # PyYAML's YAML-1.1 resolver parses a bare `off` as boolean False
+# (same resolver quirk: `1e3` parses as the string "1e3", not a float -- write such values as `1000.0`)
 spec_k: null
 ngram_lookup_max: 4
 load_mode: concurrency
