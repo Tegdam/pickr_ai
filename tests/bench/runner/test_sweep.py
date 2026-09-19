@@ -3,6 +3,7 @@ import json
 import yaml
 
 from bench.runner.engine import ENGINES
+from bench.runner.paths import REPO_ROOT
 from bench.runner.sweep import expand, load_sweep, schedule, sweep_options
 
 
@@ -38,6 +39,21 @@ def test_expand_crosses_axes_and_reps_and_resolves_traces(tmp_path):
     assert cfgs[0].image == ENGINES["vllm"].image
 
 
+def test_load_sweep_resolves_repo_root_relative_base_regardless_of_cwd(tmp_path, monkeypatch):
+    """C1/P28: a sweep file that lives somewhere other than the repo (a
+    tmp-path fixture here) with a `base:` spelled the way every real
+    bench/configs/p0b_*.yaml spells it ("bench/configs/base.yaml", relative
+    to the repo root, not to the sweep file's own directory) must still
+    resolve -- even when the process's cwd is somewhere else entirely."""
+    monkeypatch.chdir(tmp_path)  # cwd is neither the sweep's dir nor the repo root
+    sweep = tmp_path / "s.yaml"
+    sweep.write_text(yaml.safe_dump({"base": "bench/configs/base.yaml", "sweep_id": "t"}))
+    merged = load_sweep(sweep)
+    assert merged["model"] == "Qwen/Qwen2.5-3B-Instruct-AWQ"  # a real base.yaml field
+    assert merged["sweep_id"] == "t"
+    assert "base" not in merged
+
+
 def test_schedule_is_a_seeded_permutation(tmp_path):
     _traces(tmp_path)
     from tests.bench.runner.test_engine import _cfg
@@ -48,12 +64,14 @@ def test_schedule_is_a_seeded_permutation(tmp_path):
 
 
 def test_sweep_options_defaults_and_overrides():
+    # C1/P28: the traces_dir default is anchored to the repo root, not left
+    # relative -- it must resolve regardless of the process's invocation cwd.
     assert sweep_options({}) == {
         "gpu_headroom_mb": 256,
         "try_clock_pin": False,
         "max_retries_total": 0,
         "schedule_seed": 0,
-        "traces_dir": "bench/traces",
+        "traces_dir": str(REPO_ROOT / "bench" / "traces"),
     }
     overrides = {
         "gpu_headroom_mb": 512,

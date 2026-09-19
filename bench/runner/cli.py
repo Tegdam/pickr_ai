@@ -16,14 +16,19 @@ from .docker import Docker
 from .engine import ENGINES
 from .gpu_monitor import WIN_SMI, WSL_SMI, read_gpu
 from .lifecycle import RunPaths, run_sweep
+from .paths import REPO_ROOT as _REPO_ROOT
 from .probes import PROBE_ORDER, run_probe
 from .sweep import WORKLOAD_TRACES, load_sweep, sweep_options
 
-DEFAULT_RESULTS_ROOT = "bench/results"
+# C1/P28: anchored to the repo root, not left relative -- `python -m
+# bench.runner ...` may be invoked from any cwd, and these end up as docker
+# `-v` mount sources (traces/results/compile-cache), which docker rejects
+# outright when relative.
+DEFAULT_RESULTS_ROOT = str(_REPO_ROOT / "bench" / "results")
 DEFAULT_HF_CACHE = str(Path.home() / ".cache" / "huggingface")
 DEFAULT_COMPILE_CACHE = str(Path(DEFAULT_RESULTS_ROOT) / ".cache")
-DEFAULT_PROBE_PARAMS = "bench/configs/p0b_probes.yaml"
-DEFAULT_TRACES_DIR = "bench/traces"
+DEFAULT_PROBE_PARAMS = str(_REPO_ROOT / "bench" / "configs" / "p0b_probes.yaml")
+DEFAULT_TRACES_DIR = str(_REPO_ROOT / "bench" / "traces")
 
 
 def _image_present(image: str) -> bool:

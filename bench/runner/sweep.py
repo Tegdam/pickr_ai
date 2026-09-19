@@ -17,6 +17,13 @@ import yaml
 
 from .config import RunConfig
 from .engine import ENGINES
+from .paths import REPO_ROOT as _REPO_ROOT
+
+# C1/P28: single source of truth for the traces-dir default, anchored to the
+# repo root rather than left relative -- resolved regardless of the process's
+# invocation cwd (a relative "bench/traces" only ever worked when launched
+# from the repo root).
+_DEFAULT_TRACES_DIR = str(_REPO_ROOT / "bench" / "traces")
 
 WORKLOAD_TRACES = {
     "A": "chat",
@@ -37,10 +44,33 @@ _NON_RUNCONFIG_KEYS = {
 }
 
 
+def _resolve_relative(path_str: str, sweep_path: Path) -> Path:
+    """C1/P28: resolve a sweep YAML's `base:` (or any such relative
+    reference) against the sweep file's own directory first, then the repo
+    root, then cwd -- the first candidate that exists on disk. An already-
+    absolute `path_str` (every tmp-path fixture's `base:`) collapses the
+    first candidate back to itself, so this is a no-op for those. Falls back
+    to the first candidate (sweep-dir-relative) when none exist, so the
+    caller's own `read_text()`/`FileNotFoundError` still names something
+    sensible."""
+    candidates = [sweep_path.parent / path_str, _REPO_ROOT / path_str, Path.cwd() / path_str]
+    return next((c for c in candidates if c.exists()), candidates[0])
+
+
 def load_sweep(path: str | Path) -> dict:
-    """Load a sweep YAML, merging its `base:` file (if any) underneath the sweep's own keys."""
-    sweep = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    base = yaml.safe_load(Path(sweep["base"]).read_text(encoding="utf-8")) if "base" in sweep else {}
+    """Load a sweep YAML, merging its `base:` file (if any) underneath the
+    sweep's own keys. C1/P28: `base:` is resolved via `_resolve_relative`
+    (sweep-file dir -> repo root -> cwd) rather than taken as a literal
+    cwd-relative path, so `base: bench/configs/base.yaml` keeps working
+    regardless of the process's invocation directory. A frozen sweep.yaml
+    written by `run_sweep` (Important 2/P31) carries no `base:` key at all,
+    so resuming from it is a straight load with no re-merge against the
+    live base.yaml."""
+    path = Path(path)
+    sweep = yaml.safe_load(path.read_text(encoding="utf-8"))
+    base = {}
+    if "base" in sweep:
+        base = yaml.safe_load(_resolve_relative(sweep["base"], path).read_text(encoding="utf-8"))
     merged = {**base, **{k: v for k, v in sweep.items() if k != "base"}}
     merged["_source"] = str(path)
     return merged
@@ -54,7 +84,7 @@ def sweep_options(sweep: dict) -> dict:
         "try_clock_pin": sweep.get("try_clock_pin", False),
         "max_retries_total": sweep.get("max_retries_total", 0),
         "schedule_seed": sweep.get("schedule_seed", 0),
-        "traces_dir": sweep.get("traces_dir", "bench/traces"),
+        "traces_dir": sweep.get("traces_dir", _DEFAULT_TRACES_DIR),
     }
 
 
@@ -72,7 +102,7 @@ def expand(sweep: dict, sweep_id: str) -> list[RunConfig]:
     axes = sweep.get("axes", {})
     keys = list(axes)
     reps = int(sweep.get("reps", 1))
-    traces_dir = Path(sweep.get("traces_dir", "bench/traces"))
+    traces_dir = Path(sweep.get("traces_dir", _DEFAULT_TRACES_DIR))
     fixed = {k: v for k, v in sweep.items() if k not in _NON_RUNCONFIG_KEYS}
 
     out: list[RunConfig] = []
