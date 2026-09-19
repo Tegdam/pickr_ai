@@ -45,13 +45,17 @@ class FakeHTTP:
         self.ready_polls = 0
         self.posts = []
         self.metrics_text = ""
+        self.sequence = []       # "/health" / "/ready" paths hit, in poll order
+        self.reset_responses = []  # [{"status": 200, "json": {...}, "text": "..."}], consumed in order for reset-cache calls
 
     def get(self, url, timeout=5):
         if url.endswith("/ready"):
+            self.sequence.append("/ready")
             self.ready_polls += 1
             ok = self.ready_polls > self.ready_after
             return SimpleNamespace(status_code=200 if ok else 503, text="")
         if url.endswith("/health"):
+            self.sequence.append("/health")
             self.polls += 1
             ok = self.polls > self.healthy_after
             return SimpleNamespace(status_code=200 if ok else 503, text="")
@@ -62,8 +66,12 @@ class FakeHTTP:
     def post(self, url, json=None, timeout=60):
         self.posts.append((url, json))
         if url.endswith("/v1/completions"):
-            return SimpleNamespace(status_code=200, json=lambda: {"choices": [{"text": "ok"}], "usage": {"prompt_tokens": 265, "completion_tokens": 4}})
-        return SimpleNamespace(status_code=200, json=lambda: {})
+            return SimpleNamespace(status_code=200, text="", json=lambda: {"choices": [{"text": "ok"}], "usage": {"prompt_tokens": 265, "completion_tokens": 4}})
+        if self.reset_responses:
+            entry = self.reset_responses.pop(0)
+            body_json = entry.get("json", {})
+            return SimpleNamespace(status_code=entry.get("status", 200), json=lambda: body_json, text=entry.get("text", ""))
+        return SimpleNamespace(status_code=200, json=lambda: {}, text="")
 
 
 @pytest.fixture

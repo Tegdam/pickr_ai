@@ -11,6 +11,9 @@ import time
 
 from .engine import EngineSpec
 
+_DEFAULT_RESET_ATTEMPTS = 5
+_DEFAULT_RESET_BACKOFF_S = 1.0
+
 
 def wait_healthy(http, base_url, health_path, timeout_s, poll_s=2.0, docker=None, container=None,
                   ready_path=None) -> float:
@@ -46,8 +49,48 @@ def warmup(http, base_url, model, prompts, max_tokens=8) -> int:
     return n
 
 
-def reset_cache(http, base_url, spec: EngineSpec) -> None:
+def _reset_succeeded(spec: EngineSpec, r) -> bool:
+    """A 2xx status alone does not mean the reset happened (doc §3.3, §4.3, §8):
+    vLLM's /reset_prefix_cache returns 200 with {"success": false} while requests
+    are still in flight; SGLang's /flush_cache returns 200 even when refused,
+    with a body that does not start with "Cache flushed." while requests are
+    running or queued -- so each engine's body must be inspected, not just its
+    status code."""
+    if spec.name == "vllm":
+        try:
+            return r.json().get("success") is True
+        except Exception:
+            return False
+    if spec.name == "sglang":
+        return (getattr(r, "text", "") or "").startswith("Cache flushed.")
+    return 200 <= r.status_code < 300
+
+
+def _reset_body(r) -> str:
+    text = getattr(r, "text", None)
+    if text:
+        return text
+    try:
+        return str(r.json())
+    except Exception:
+        return ""
+
+
+def reset_cache(http, base_url, spec: EngineSpec, attempts: int = _DEFAULT_RESET_ATTEMPTS,
+                 backoff_s: float = _DEFAULT_RESET_BACKOFF_S, sleep=time.sleep) -> None:
+    """POST/GET per spec.reset_cache_method, then retry while the engine reports
+    the reset was refused (requests still in flight) -- up to `attempts` tries,
+    sleeping `backoff_s` between them. A non-2xx status is a hard failure (route
+    missing/misconfigured) and raises immediately; a 2xx refusal retries."""
     url = base_url + spec.reset_cache_path
-    r = http.post(url, json={}, timeout=30) if spec.reset_cache_method == "POST" else http.get(url, timeout=30)
-    if not (200 <= r.status_code < 300):
-        raise RuntimeError(f"cache reset failed: {spec.reset_cache_method} {url} -> {r.status_code}")
+    last_body = ""
+    for attempt in range(attempts):
+        r = http.post(url, json={}, timeout=30) if spec.reset_cache_method == "POST" else http.get(url, timeout=30)
+        if not (200 <= r.status_code < 300):
+            raise RuntimeError(f"cache reset failed: {spec.reset_cache_method} {url} -> {r.status_code}")
+        if _reset_succeeded(spec, r):
+            return
+        last_body = _reset_body(r)
+        if attempt < attempts - 1:
+            sleep(backoff_s)
+    raise RuntimeError(f"cache reset refused after {attempts} attempts: {last_body[:120]}")

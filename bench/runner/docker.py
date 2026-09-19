@@ -39,11 +39,15 @@ class Docker:
         return self._run("docker", "inspect", "-f", "{{.State.Running}}", name, check=False) == "true"
 
     def image_digest(self, image: str) -> str:
-        return self._run("docker", "image", "inspect", image, "--format", "{{index .RepoDigests 0}}")
+        digest = self._run("docker", "image", "inspect", image, "--format", "{{index .RepoDigests 0}}", check=False)
+        if digest:
+            return digest
+        # Locally built images (e.g. bench-client) carry no RepoDigests -- fall
+        # back to the image Id.
+        return self._run("docker", "image", "inspect", image, "--format", "{{.Id}}")
 
     def pip_freeze(self, image: str) -> str:
         return self._run("docker", "run", "--rm", "--entrypoint", "pip", image, "freeze")
 
     def container_logs(self, name: str) -> str:
-        return subprocess.run(["docker", "logs", name], capture_output=True, text=True).stdout + \
-               subprocess.run(["docker", "logs", name], capture_output=True, text=True).stderr
+        return subprocess.run(["docker", "logs", name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True).stdout
