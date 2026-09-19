@@ -1,0 +1,32 @@
+# Shared defaults for every sweep. Every value here is recorded per run in config.yaml.
+phase: p0b
+model: Qwen/Qwen2.5-3B-Instruct-AWQ
+model_revision: "3559b226e8ce77211e2c1bd7ddfb7686fec4d6dd"
+quantization: awq
+draft_model: Qwen/Qwen2.5-0.5B-Instruct
+draft_revision: "7ae557604adf67be50417f59c2c2f167def9a775"
+draft_quantization: null
+spec_method: "off"  # PyYAML's YAML-1.1 resolver parses a bare `off` as boolean False
+spec_k: null
+ngram_lookup_max: 4
+load_mode: concurrency
+concurrency: 8
+request_rate: null
+burstiness: 1.0
+num_prompts: 200
+cache_state: cold
+prefix_caching: true
+max_model_len: 2048
+max_num_seqs: 32
+chunked_prefill_tokens: 1024
+cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+sampling: {temperature: 1.0, top_p: 1.0, top_k: -1, repetition_penalty: 1.0}
+ignore_eos: true
+max_tokens_cap: null
+warmup_requests: 8
+cooldown_temp_c: 50
+cooldown_min_s: 90
+try_clock_pin: false
+gpu_headroom_mb: 256
+seed: 0
+extra_body: {}

@@ -1,0 +1,10 @@
+base: bench/configs/base.yaml
+sweep_id: p0b-variance
+rq_tag: calibration
+schedule_seed: 20260919
+max_retries_total: 3
+reps: 10
+axes:
+  engine: [vllm]
+  workload: [A]
+  concurrency: [8]
