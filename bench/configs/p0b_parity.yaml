@@ -1,0 +1,18 @@
+# P0b calibration: chat-template parity check (spec §4 "Chat-template
+# parity") -- one trace row through both engines on the completions endpoint
+# (doc §6.1: the pre-templated path is parity-safe). bench.runner.probes.
+# parity_verdict compares the resulting summary.json's usage.prompt_tokens
+# across engines against the trace row's own prompt_tokens_qwen.
+base: bench/configs/base.yaml
+sweep_id: p0b-parity
+phase: p0b
+rq_tag: calibration
+schedule_seed: 20260919
+reps: 1
+axes:
+  engine: [vllm, sglang]
+  workload: [A]
+  concurrency: [1]
+num_prompts: 1
+warmup_requests: 1
+cooldown_min_s: 30

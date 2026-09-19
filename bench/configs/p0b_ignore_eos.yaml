@@ -1,0 +1,23 @@
+# P0b calibration: `ignore_eos` x acceptance-rate probe (spec §3.1) -- draft
+# and ngram speculation on vLLM, with and without --ignore-eos, over 100
+# chat_v1 (workload A) prompts. The client passes --ignore-eos only when
+# true; with false the engine stops at the natural EOS and output_lens may be
+# shorter than output_tokens -- that is the point (doc's pre-registered
+# handling: report acceptance over the natural-length prefix if the two
+# diverge by more than 10% relative). bench.runner.probes.acceptance_delta
+# compares the two rates from this sweep's summary.json files.
+base: bench/configs/base.yaml
+sweep_id: p0b-ignore-eos
+phase: p0b
+rq_tag: calibration
+schedule_seed: 20260919
+reps: 1
+workload: A
+spec_k: 3
+concurrency: 1
+num_prompts: 100
+max_tokens_cap: 512
+axes:
+  engine: [vllm]
+  spec_method: [draft, ngram]
+  ignore_eos: [true, false]

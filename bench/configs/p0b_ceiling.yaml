@@ -1,0 +1,21 @@
+# P0b calibration: echo-server request-rate ladder -> harness ceiling (spec
+# §9 P0b exit: ceiling >= 3x the study's peak rate; §3.1's echo-server probe,
+# doc bench/docs/p0b-engine-verification.md §8). No real inference engine is
+# in the loop -- this measures the harness/client's own overhead ceiling.
+base: bench/configs/base.yaml
+sweep_id: p0b-ceiling
+phase: p0b
+rq_tag: calibration
+schedule_seed: 20260919
+max_retries_total: 2
+reps: 2
+axes:
+  engine: [echo]
+  workload: [A]
+  request_rate: [8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+load_mode: poisson
+concurrency: null
+num_prompts: 500
+cooldown_min_s: 0
+cooldown_temp_c: 99
+warmup_requests: 4

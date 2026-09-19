@@ -1,0 +1,21 @@
+# Not a sweep -- parameters for `python -m bench.runner probe <name>`
+# (bench.runner.probes.run_probe). See bench/docs/p0b-engine-verification.md
+# §7-8 (clock pinning, host telemetry) and spec §3.1 (OOM-signal, CUDA-graph
+# and host-reservation probes) for what each probe measures. `parity` and
+# `ignore_eos_acceptance` are NOT probes -- they are the p0b_parity.yaml /
+# p0b_ignore_eos.yaml sweeps; see bench/runner/probes.py's module docstring.
+oom_signal:
+  fractions: [0.90, 0.95, 0.98, 1.00]
+  baseline_fraction: 0.85
+  requests: 20
+cudagraph_cost:
+  capture_lists:
+    - [1]
+    - [1, 2, 4, 8]
+    - [1, 2, 4, 8, 16, 32]
+host_reservation:
+  idle_seconds: 60
+  load_seconds: 60
+  load_concurrency: 8
+clock_pin:
+  sm_mhz: 2055

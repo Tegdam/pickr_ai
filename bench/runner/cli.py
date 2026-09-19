@@ -1,23 +1,29 @@
 """python -m bench.runner <check-env|run|resume|probe> (spec §6 "check-env";
-ruling: CLI surface for the sweep loop). `probe` is Task 10's territory."""
+ruling: CLI surface for the sweep loop)."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
 import subprocess
+import time
 from pathlib import Path
+
+import yaml
 
 from .client import CLIENT_IMAGE, build_client_image
 from .docker import Docker
 from .engine import ENGINES
 from .gpu_monitor import WIN_SMI, WSL_SMI, read_gpu
-from .lifecycle import run_sweep
+from .lifecycle import RunPaths, run_sweep
+from .probes import PROBE_ORDER, run_probe
 from .sweep import WORKLOAD_TRACES, load_sweep, sweep_options
 
 DEFAULT_RESULTS_ROOT = "bench/results"
 DEFAULT_HF_CACHE = str(Path.home() / ".cache" / "huggingface")
 DEFAULT_COMPILE_CACHE = str(Path(DEFAULT_RESULTS_ROOT) / ".cache")
+DEFAULT_PROBE_PARAMS = "bench/configs/p0b_probes.yaml"
+DEFAULT_TRACES_DIR = "bench/traces"
 
 
 def _image_present(image: str) -> bool:
@@ -144,8 +150,25 @@ def _cmd_resume(a) -> int:
 
 
 def _cmd_probe(a) -> int:
-    print("see Task 10")
-    return 2
+    """Task 10: `probe <name>` runs one of `bench.runner.probes.PROBE_ORDER`
+    (or every one of them, in that order, for `<name>` omitted/"all"), reading
+    parameters from `--params` (default `bench/configs/p0b_probes.yaml`).
+    Each probe writes its own `bench/results/probes/<name>-<timestamp>.json`
+    even on failure (`run_probe`'s own contract) -- this only decides the
+    process exit code from whether any probe recorded an `error`."""
+    params = yaml.safe_load(Path(a.params).read_text(encoding="utf-8"))
+    paths = RunPaths(
+        results_root=Path(a.results), sweep_dir=Path(a.results) / "probes",
+        run_dir=Path(a.results) / "probes" / "_scratch",
+        traces_dir=Path(DEFAULT_TRACES_DIR), hf_cache_dir=Path(a.hf_cache),
+        compile_cache_root=Path(a.compile_cache),
+    )
+    result = run_probe(a.name, params, paths, docker=Docker(), http=_http_module(),
+                        gpu_reader=read_gpu, popen=subprocess.Popen, sleep=time.sleep,
+                        clock=time.monotonic)
+    print(json.dumps(result, indent=2))
+    errors = ([r.get("error") for r in result.values()] if a.name == "all" else [result.get("error")])
+    return 0 if not any(errors) else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -173,7 +196,11 @@ def build_parser() -> argparse.ArgumentParser:
     rs.set_defaults(fn=_cmd_resume)
 
     pr = sub.add_parser("probe")
-    pr.add_argument("name", nargs="?", default=None)
+    pr.add_argument("name", nargs="?", default="all", choices=[*PROBE_ORDER, "all"])
+    pr.add_argument("--params", default=DEFAULT_PROBE_PARAMS)
+    pr.add_argument("--results", default=DEFAULT_RESULTS_ROOT)
+    pr.add_argument("--hf-cache", default=DEFAULT_HF_CACHE)
+    pr.add_argument("--compile-cache", default=DEFAULT_COMPILE_CACHE)
     pr.set_defaults(fn=_cmd_probe)
 
     return p
