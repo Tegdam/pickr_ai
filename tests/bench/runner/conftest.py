@@ -23,6 +23,7 @@ class FakeDocker:
         self.exit_codes = {}
         self.fail_next = False
         self.keep_running = False
+        self.images_present = {}  # image -> bool; missing key defaults to True
 
     def run(self, image, name, args, gpus=True, network_host=True, mounts=(), env=None, entrypoint=None, extra_args=None):
         self.calls.append({
@@ -59,6 +60,9 @@ class FakeDocker:
 
     def ps_names(self):
         return sorted(self.running)
+
+    def image_present(self, image):
+        return self.images_present.get(image, True)
 
     def build(self, tag, dockerfile, context):
         self.calls.append({"op": "build", "tag": tag, "dockerfile": dockerfile, "context": context})

@@ -4,6 +4,7 @@ to pass in (see bench/runner/engine.py)."""
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 
 class Docker:
@@ -16,12 +17,21 @@ class Docker:
 
     def run(self, image, name, args, gpus=True, network_host=True, mounts=(), env=None,
             entrypoint=None, extra_args=None) -> str:
-        cmd = ["docker", "run", "-d", "--name", name, "--ipc=host"]
+        # C1/P28 minor: no --ipc=host -- with it set, docker silently ignores
+        # --shm-size (the engines' own docker_extra_args), so /dev/shm stayed
+        # at docker's tiny 64 MiB default regardless of the "--shm-size 2g" we
+        # thought we were passing.
+        cmd = ["docker", "run", "-d", "--name", name]
         if gpus:
             cmd += ["--gpus", "all"]
         if network_host:
             cmd += ["--network", "host"]
         for host_path, container_path, mode in mounts:
+            # C1/P28: docker rejects a relative -v source outright ("<path>
+            # includes invalid characters for a local volume name") --
+            # resolve every host-side mount path to absolute before building
+            # the flag, regardless of what the caller passed in.
+            host_path = str(Path(host_path).expanduser().resolve())
             cmd += ["-v", f"{host_path}:{container_path}:{mode}"]
         for k, v in (env or {}).items():
             cmd += ["-e", f"{k}={v}"]
@@ -30,6 +40,11 @@ class Docker:
         if entrypoint:
             cmd += ["--entrypoint", entrypoint]
         return self._run(*cmd, image, *args)
+
+    def image_present(self, image: str) -> bool:
+        """I4/P33: pre-flight checks this before launching -- `docker image
+        inspect` exits non-zero (empty stdout) when the image is missing."""
+        return bool(self._run("docker", "image", "inspect", image, check=False))
 
     def stop(self, name: str, timeout: int = 30) -> None:
         self._run("docker", "stop", "-t", str(timeout), name, check=False)
