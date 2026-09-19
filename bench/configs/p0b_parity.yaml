@@ -2,7 +2,10 @@
 # parity") -- one trace row through both engines on the completions endpoint
 # (doc §6.1: the pre-templated path is parity-safe). bench.runner.probes.
 # parity_verdict compares the resulting summary.json's usage.prompt_tokens
-# across engines against the trace row's own prompt_tokens_qwen.
+# across engines against the trace row's own prompt_tokens_qwen. In practice
+# the analysis reads requests.jsonl[0].prompt_tokens per engine (num_prompts:
+# 1 below, so index 0 is the run's only request) rather than re-deriving
+# usage.prompt_tokens from summary.json.
 base: bench/configs/base.yaml
 sweep_id: p0b-parity
 phase: p0b

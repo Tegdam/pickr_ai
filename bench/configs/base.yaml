@@ -19,7 +19,9 @@ cache_state: cold
 prefix_caching: true
 max_model_len: 2048
 max_num_seqs: 32
-chunked_prefill_tokens: 1024
+chunked_prefill_tokens: 2048  # smoke-verified value (ruling P11 text)
+# The pinned capture list's trailing "...64" is a pin the parity smoke verifies --
+# do not resize it without re-running that smoke and updating the doc.
 cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
 sampling: {temperature: 1.0, top_p: 1.0, top_k: -1, repetition_penalty: 1.0}
 ignore_eos: true
