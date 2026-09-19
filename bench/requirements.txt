@@ -5,3 +5,6 @@ langsmith            # already an app dep; listed so bench installs standalone
 numpy
 pandas
 pytest
+pyyaml               # P0b runner: config.yaml per run
+requests             # P0b runner: engine health / cache-reset / metrics scrapes
+aiohttp              # P0b runner: multi-turn replayer and concurrent mixed-load client
