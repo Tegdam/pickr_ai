@@ -1,25 +1,15 @@
 """P0b hardware/harness calibration probes (spec §3.1, §9 P0b exit; doc
 bench/docs/p0b-engine-verification.md §7-8).
 
-Five pure functions, unit-tested directly against hand-built inputs:
+The five pure calibration-reducer functions this module used to define
+directly now live in `bench.analysis.reducers`:
 
-- `ceiling_from_rows`: reduces the echo-server request-rate ladder
-  (`p0b_ceiling.yaml`'s `summary.json`s) to the harness ceiling (spec §9:
-  ceiling >= 3x the study's peak rate).
-- `ceiling_rows_from_sweep`: reads a real (or fixture) `p0b-ceiling` sweep
-  directory's per-run `config.yaml`/`summary.json` files and averages reps
-  per `request_rate`, producing `ceiling_from_rows`'s input directly.
-- `parity_verdict`: reduces the chat-template parity sweep
-  (`p0b_parity.yaml`'s `summary.json`s, one `usage.prompt_tokens` per engine)
-  to a pass/fail against the trace row's own token count (spec §4).
-- `acceptance_delta`: the pre-registered `ignore_eos` x acceptance-rate rule
-  (spec §3.1): a >10% relative divergence between the with/without
-  `--ignore-eos` acceptance rates means P2 reports acceptance over the
-  natural-length prefix only.
-- `throttle_baseline`: per-bit `clocks_throttle_reasons.active` fractions
-  over a set of GPU samples (the `host_reservation` probe's idle phase),
-  reusing `summary._throttle_bits_fraction`/`_throttle_reason_values` so the
-  bit semantics never drift from `summary.py`'s.
+- `ceiling_from_rows`, `ceiling_rows_from_sweep`, `parity_verdict`,
+  `acceptance_delta`, `throttle_baseline`: moved to `bench.analysis.reducers`
+  (final-review fix wave, Minors) so the P0b calibration analysis can run
+  standalone, without pulling in this module's docker/subprocess/GPU
+  machinery -- imported back here so existing call sites (`probes.foo(...)`)
+  are unaffected. See that module's docstring for what each one does.
 
 `parity` and `ignore_eos_acceptance` are **not** probes run by this module --
 they are the `p0b_parity.yaml` / `p0b_ignore_eos.yaml` sweeps (ordinary
@@ -57,112 +47,22 @@ from pathlib import Path
 
 import yaml
 
+from bench.analysis.reducers import (
+    acceptance_delta, ceiling_from_rows, ceiling_rows_from_sweep, parity_verdict, throttle_baseline,
+)
+
 from .config import RunConfig, resolve_gpu_memory_fraction, validate
-from .engine import ENGINES
+from .engine import ENGINES, EngineSpec
 from .gpu_monitor import WIN_SMI, WSL_SMI, read_gpu
 from .lifecycle import PreflightError, RunPaths, _read_trace_rows, _wait_vram_return, start_engine, stop_engine
+from .paths import REPO_ROOT as _REPO_ROOT
 from .readiness import wait_healthy, warmup
-from .summary import _throttle_bits_fraction, _throttle_reason_values
 from .sweep import expand, load_sweep
 
-# ---------------------------------------------------------------------------
-# Pure functions (unit-tested directly).
-# ---------------------------------------------------------------------------
-
-
-def ceiling_from_rows(rows: list[dict]) -> dict:
-    """Spec §9 P0b exit: the harness ceiling is the highest `request_rate` R
-    (from `p0b_ceiling.yaml`'s per-rate `summary.json`s, one row per rate:
-    `{"request_rate", "req_s", "ttft_p99_ms"}`) at which the achieved
-    `req_s >= 0.95 * R` AND `ttft_p99_ms` stays within 2x of the lowest
-    rate's `ttft_p99_ms` (the harness/client is not itself the bottleneck).
-    Returns `{"ceiling_req_s": R or None, "table": rows sorted by rate, each
-    with a "passes" bool}`."""
-    sorted_rows = sorted(rows, key=lambda r: r["request_rate"])
-    if not sorted_rows:
-        return {"ceiling_req_s": None, "table": []}
-
-    baseline_ttft = sorted_rows[0]["ttft_p99_ms"]
-    table: list[dict] = []
-    ceiling: float | None = None
-    for row in sorted_rows:
-        passes = (
-            row["req_s"] >= 0.95 * row["request_rate"]
-            and row["ttft_p99_ms"] <= 2 * baseline_ttft
-        )
-        table.append({**row, "passes": passes})
-        if passes:
-            ceiling = row["request_rate"]
-    return {"ceiling_req_s": ceiling, "table": table}
-
-
-def ceiling_rows_from_sweep(sweep_dir) -> list[dict]:
-    """Reads a `p0b-ceiling` sweep directory's per-run `config.yaml`
-    (`request_rate`) and `summary.json` (`req_s`, `ttft_p99_client`) and
-    averages reps per rate, producing `ceiling_from_rows`'s input directly
-    from a real (or fixture) sweep directory. Runs missing either file, or
-    whose `config.yaml` carries no `request_rate` (not a poisson-mode run),
-    are skipped."""
-    sweep_dir = Path(sweep_dir)
-    by_rate: dict[float, list[dict]] = {}
-    for run_dir in sorted(p for p in sweep_dir.iterdir() if p.is_dir()):
-        config_path, summary_path = run_dir / "config.yaml", run_dir / "summary.json"
-        if not config_path.exists() or not summary_path.exists():
-            continue
-        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        rate = cfg.get("request_rate")
-        if rate is None:
-            continue
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        by_rate.setdefault(rate, []).append({
-            "req_s": summary.get("req_s"),
-            "ttft_p99_ms": summary.get("ttft_p99_client"),
-        })
-
-    rows = []
-    for rate, entries in by_rate.items():
-        req_s_vals = [e["req_s"] for e in entries if e["req_s"] is not None]
-        ttft_vals = [e["ttft_p99_ms"] for e in entries if e["ttft_p99_ms"] is not None]
-        rows.append({
-            "request_rate": rate,
-            "req_s": statistics.fmean(req_s_vals) if req_s_vals else None,
-            "ttft_p99_ms": statistics.fmean(ttft_vals) if ttft_vals else None,
-        })
-    return rows
-
-
-def parity_verdict(prompt_tokens_by_engine: dict[str, int], expected: int) -> dict:
-    """Spec §4 chat-template parity: pass iff `prompt_tokens_by_engine` is
-    non-empty and every engine's reported `usage.prompt_tokens` equals
-    `expected` (the trace row's own `prompt_tokens_qwen`) -- an empty dict
-    never passes vacuously."""
-    return {
-        "pass": bool(prompt_tokens_by_engine) and all(v == expected for v in prompt_tokens_by_engine.values()),
-        "values": dict(prompt_tokens_by_engine),
-        "expected": expected,
-    }
-
-
-def acceptance_delta(with_ignore_eos: float | None, without: float | None) -> dict:
-    """Spec §3.1 pre-registered rule: if the with/without `--ignore-eos`
-    acceptance rates differ by more than 10% relative, P2 reports acceptance
-    over the natural-length prefix only. `rel_diff` is `None` (and the rule
-    does not apply) when either rate is missing or `without` is zero."""
-    if with_ignore_eos is None or without is None or without == 0:
-        return {"rel_diff": None, "prefix_rule_applies": False}
-    rel_diff = (with_ignore_eos - without) / without
-    return {"rel_diff": rel_diff, "prefix_rule_applies": abs(rel_diff) > 0.10}
-
-
-def throttle_baseline(gpu_rows: list[dict]) -> dict:
-    """Per-bit fraction of samples (with a non-None `throttle_reasons`)
-    having each `clocks_throttle_reasons.active` bit set, over `gpu_rows`
-    (the `host_reservation` probe's idle-phase samples). Reuses
-    `summary._throttle_bits_fraction`/`_throttle_reason_values` directly --
-    the exact computation `build_summary` uses for a real run -- so the bit
-    semantics never drift from `summary.py`'s."""
-    return _throttle_bits_fraction(_throttle_reason_values(gpu_rows))
-
+__all__ = [
+    "acceptance_delta", "ceiling_from_rows", "ceiling_rows_from_sweep", "parity_verdict", "throttle_baseline",
+    "PROBE_ORDER", "run_probe",
+]
 
 # ---------------------------------------------------------------------------
 # Orchestration (thin, injectable; see module docstring).
@@ -177,7 +77,9 @@ _OOM_RE = re.compile(
 _GRAPH_GIB_RE = re.compile(r"graph capturing finished in.*?took\s+([0-9.]+)\s*gi?b", re.IGNORECASE)
 _KV_TOKENS_RE = re.compile(r"gpu kv cache size:\s*([0-9,]+)\s*tokens", re.IGNORECASE)
 
-_BASE_YAML = Path("bench/configs/base.yaml")
+# C1/P28: anchored to the repo root, not left relative -- the probe CLI may
+# be invoked from anywhere.
+_BASE_YAML = _REPO_ROOT / "bench" / "configs" / "base.yaml"
 
 
 def _preflight_guard(docker) -> None:
@@ -214,15 +116,23 @@ def _load_base_capture_sizes() -> list[int]:
     return list(base["cudagraph_capture_sizes"])
 
 
-def _resolve_mem_fraction_and_free(gpu_reader, headroom_mb: int = 256) -> tuple[int, float]:
+def _resolve_mem_fraction_and_free(gpu_reader, spec: EngineSpec, headroom_mb: int = 256) -> tuple[int, float]:
     """Same measurement `lifecycle.run_one` step 1 makes: fraction/free VRAM
-    from a fresh Windows-side reading, never 0.9 by reflex (spec §3.1)."""
+    from a fresh Windows-side reading, never 0.9 by reflex (spec §3.1). C2/P29:
+    `spec.mem_headroom_mb` is added on top of `headroom_mb` and the result is
+    capped at `spec.max_mem_fraction`, exactly like `run_one`'s own
+    pre-flight -- these probes launch the same engine the same way, so they
+    must resolve the same fraction it would."""
     win = gpu_reader(WIN_SMI)
     total_mb, used_mb = win.get("total_mb"), win.get("used_mb")
     if total_mb is None or used_mb is None:
         raise RuntimeError(f"gpu reader returned no usable total_mb/used_mb: {win}")
     free_mb = total_mb - used_mb
-    return free_mb, resolve_gpu_memory_fraction(total_mb, used_mb, headroom_mb)
+    frac = min(
+        resolve_gpu_memory_fraction(total_mb, used_mb, headroom_mb + spec.mem_headroom_mb),
+        spec.max_mem_fraction,
+    )
+    return free_mb, frac
 
 
 def _gpu_pair_sample(gpu_reader) -> dict:
@@ -250,6 +160,30 @@ def _stats(values: list[float]) -> dict:
     if not values:
         return {"mean": None, "min": None, "max": None, "n": 0}
     return {"mean": statistics.fmean(values), "min": min(values), "max": max(values), "n": len(values)}
+
+
+def _views_track_each_other(win_vals: list[float], wsl_vals: list[float]) -> bool | None:
+    """I6: do the Windows-side and WSL-side nvidia-smi `used_mb` series move
+    together closely enough that `used_host_mb` (their difference) carries no
+    real signal on this WSL2 build? True if every paired sample's absolute
+    difference stays under 100 MiB, OR (when there's enough spread to compute
+    one) their Pearson correlation is >= 0.95. `None` when there are no paired
+    samples to compare at all."""
+    pairs = [(w, s) for w, s in zip(win_vals, wsl_vals) if w is not None and s is not None]
+    if not pairs:
+        return None
+    if max(abs(w - s) for w, s in pairs) < 100:
+        return True
+    if len(pairs) < 2:
+        return False
+    win_series, wsl_series = zip(*pairs)
+    if len(set(win_series)) < 2 or len(set(wsl_series)) < 2:
+        return False  # a constant series has no defined correlation
+    try:
+        corr = statistics.correlation(win_series, wsl_series)
+    except (statistics.StatisticsError, AttributeError):
+        return False
+    return corr >= 0.95
 
 
 def _probe_clock_pin(params: dict, paths: RunPaths, *, docker, http, gpu_reader, popen, sleep, clock) -> dict:
@@ -305,12 +239,12 @@ def _probe_host_reservation(params: dict, paths: RunPaths, *, docker, http, gpu_
     idle_rows = _sample_for(gpu_reader, idle_seconds, sleep, clock, interval_s)
     idle_used = [r["used_host_mb"] for r in idle_rows if r.get("used_host_mb") is not None]
 
+    spec = ENGINES["vllm"]
     cfg = _probe_run_config(paths, run_id=f"probe-host-reservation-{int(clock())}")
-    free_mb, frac = _resolve_mem_fraction_and_free(gpu_reader)
+    free_mb, frac = _resolve_mem_fraction_and_free(gpu_reader, spec)
     cfg.free_vram_mb_at_start, cfg.gpu_memory_utilization = free_mb, frac
     validate(cfg)
 
-    spec = ENGINES["vllm"]
     pre_used = gpu_reader(WSL_SMI).get("used_mb")
     load_rows: list[dict] = []
     vram_returned_mb = vram_leak_mb = None
@@ -339,12 +273,22 @@ def _probe_host_reservation(params: dict, paths: RunPaths, *, docker, http, gpu_
         load_stats["mean"] - idle_stats["mean"]
         if idle_stats["mean"] is not None and load_stats["mean"] is not None else None
     )
+    # I6: both nvidia-smi views' own used_mb series, over idle and load, plus
+    # whether they track each other closely enough that the Windows-view-
+    # minus-WSL-view "host share" is actually observable on this WSL2 build
+    # (see gpu_monitor.view_diff_mb / env_capture.host_view_note).
+    idle_win = [r["win"].get("used_mb") for r in idle_rows if r.get("win", {}).get("used_mb") is not None]
+    idle_wsl = [r["wsl"].get("used_mb") for r in idle_rows if r.get("wsl", {}).get("used_mb") is not None]
+    load_win = [r["win"].get("used_mb") for r in load_rows if r.get("win", {}).get("used_mb") is not None]
+    load_wsl = [r["wsl"].get("used_mb") for r in load_rows if r.get("wsl", {}).get("used_mb") is not None]
     return {
-        "idle": {"used_host_mb": idle_stats, "throttle_baseline": throttle_baseline(idle_rows)},
-        "load": {"used_host_mb": load_stats},
+        "idle": {"used_host_mb": idle_stats, "throttle_baseline": throttle_baseline(idle_rows),
+                 "win_used_mb": _stats(idle_win), "wsl_used_mb": _stats(idle_wsl)},
+        "load": {"used_host_mb": load_stats, "win_used_mb": _stats(load_win), "wsl_used_mb": _stats(load_wsl)},
         "drift_mb": drift_mb,
         "vram_returned_mb": vram_returned_mb,
         "vram_leak_mb": vram_leak_mb,
+        "views_track_each_other": _views_track_each_other(idle_win + load_win, idle_wsl + load_wsl),
     }
 
 
@@ -379,7 +323,7 @@ def _probe_cudagraph_cost(params: dict, paths: RunPaths, *, docker, http, gpu_re
 
     for i, sizes in enumerate(capture_lists):
         try:
-            free_mb, frac = _resolve_mem_fraction_and_free(gpu_reader)
+            free_mb, frac = _resolve_mem_fraction_and_free(gpu_reader, spec)
             cfg = _probe_run_config(paths, run_id=f"probe-cudagraph-{i}")
             cfg.cudagraph_capture_sizes = list(sizes)
             cfg.free_vram_mb_at_start, cfg.gpu_memory_utilization = free_mb, frac
@@ -513,6 +457,10 @@ def _classify_oom_outcome(ladder_results: list[dict]) -> dict:
     (`baseline_failed` is handled one level up, before the ladder even
     runs; see `_probe_oom_signal`). Rules, in order:
 
+    0. (I7) Any rung whose `vram_leak_mb` (when not `None`) exceeds 512 MiB
+       -> `inconclusive` -- `_probe_oom_signal` stops the ladder the instant
+       this happens (a leaked rung poisons every fraction's "free VRAM"
+       measurement after it), so this fires on the ladder's own last entry.
     1. Any `slow_or_hung` fraction anywhere in the ladder -> `spill_suspected`
        -- a live-but-glacial (paging) container IS the paging signature
        itself, not something to fall through past. (Fix round 1 made this
@@ -532,6 +480,12 @@ def _classify_oom_outcome(ladder_results: list[dict]) -> dict:
     Returns `{"outcome": ..., "outcome_reason": ...}` -- the reason names
     which rule fired and the fraction that triggered it, so a human reading
     `oom_signal-*.json` doesn't have to re-derive the verdict."""
+    for r in ladder_results:
+        leak = r.get("vram_leak_mb")
+        if leak is not None and leak > 512:
+            return {"outcome": "inconclusive",
+                    "outcome_reason": f"vram did not return after fraction {r['fraction']} (leak {leak} MiB)"}
+
     for r in ladder_results:
         if r.get("outcome") == "slow_or_hung":
             return {"outcome": "spill_suspected",
@@ -637,6 +591,13 @@ def _probe_oom_signal(params: dict, paths: RunPaths, *, docker, http, gpu_reader
             r = {"fraction": frac, "outcome": "probe_error", "detail": str(e), "error_type": type(e).__name__}
         ladder_results.append(r)
         runs.append(r)
+        # I7: a rung whose VRAM never returned poisons every fraction after
+        # it (the "free VRAM" this ladder measures against is no longer
+        # real) -- stop climbing; _classify_oom_outcome reads this same
+        # ladder_results and returns `inconclusive` for it.
+        leak = r.get("vram_leak_mb")
+        if leak is not None and leak > 512:
+            break
 
     return {
         "baseline_fraction": baseline_fraction, "fractions": fractions,
