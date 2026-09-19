@@ -26,6 +26,16 @@ def test_engines_are_verified_and_complete():
         for k in ("kv_usage", "running", "waiting", "spec_accepted", "spec_draft", "spec_drafts", "prefix_hits", "prefix_queries"):
             assert k in e.metric_names, (name, k)
         assert e.health_path.startswith("/") and e.reset_cache_path.startswith("/") and e.metrics_path == "/metrics"
+        assert e.mem_headroom_mb >= 0 and 0 < e.max_mem_fraction <= 1.0
+
+
+def test_per_engine_mem_headroom_and_cap():
+    """C2/P29: SGLang needs materially more headroom than vLLM (doc §7 smoke
+    footprints), and each engine's fraction is capped until an OOM probe says
+    otherwise; the echo engine has no GPU engine in the loop at all."""
+    assert ENGINES["vllm"].mem_headroom_mb == 512 and ENGINES["vllm"].max_mem_fraction == 0.90
+    assert ENGINES["sglang"].mem_headroom_mb == 1280 and ENGINES["sglang"].max_mem_fraction == 0.80
+    assert ENGINES["echo"].mem_headroom_mb == 0 and ENGINES["echo"].max_mem_fraction == 1.0
 
 
 def test_readiness_route_and_timeout():

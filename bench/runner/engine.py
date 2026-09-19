@@ -31,6 +31,18 @@ class EngineSpec:
     metric_names: dict[str, str]
     env: dict[str, str]
     docker_extra_args: list[str]
+    # C2/P29: per-engine memory headroom on top of the sweep's own
+    # gpu_headroom_mb -- SGLang's static allocation plus CUDA-graph capture
+    # needs materially more slack than vLLM's, and the shared
+    # resolve_gpu_memory_fraction(6141, 0, 256) = 0.95 formula (before this
+    # ruling) left SGLang with no margin at all (observed 5.3-5.9 GiB of 6.1
+    # used at fraction 0.80) while sitting vLLM right at its own startup-check
+    # edge. Values are the contract doc §7 smoke footprints; mem_headroom_mb
+    # is added to gpu_headroom_mb before resolve_gpu_memory_fraction, and
+    # max_mem_fraction is a hard cap on top of that until the OOM probe
+    # (Task 11 runbook) raises it from an observed clean boundary.
+    mem_headroom_mb: int
+    max_mem_fraction: float
     _launch: Callable[[RunConfig, float], list[str]] = field(repr=False)
 
     def build_launch_args(self, cfg: RunConfig, mem_fraction: float) -> list[str]:
@@ -189,6 +201,7 @@ ENGINES: dict[str, EngineSpec] = {
             "VLLM_SERVER_DEV_MODE": "1",                                    # T1 P6 (doc §8: mounts /reset_prefix_cache)
         },
         docker_extra_args=["--shm-size", "2g"],                             # controller decision (doc §8 intro): both engines get it
+        mem_headroom_mb=512, max_mem_fraction=0.90,                          # C2/P29 (doc §7 smoke footprints)
         _launch=_vllm_args,
     ),
     "sglang": EngineSpec(
@@ -219,6 +232,11 @@ ENGINES: dict[str, EngineSpec] = {
             "HF_HUB_OFFLINE": "1",                                          # T1 (doc §8 "Common to every container")
         },
         docker_extra_args=["--shm-size", "2g"],                             # T1 (doc §8: used in all SGLang smokes)
+        # C2/P29 (doc §7): SGLang's static allocation + CUDA-graph capture sat
+        # at 5.3-5.9 GiB of 6.1 at fraction 0.80 alone -- 1280 MiB headroom on
+        # top of the sweep's own gpu_headroom_mb, capped at 0.80 until an OOM
+        # probe says otherwise.
+        mem_headroom_mb=1280, max_mem_fraction=0.80,
         _launch=_sglang_args,
     ),
     "echo": EngineSpec(
@@ -254,6 +272,7 @@ ENGINES: dict[str, EngineSpec] = {
         },
         env={},
         docker_extra_args=[],
+        mem_headroom_mb=0, max_mem_fraction=1.0,                             # C2/P29: no GPU engine in the loop at all
         _launch=lambda cfg, mem: ["--port", str(ECHO_PORT), "--per-token-ms", "5"],
     ),
 }

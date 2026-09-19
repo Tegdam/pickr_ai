@@ -47,6 +47,9 @@ class RunConfig:
     cudagraph_capture_sizes: list[int]
     sampling: dict
     ignore_eos: bool
+    # Unused until P3 (natural termination) -- the client always passes
+    # per-row output_tokens (--custom-output-len -1), so nothing in P0b reads
+    # this yet.
     max_tokens_cap: int | None
     warmup_requests: int
     cooldown_temp_c: int
@@ -55,6 +58,12 @@ class RunConfig:
     free_vram_mb_at_start: int
     seed: int
     extra_body: dict = field(default_factory=dict)
+    # C2/P29: gpu_headroom_mb (sweep-level) + spec.mem_headroom_mb
+    # (per-engine) -- recorded next to gpu_memory_utilization so config.yaml
+    # shows the full headroom actually applied, not just the sweep's own
+    # knob. Default 0 so callers/tests that never set it (pre-C2) still
+    # round-trip.
+    mem_headroom_mb_total: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
