@@ -121,6 +121,14 @@ def capture_env(cfg, docker, spec: EngineSpec, launch_args: list[str], client_im
         # not only when the caller happens to pass them in `extra`.
         "clocks_pinned": extra.get("clocks_pinned", False),
         "client_output_schema_version": extra.get("client_output_schema_version"),
+        # I6: makes gpu_samples.jsonl's used_host_mb honest to a reader --
+        # see gpu_monitor.py's own view_diff_mb (the same difference, not
+        # clamped) and probes._probe_host_reservation's views_track_each_other.
+        "host_view_note": (
+            "used_host_mb = Windows view - WSL view; if the two views track "
+            "each other on this WSL2 build, host share is unobservable and "
+            "used_host_mb ~= 0 (see host_reservation probe)"
+        ),
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
     env.update(_host_lines())

@@ -37,7 +37,31 @@ def test_sampler_writes_host_and_ours(tmp_path):
     s.stop()
     assert len(rows) >= 3
     assert rows[0]["used_total_mb"] == 1000 and rows[0]["used_ours_mb"] == 700 and rows[0]["used_host_mb"] == 300
+    assert rows[0]["view_diff_mb"] == 300  # I6: same value here (win >= wsl), but never clamped
     assert "t" in rows[0] and "wall" in rows[0] and rows[0]["power_w"] == 20.0
+
+
+def test_sampler_view_diff_mb_is_not_clamped_when_negative(tmp_path):
+    """I6: `used_host_mb` clamps to 0 when the WSL view reads higher than the
+    Windows one, but `view_diff_mb` must carry the real (negative) signal so
+    analysis can see the two views diverge in either direction."""
+    def reader(cmd):
+        # WSL-side reads HIGHER than Windows-side here (win used=700, wsl used=1000).
+        return {"used_mb": 700 if "exe" in cmd[0] else 1000, "total_mb": 6141, "sm_util": 1, "mem_util": 1,
+                "sm_clock": 1, "mem_clock": 1, "temp_c": 50, "power_w": 20.0, "throttle_reasons": "0x0"}
+
+    s = GpuSampler(tmp_path / "g.jsonl", interval_s=0.01, wsl_cmd=["nvidia-smi"], win_cmd=["nvidia-smi.exe"], reader=reader)
+    s.start()
+    path = tmp_path / "g.jsonl"
+    rows: list[dict] = []
+    deadline = time.monotonic() + 5
+    while len(rows) < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+        if path.exists():
+            rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    s.stop()
+    assert rows[0]["used_host_mb"] == 0  # clamped
+    assert rows[0]["view_diff_mb"] == -300  # not clamped
 
 
 def test_sampler_records_reader_errors_instead_of_dying(tmp_path):

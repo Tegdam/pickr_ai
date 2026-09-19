@@ -13,8 +13,9 @@ def test_capture_env_has_the_spec_fields(fake_docker, monkeypatch):
     for k in ("image", "image_digest", "pip_freeze", "wsl_nvidia_smi", "win_nvidia_smi", "power_max_limit_w", "uname",
               "docker_version", "windows_power_mode", "clocks_pinned", "client_image", "client_output_schema_version",
               "bench_git_sha", "launch_cmd", "captured_at", "engine_env", "docker_extra_args", "quantization_kernel",
-              "compile_cache_mounted", "clock_pin_note", "transformers_version"):
+              "compile_cache_mounted", "clock_pin_note", "transformers_version", "host_view_note"):
         assert k in env, k
+    assert "used_host_mb" in env["host_view_note"]  # I6
     assert env["image_digest"].startswith("sha256:") and env["launch_cmd"] == ["--model", "m"]
     assert env["engine_env"] == ENGINES["vllm"].env and env["docker_extra_args"] == ENGINES["vllm"].docker_extra_args
     assert env["quantization_kernel"] is None and env["compile_cache_mounted"] is False

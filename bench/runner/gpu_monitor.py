@@ -101,8 +101,16 @@ class GpuSampler:
         row["used_total_mb"] = win["used_mb"] if win else None
         if wsl and win and wsl["used_mb"] is not None and win["used_mb"] is not None:
             row["used_host_mb"] = max(0, win["used_mb"] - wsl["used_mb"])
+            # I6: the same difference, but NOT clamped to 0 -- lets analysis
+            # see whether the two nvidia-smi views actually move together
+            # (see env_capture.host_view_note / probes._probe_host_reservation's
+            # views_track_each_other): a clamped used_host_mb alone can't
+            # distinguish "no host share" from "the WSL view briefly read
+            # higher than the Windows view."
+            row["view_diff_mb"] = win["used_mb"] - wsl["used_mb"]
         else:
             row["used_host_mb"] = None
+            row["view_diff_mb"] = None
 
         # Windows view is preferred for the shared fields (it also carries
         # power.max_limit / throttle reasons that the WSL view lacks, doc %7);
