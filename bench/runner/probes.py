@@ -53,6 +53,7 @@ from bench.analysis.reducers import (
 
 from .config import RunConfig, resolve_gpu_memory_fraction, validate
 from .engine import ENGINES, EngineSpec
+from .enginelog import parse_graph_gib, parse_kv_tokens
 from .gpu_monitor import WIN_SMI, WSL_SMI, read_gpu
 from .lifecycle import PreflightError, RunPaths, _read_trace_rows, _wait_vram_return, start_engine, stop_engine
 from .paths import REPO_ROOT as _REPO_ROOT
@@ -307,14 +308,6 @@ def _probe_host_reservation(params: dict, paths: RunPaths, *, docker, http, gpu_
     }
 
 
-def _parse_graph_gib(logs: str) -> float | None:
-    m = _GRAPH_GIB_RE.search(logs or "")
-    return float(m.group(1)) if m else None
-
-
-def _parse_kv_tokens(logs: str) -> int | None:
-    m = _KV_TOKENS_RE.search(logs or "")
-    return int(m.group(1).replace(",", "")) if m else None
 
 
 def _probe_cudagraph_cost(params: dict, paths: RunPaths, *, docker, http, gpu_reader, popen, sleep, clock) -> dict:
@@ -365,7 +358,7 @@ def _probe_cudagraph_cost(params: dict, paths: RunPaths, *, docker, http, gpu_re
                          docker=docker, container=handle.name, ready_path=spec.ready_path)
             logs = docker.container_logs(handle.name)
             entry.update(outcome="served", used_mb=gpu_reader(WSL_SMI).get("used_mb"),
-                         graph_gib=_parse_graph_gib(logs), kv_tokens=_parse_kv_tokens(logs))
+                         graph_gib=parse_graph_gib(logs), kv_tokens=parse_kv_tokens(logs))
         except Exception as e:  # noqa: BLE001 - a failed list is a probe outcome, not a crash
             entry.update(outcome="launch_failed", detail=str(e), error_type=type(e).__name__)
         finally:

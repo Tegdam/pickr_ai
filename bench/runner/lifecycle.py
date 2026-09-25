@@ -35,6 +35,7 @@ import yaml
 from .client import CLIENT_IMAGE, run_client
 from .config import RunConfig, resolve_gpu_memory_fraction, validate
 from .engine import ENGINES, EngineSpec
+from .enginelog import parse_memory_breakdown
 from .env_capture import capture_env
 from .gpu_monitor import GpuSampler, WIN_SMI, WSL_SMI, read_gpu
 from .metrics_scraper import MetricsScraper
@@ -220,6 +221,19 @@ def _compile_cache_mount(spec: EngineSpec, paths: RunPaths):
     return (str(host_dir), "/root/.cache/vllm", "rw"), True
 
 
+def compile_cache_is_warm(spec: EngineSpec, paths: RunPaths) -> bool | None:
+    """P38: a COLD torch.compile cache changes the measured memory budget --
+    vLLM profiles ~0.5 GiB more consumed memory and ~0.45 GiB more peak
+    activation, and sizes KV at 1.5 GiB (43,664 tokens) instead of 2.41 GiB
+    (70,240 tokens) for the same config. A cold first run in a sweep of
+    "identical" runs is therefore an outlier that would inflate the variance
+    floor, so every run records whether the cache was already populated."""
+    if spec.name != "vllm":
+        return None
+    host_dir = Path(paths.compile_cache_root) / "vllm"
+    return host_dir.exists() and any(host_dir.iterdir())
+
+
 def start_engine(cfg: RunConfig, spec: EngineSpec, docker, paths: RunPaths, *,
                   popen=subprocess.Popen) -> EngineHandle:
     """Step 2 (spec §6): launch the engine. Does not block for readiness --
@@ -380,7 +394,8 @@ def _cooldown(gpu_reader, cooldown_temp_c: int, cooldown_min_s: int, clock, slee
 
 
 def _record_run(cfg, spec, docker, handle, client, trace_rows, run_dir, kernel, clock_pin_note,
-                 clocks_pinned, timing, opts, wall_start, mono_anchor) -> tuple[dict, dict]:
+                 clocks_pinned, timing, opts, wall_start, mono_anchor,
+                 engine_memory=None, compile_cache_warm=None) -> tuple[dict, dict]:
     """Important 5: `write_requests`/`build_summary`/`capture_env`/
     `config.yaml`/`meta.json` are written immediately after the samplers stop
     -- NOT after `docker.stop` + the VRAM-return check + cooldown, which used
@@ -396,6 +411,8 @@ def _record_run(cfg, spec, docker, handle, client, trace_rows, run_dir, kernel, 
 
     env = capture_env(cfg, docker, spec, handle.launch_args, CLIENT_IMAGE, extra={
         "quantization_kernel": kernel,
+        "engine_memory": engine_memory or {},
+        "compile_cache_warm": compile_cache_warm,
         "clocks_pinned": clocks_pinned,
         "clock_pin_note": clock_pin_note,
         "compile_cache_mounted": handle.compile_cache_mounted,
@@ -545,6 +562,8 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
     (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg.to_dict(), sort_keys=False), encoding="utf-8")
 
     # --- 2. Launch the engine (PreflightError on a failed launch) --------
+    # P38: read BEFORE launching -- the launch itself populates the cache.
+    compile_cache_warm = compile_cache_is_warm(spec, paths)
     handle = start_engine(cfg, spec, docker, paths, popen=popen)
     log(f"launched {handle.name}: {' '.join(handle.launch_args)}")
 
@@ -569,7 +588,12 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
             ready_s = wait_healthy(http, handle.base_url, spec.health_path, spec.readiness_timeout_s,
                                     docker=docker, container=handle.name, ready_path=spec.ready_path)
         timing["ready_s"] = ready_s
-        kernel = None if spec.image is None else _quantization_kernel(docker.container_logs(handle.name))
+        engine_log_at_ready = "" if spec.image is None else docker.container_logs(handle.name)
+        kernel = None if spec.image is None else _quantization_kernel(engine_log_at_ready)
+        # P37/P38: the engine's startup log is the only authoritative source for
+        # where the 6 GB went -- nvidia-smi cannot see the WSL2 reservation and
+        # both of its views report the same device-wide figure.
+        engine_memory = parse_memory_breakdown(engine_log_at_ready) if engine_log_at_ready else {}
 
         trace_rows = _read_trace_rows(cfg)
         warmup_prompts = [r["prompt"] for r in trace_rows[: cfg.warmup_requests]]
@@ -597,7 +621,8 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
 
         # --- 7. Record artifacts NOW (Important 5) --------------------------
         summary, meta = _record_run(cfg, spec, docker, handle, client, trace_rows, run_dir, kernel,
-                                     clock_pin_note, clocks_pinned, timing, opts, wall_start, mono_anchor)
+                                     clock_pin_note, clocks_pinned, timing, opts, wall_start, mono_anchor,
+                                     engine_memory=engine_memory, compile_cache_warm=compile_cache_warm)
     except Exception as e:  # noqa: BLE001 - deliberately broad: any failure still needs cleanup below
         exc = e
         log(f"run failed: {e!r}")
