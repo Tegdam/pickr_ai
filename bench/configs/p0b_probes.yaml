@@ -5,8 +5,15 @@
 # `ignore_eos_acceptance` are NOT probes -- they are the p0b_parity.yaml /
 # p0b_ignore_eos.yaml sweeps; see bench/runner/probes.py's module docstring.
 oom_signal:
-  fractions: [0.90, 0.95, 0.98, 1.00]
-  baseline_fraction: 0.85
+  # P36: re-bracketed around the MEASURED boundary. CUDA sees 4.95/6.0 GiB free
+  # at idle (the ~1.05 GiB WSL2/WDDM reservation is invisible to nvidia-smi), so
+  # vLLM V1's init check refuses anything above free/total ~= 0.825. The old
+  # ladder (0.90-1.00, baseline 0.85) sat entirely above that line and would
+  # have reported "clean_oom at 0.90" while never testing a fraction that could
+  # serve. This ladder brackets 0.825 from both sides so the boundary, and any
+  # WDDM paging just below it, are both observable.
+  fractions: [0.80, 0.82, 0.84, 0.90]
+  baseline_fraction: 0.78
   requests: 20
 cudagraph_cost:
   # bench.runner.probes._probe_cudagraph_cost always appends base.yaml's own

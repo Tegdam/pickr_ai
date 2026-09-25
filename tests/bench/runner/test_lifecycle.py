@@ -6,9 +6,9 @@ No real docker or nvidia-smi is invoked: `gpu_reader` here stands in for
 is currently in `fake_docker.running` -- WSL-side usage is 0 before the
 engine container starts (or after it is stopped) and 3000 while it runs,
 Windows-side total/used/temp are fixed, matching the brief's calibration
-numbers (total 6141, host used 0 -> resolved fraction 0.87 for vLLM: C2/P29's
-per-engine headroom is 256 (sweep default) + 512 (vLLM) = 768, so
-(6141-0-768)*100 // 6141 == 87; temp 45 <= the default cooldown_temp_c 55).
+numbers (total 6141, host used 0 -> resolved fraction 0.79 for vLLM: P36's
+per-engine headroom is 256 (sweep default) + 1024 (vLLM) = 1280, so
+(6141-0-1280)*100 // 6141 == 79; temp 45 <= the default cooldown_temp_c 55).
 """
 from __future__ import annotations
 
@@ -143,7 +143,7 @@ def test_run_one_happy_path_writes_every_artifact_and_is_valid(tmp_path, monkeyp
     assert run_call["gpus"] is True and run_call["network_host"] is True
     assert run_call["env"] == ENGINES["vllm"].env
     assert run_call["extra_args"] == ["--shm-size", "2g"]
-    assert "--gpu-memory-utilization 0.87" in " ".join(run_call["args"])  # C2/P29: vLLM headroom 256+512=768
+    assert "--gpu-memory-utilization 0.79" in " ".join(run_call["args"])  # P36: vLLM headroom 256+1024=1280
     assert (str(paths.hf_cache_dir), "/root/.cache/huggingface", "ro") in run_call["mounts"]
     assert (str(paths.compile_cache_root / "vllm"), "/root/.cache/vllm", "rw") in run_call["mounts"]
 
@@ -161,7 +161,7 @@ def test_run_one_happy_path_writes_every_artifact_and_is_valid(tmp_path, monkeyp
     assert summary["valid"] is True
 
     config_yaml = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8"))
-    assert config_yaml["gpu_memory_utilization"] == pytest.approx(0.87)
+    assert config_yaml["gpu_memory_utilization"] == pytest.approx(0.79)
     assert config_yaml["free_vram_mb_at_start"] == WIN_TOTAL_MB - WIN_USED_MB
 
     meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
@@ -632,7 +632,7 @@ def test_run_one_writes_config_yaml_early_right_after_validate(tmp_path, monkeyp
                 port_free=_free_port)
 
     config_yaml = yaml.safe_load((paths.run_dir / "config.yaml").read_text(encoding="utf-8"))
-    assert config_yaml["gpu_memory_utilization"] == pytest.approx(0.87)
+    assert config_yaml["gpu_memory_utilization"] == pytest.approx(0.79)
 
 
 def test_run_one_wait_healthy_timeout_stops_engine_and_writes_log(tmp_path, monkeypatch, client_json):

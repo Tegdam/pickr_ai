@@ -201,7 +201,16 @@ ENGINES: dict[str, EngineSpec] = {
             "VLLM_SERVER_DEV_MODE": "1",                                    # T1 P6 (doc §8: mounts /reset_prefix_cache)
         },
         docker_extra_args=["--shm-size", "2g"],                             # controller decision (doc §8 intro): both engines get it
-        mem_headroom_mb=512, max_mem_fraction=0.90,                          # C2/P29 (doc §7 smoke footprints)
+        # P36 (measured 2026-09-25, not a smoke estimate): CUDA sees only
+        # 4.95 of 6.0 GiB free with nothing running, while BOTH nvidia-smi
+        # views report 0 MiB used -- the WSL2/WDDM reservation (~1.05 GiB) is
+        # invisible to nvidia-smi and visible only to CUDA. vLLM V1 refuses at
+        # init when free < fraction x total, so 0.87 died with "Free memory on
+        # device cuda:0 (4.95/6.0 GiB) ... less than desired GPU memory
+        # utilization (0.87, 5.22 GiB)". 0.80 is verified healthy (2.63 GiB
+        # weights+non-torch, 0.67 activation, 0.07 graphs, 1.5 KV = 43,664
+        # tokens). The hard ceiling is free/total ~= 0.825.
+        mem_headroom_mb=1024, max_mem_fraction=0.80,
         _launch=_vllm_args,
     ),
     "sglang": EngineSpec(

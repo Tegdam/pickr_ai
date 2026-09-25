@@ -13,7 +13,7 @@ def test_resolve_gpu_memory_fraction_uses_measured_free_vram():
 
 
 @pytest.mark.parametrize("engine_name, expected_fraction", [
-    ("vllm", 0.87),    # 6141 - 0 - (256+512) = 5373 -> 5373*100//6141 = 87
+    ("vllm", 0.79),    # 6141 - 0 - (256+1024) = 4861 -> 4861*100//6141 = 79 (P36: measured boundary ~0.825)
     ("sglang", 0.74),  # 6141 - 0 - (256+1280) = 4605 -> 4605*100//6141 = 74 (<= its own 0.80 cap)
     ("echo", 0.95),    # 6141 - 0 - (256+0) = 5885 -> 5885*100//6141 = 95
 ])
