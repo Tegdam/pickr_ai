@@ -22,3 +22,7 @@ data/chroma_db/
 # Benchmark run artifacts (large, regenerable from configs); traces are committed on purpose
 bench/results/
 bench/figures/
+
+# Personal walkthrough notes for the benchmark study: kept on this branch only
+# and deliberately never committed (they are prep notes, not a deliverable).
+docs/walkthrough/

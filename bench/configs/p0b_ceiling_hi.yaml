@@ -1,0 +1,32 @@
+# P0b calibration, ceiling ladder EXTENSION. The 6-rung p0b_ceiling.yaml ladder
+# passed every rung on the offered-rate criterion (ruling P30), so it bounded the
+# harness ceiling from below at >=256 req/s without locating it; these two rungs
+# push the bound to >=1024 req/s (offered rate within 1% of requested, 0 errors).
+#
+# Read the two sweeps' tables together: same base, same 500 prompts, same trace,
+# so the rungs concatenate into one ladder. Achieved req_s is NOT the criterion
+# and falls well below the offered rate at the top rungs, because req_s is
+# n / (send_window + drain_tail) and the drain tail converges on the duration of
+# the single longest trace row (257 output tokens x 5 ms/token = 1.29 s; longest
+# request measured 1.45 s). That tail is fixed while the send window halves each
+# rung, so it dominates -- an artifact of finite num_prompts against a heavy
+# -tailed output-length distribution, not client or echo-server saturation.
+# Median row is only 14 output tokens (~77 ms), so peak in-flight stays <=32
+# even at 1024 req/s.
+base: bench/configs/base.yaml
+sweep_id: p0b-ceiling-hi
+phase: p0b
+rq_tag: calibration
+schedule_seed: 20260919
+max_retries_total: 2
+reps: 2
+axes:
+  engine: [echo]
+  workload: [A]
+  request_rate: [512.0, 1024.0]
+load_mode: poisson
+concurrency: null
+num_prompts: 500
+cooldown_min_s: 0
+cooldown_temp_c: 99
+warmup_requests: 4
