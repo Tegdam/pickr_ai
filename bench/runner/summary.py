@@ -243,6 +243,16 @@ def build_summary(client: dict, requests: list[dict], gpu_rows: list[dict], metr
     summary["host_share_drift_mb"] = _host_share_drift(gpu_rows)
     summary["power_w"] = _power_stats(gpu_rows)
     summary["clock_cv"] = _clock_cv(gpu_rows)
+    # P41: clock_cv over ALL client-phase samples measures idle/boost
+    # transitions, not thermal drift, whenever the load does not fill the
+    # window -- the 2026-09-25 parity smoke (1 request, 18 s window) read
+    # sm_clock 210 MHz for 11 of 17 samples with 2685 MHz spikes, giving
+    # cv 1.37. Since clock_cv is the study's substitute for the clock pinning
+    # WSL2 refuses, the covariate that matters is the one over the BUSY
+    # samples; both are recorded.
+    busy = [r for r in gpu_rows if (r.get("sm_util") or 0) > 0]
+    summary["clock_cv_busy"] = _clock_cv(busy)
+    summary["busy_sample_fraction"] = (round(len(busy) / len(gpu_rows), 3) if gpu_rows else None)
 
     throttle_values = _throttle_reason_values(gpu_rows)
     summary["throttled"] = _throttled(throttle_values)

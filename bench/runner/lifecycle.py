@@ -35,7 +35,7 @@ import yaml
 from .client import CLIENT_IMAGE, run_client
 from .config import RunConfig, resolve_gpu_memory_fraction, validate
 from .engine import ENGINES, EngineSpec
-from .enginelog import parse_memory_breakdown
+from .enginelog import parse_engine_memory
 from .env_capture import capture_env
 from .gpu_monitor import GpuSampler, WIN_SMI, WSL_SMI, read_gpu
 from .metrics_scraper import MetricsScraper
@@ -593,7 +593,7 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
         # P37/P38: the engine's startup log is the only authoritative source for
         # where the 6 GB went -- nvidia-smi cannot see the WSL2 reservation and
         # both of its views report the same device-wide figure.
-        engine_memory = parse_memory_breakdown(engine_log_at_ready) if engine_log_at_ready else {}
+        engine_memory = parse_engine_memory(engine_log_at_ready, spec.name) if engine_log_at_ready else {}
 
         trace_rows = _read_trace_rows(cfg)
         warmup_prompts = [r["prompt"] for r in trace_rows[: cfg.warmup_requests]]

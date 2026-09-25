@@ -131,6 +131,25 @@ def _sglang_args(cfg: RunConfig, mem: float) -> list[str]:
         # T1: the real flag at v0.5.20 is --cuda-graph-bs-decode; --cuda-graph-bs /
         # --cuda-graph-max-bs do not exist (doc §4.1: "the brief's ... do not exist").
         "--cuda-graph-bs-decode", *[str(b) for b in cfg.cudagraph_capture_sizes],
+        # P40 (measured 2026-09-25, then re-measured): SGLang ALSO captures prefill
+        # graphs, by default across 42 batch sizes ([4..2048]), which vLLM does not
+        # do -- vLLM's piecewise graphs use one capture list for both phases. Pinned
+        # to the same sizes as decode, prefill graph memory drops 0.47 -> 0.08 GB and
+        # SGLang ends with 0.49 GB spare instead of 0.12 GB. Two corrections to the
+        # first reading, both worth carrying into the writeup:
+        #   * KV is UNCHANGED at 48,154 tokens either way. The engines size memory
+        #     differently: vLLM computes KV from what is left after weights +
+        #     activation + graphs (so graphs reduce KV), while SGLang allocates its
+        #     static pool, and KV inside it, BEFORE capture (so graphs consume only
+        #     the remainder). Matching --mem-fraction-static to
+        #     --gpu-memory-utilization therefore does NOT match KV capacity; see the
+        #     open P1 decision about pinning KV bytes directly (vLLM offers
+        #     --kv-cache-memory) if an equal-KV comparison is wanted.
+        #   * The ~220 s capture is a FIXED per-launch cost, not proportional to the
+        #     list: 7 sizes took 225 s where 42 took 212 s. Pinning buys symmetry and
+        #     headroom, not startup time. Prefill graphs stay ENABLED because
+        #     disabling a default optimization on one engine would bias RQ3.
+        "--cuda-graph-bs-prefill", *[str(b) for b in cfg.cudagraph_capture_sizes],
         "--sampling-defaults", "openai",                                    # T1 P9
         "--enable-metrics",                                                 # T1: required for /metrics to exist (doc §4.1, §8)
         "--enable-cache-report",                                            # T1 (doc §8 "metrics names" row): per-request cached tokens for the runner's own prefix pass

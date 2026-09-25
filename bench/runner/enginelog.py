@@ -65,3 +65,59 @@ def parse_memory_breakdown(logs: str) -> dict:
         "max_concurrency_x": float(c.group(2)) if c else None,
     }
     return out
+
+# --- SGLang v0.5.20 (verified against a real container log, 2026-09-25) -------
+# Its startup log carries a different, richer set of memory lines than vLLM's;
+# `parse_memory_breakdown` returns the same keys for both engines so the RQ4
+# memory table can be built from either, with engine-specific extras alongside.
+_SGL_AVAIL_BEGIN = re.compile(r"Load weight begin\. avail mem=([0-9.]+) GB", re.I)
+_SGL_WEIGHTS = re.compile(r"Load weight end\..*?avail mem=([0-9.]+) GB, mem usage=([0-9.]+) GB", re.I)
+_SGL_KV = re.compile(r"KV Cache is allocated\. dtype: (\S+), #tokens: ([0-9,]+), K size: ([0-9.]+) GB, V size: ([0-9.]+) GB", re.I)
+_SGL_POOL_END = re.compile(r"Memory pool end\. avail mem=([0-9.]+) GB", re.I)
+_SGL_PREFILL_GRAPH = re.compile(r"Capture target prefill CUDA graph end\. elapsed=([0-9.]+) s, mem usage=([0-9.]+) GB", re.I)
+_SGL_DECODE_GRAPH = re.compile(r"Capture target decode CUDA graph end\. elapsed=([0-9.]+) s, mem usage=([0-9.]+) GB", re.I)
+_SGL_TOTALS = re.compile(r"max_total_num_tokens=([0-9]+).*?available_gpu_mem=([0-9.]+) GB", re.I)
+
+
+def parse_sglang_memory(logs: str) -> dict:
+    """SGLang's own memory accounting. Keys mirror `parse_memory_breakdown`
+    where the engines report the same quantity, so a cross-engine table can be
+    assembled without special-casing at the call site."""
+    w, kv, pre, dec, tot = (_SGL_WEIGHTS.search(logs), _SGL_KV.search(logs),
+                            _SGL_PREFILL_GRAPH.search(logs), _SGL_DECODE_GRAPH.search(logs),
+                            _SGL_TOTALS.search(logs))
+    begin = _SGL_AVAIL_BEGIN.search(logs)
+    kv_gib = (float(kv.group(3)) + float(kv.group(4))) if kv else None
+    graph_gib = None
+    if pre or dec:
+        graph_gib = (float(pre.group(2)) if pre else 0.0) + (float(dec.group(2)) if dec else 0.0)
+    return {
+        "cuda_free_gib_at_startup": float(begin.group(1)) if begin else None,
+        "cuda_total_gib": None,                     # SGLang does not print the total
+        "requested_fraction": None,                 # (it is --mem-fraction-static, already in config.yaml)
+        "requested_gib": None,
+        "weights_plus_non_torch_gib": float(w.group(2)) if w else None,
+        "peak_activation_gib": None,                # not reported separately
+        "cudagraph_gib": graph_gib,
+        "kv_cache_gib": kv_gib,
+        "kv_cache_tokens": int(kv.group(2).replace(",", "")) if kv else None,
+        "model_load_gib": float(w.group(2)) if w else None,
+        "compilation_s": None,
+        "max_concurrency_at_tokens": None,
+        "max_concurrency_x": None,
+        # engine-specific extras
+        "sgl_kv_dtype": kv.group(1) if kv else None,
+        "sgl_avail_after_weights_gib": float(w.group(1)) if w else None,
+        "sgl_avail_after_pool_gib": _f(_SGL_POOL_END.search(logs)),
+        "sgl_prefill_graph_s": float(pre.group(1)) if pre else None,
+        "sgl_prefill_graph_gib": float(pre.group(2)) if pre else None,
+        "sgl_decode_graph_s": float(dec.group(1)) if dec else None,
+        "sgl_decode_graph_gib": float(dec.group(2)) if dec else None,
+        "sgl_max_total_num_tokens": int(tot.group(1)) if tot else None,
+        "sgl_available_gpu_mem_gib": float(tot.group(2)) if tot else None,
+    }
+
+
+def parse_engine_memory(logs: str, engine: str) -> dict:
+    """Dispatch on engine name; unknown engines get the vLLM shape, all None."""
+    return parse_sglang_memory(logs) if engine == "sglang" else parse_memory_breakdown(logs)

@@ -166,6 +166,10 @@ def test_sglang_exact_args_off():
         "--mem-fraction-static", "0.80",
         "--random-seed", "0", "--port", "30000", "--host", "0.0.0.0",
         "--cuda-graph-bs-decode", "1", "2", "4", "8", "16", "32",
+        # P40: prefill graphs pinned to the same sizes as decode -- SGLang's default
+        # captures 42 of them for 0.47 GB; pinning leaves 0.08 GB. (KV is unchanged
+        # either way: SGLang sizes its static pool before capture. See engine.py.)
+        "--cuda-graph-bs-prefill", "1", "2", "4", "8", "16", "32",
         "--sampling-defaults", "openai",
         "--enable-metrics", "--enable-cache-report",
         "--quantization", "awq_marlin",
@@ -187,6 +191,10 @@ def test_sglang_exact_args_standalone():
         "--mem-fraction-static", "0.80",
         "--random-seed", "0", "--port", "30000", "--host", "0.0.0.0",
         "--cuda-graph-bs-decode", "1", "2", "4", "8", "16", "32",
+        # P40: prefill graphs pinned to the same sizes as decode -- SGLang's default
+        # captures 42 of them for 0.47 GB; pinning leaves 0.08 GB. (KV is unchanged
+        # either way: SGLang sizes its static pool before capture. See engine.py.)
+        "--cuda-graph-bs-prefill", "1", "2", "4", "8", "16", "32",
         "--sampling-defaults", "openai",
         "--enable-metrics", "--enable-cache-report",
         "--quantization", "awq_marlin",
@@ -237,6 +245,10 @@ def test_sglang_exact_args_ngram():
         "--mem-fraction-static", "0.80",
         "--random-seed", "0", "--port", "30000", "--host", "0.0.0.0",
         "--cuda-graph-bs-decode", "1", "2", "4", "8", "16", "32",
+        # P40: prefill graphs pinned to the same sizes as decode -- SGLang's default
+        # captures 42 of them for 0.47 GB; pinning leaves 0.08 GB. (KV is unchanged
+        # either way: SGLang sizes its static pool before capture. See engine.py.)
+        "--cuda-graph-bs-prefill", "1", "2", "4", "8", "16", "32",
         "--sampling-defaults", "openai",
         "--enable-metrics", "--enable-cache-report",
         "--quantization", "awq_marlin",
