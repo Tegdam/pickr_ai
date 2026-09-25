@@ -5,6 +5,12 @@ The WSL-side `nvidia-smi` sees only this VM's own usage; the Windows-side one
 binary inside WSL2's own kernel view of the GPU) sees the whole card. The
 difference between the two is the rest of the host's reservation (spec %7
 gpu_samples.jsonl). Both views were verified callable on 2026-09-18 (doc %7).
+
+Measured 2026-09-25 (host_reservation probe): on this WSL2 build the two views
+report the SAME device-wide figure, so `used_host_mb` is always 0 -- see
+`env_capture.host_view_note`. Each sample therefore also carries host CPU
+(P39), which is the one contention signal neither GPU view can provide and the
+load generator is co-located with the engine.
 """
 from __future__ import annotations
 
@@ -34,6 +40,40 @@ def _num(kind, raw: str):
     return kind(raw)
 
 
+def read_host_cpu(proc_stat: str = "/proc/stat", loadavg: str = "/proc/loadavg") -> dict:
+    """P39: the load generator is co-located with the engine, so CPU contention
+    on this laptop can starve the client and inflate TTFT with no trace in the
+    GPU samples -- the one blind spot the two nvidia-smi views cannot cover.
+    Sampled from /proc so it costs nothing and needs no extra dependency.
+
+    `cpu_busy_pct` is computed against the previous call's counters (None on
+    the first sample, which has no interval to difference against).
+    """
+    fields = Path(proc_stat).read_text().splitlines()[0].split()[1:]
+    vals = [int(x) for x in fields[:8]]
+    idle = vals[3] + vals[4]                                   # idle + iowait
+    total = sum(vals)
+    la1, la5, la15 = Path(loadavg).read_text().split()[:3]
+    row = {"cpu_total_jiffies": total, "cpu_idle_jiffies": idle,
+           "loadavg_1m": float(la1), "loadavg_5m": float(la5), "loadavg_15m": float(la15)}
+    prev = read_host_cpu._prev
+    read_host_cpu._prev = (total, idle)
+    if prev is not None:
+        d_total, d_idle = total - prev[0], idle - prev[1]
+        row["cpu_busy_pct"] = round(100.0 * (d_total - d_idle) / d_total, 1) if d_total > 0 else None
+    else:
+        row["cpu_busy_pct"] = None
+    return row
+
+
+read_host_cpu._prev = None
+
+
+def reset_host_cpu_counter() -> None:
+    """Drop the cached counters so a fresh sampler's first interval is its own."""
+    read_host_cpu._prev = None
+
+
 def read_gpu(nvidia_smi_cmd: list[str]) -> dict:
     cmd = [*nvidia_smi_cmd, f"--query-gpu={_QUERY}", "--format=csv,noheader,nounits"]
     out = subprocess.check_output(cmd, text=True, timeout=5)
@@ -54,12 +94,13 @@ class GpuSampler:
     JOIN_TIMEOUT_S = 5.0
 
     def __init__(self, out_path, interval_s: float = 1.0, wsl_cmd: list[str] = WSL_SMI,
-                 win_cmd: list[str] = WIN_SMI, reader=read_gpu):
+                 win_cmd: list[str] = WIN_SMI, reader=read_gpu, host_reader=read_host_cpu):
         self.out_path = Path(out_path)
         self.interval_s = interval_s
         self.wsl_cmd = wsl_cmd
         self.win_cmd = win_cmd
         self.reader = reader
+        self.host_reader = host_reader
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -67,6 +108,7 @@ class GpuSampler:
         if self._thread is not None and self._thread.is_alive():
             raise RuntimeError("GpuSampler already started")
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        reset_host_cpu_counter()      # P39: this run's first interval is its own
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -118,6 +160,14 @@ class GpuSampler:
         primary = win or wsl or {}
         for key in ("sm_util", "mem_util", "sm_clock", "mem_clock", "temp_c", "power_w", "throttle_reasons"):
             row[key] = primary.get(key)
+
+        # P39: host CPU alongside the GPU views -- the client is co-located, so
+        # contention here is a client-starvation signal the GPU cannot show.
+        if self.host_reader is not None:
+            try:
+                row.update(self.host_reader())
+            except Exception as exc:
+                row["host_cpu_error"] = str(exc)
 
         return row
 
