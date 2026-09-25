@@ -116,6 +116,21 @@ def _load_base_capture_sizes() -> list[int]:
     return list(base["cudagraph_capture_sizes"])
 
 
+def _wait_until_idle(gpu_reader, sleep, clock, *, threshold_mb: int = 150, timeout_s: float = 90.0) -> int:
+    """P37: a previous probe's container can still be releasing VRAM when the
+    next probe resolves its fraction -- the 2026-09-25 run recorded
+    `host_used_mb_before: 423` on the OOM baseline three seconds after the
+    cudagraph probe's last teardown, which silently lowers the resolved
+    fraction and makes cross-launch comparisons meaningless. Wait for the
+    device to go idle first and return the reading we settled on."""
+    t0 = clock()
+    used = gpu_reader(WIN_SMI).get("used_mb")
+    while used is not None and used > threshold_mb and clock() - t0 < timeout_s:
+        sleep(3.0)
+        used = gpu_reader(WIN_SMI).get("used_mb")
+    return used if used is not None else -1
+
+
 def _resolve_mem_fraction_and_free(gpu_reader, spec: EngineSpec, headroom_mb: int = 256) -> tuple[int, float]:
     """Same measurement `lifecycle.run_one` step 1 makes: fraction/free VRAM
     from a fresh Windows-side reading, never 0.9 by reflex (spec §3.1). C2/P29:
@@ -321,9 +336,17 @@ def _probe_cudagraph_cost(params: dict, paths: RunPaths, *, docker, http, gpu_re
     spec = ENGINES["vllm"]
     results: list[dict] = []
 
+    # P37: resolve the fraction ONCE, with the device idle, and reuse it for
+    # every capture list. Re-resolving per launch made `kv_tokens` track the
+    # fraction instead of the graph cost (the 2026-09-25 run read 44,416 /
+    # 43,568 / 58,016 tokens because its three launches got three different
+    # fractions), which is the whole comparison this probe exists to make.
+    idle_used_mb = _wait_until_idle(gpu_reader, sleep, clock)
+    shared_free_mb, shared_frac = _resolve_mem_fraction_and_free(gpu_reader, spec)
+
     for i, sizes in enumerate(capture_lists):
         try:
-            free_mb, frac = _resolve_mem_fraction_and_free(gpu_reader, spec)
+            free_mb, frac = shared_free_mb, shared_frac
             cfg = _probe_run_config(paths, run_id=f"probe-cudagraph-{i}")
             cfg.cudagraph_capture_sizes = list(sizes)
             cfg.free_vram_mb_at_start, cfg.gpu_memory_utilization = free_mb, frac
@@ -365,7 +388,7 @@ def _probe_cudagraph_cost(params: dict, paths: RunPaths, *, docker, http, gpu_re
             else None
         )
 
-    return {"capture_lists": results}
+    return {"pinned_fraction": shared_frac, "idle_used_mb_before": idle_used_mb, "capture_lists": results}
 
 
 def _measure_rate(http, base_url: str, model: str, prompts: list[str], n: int, clock, max_tokens: int = 64) -> float | None:
@@ -526,6 +549,7 @@ def _probe_oom_signal(params: dict, paths: RunPaths, *, docker, http, gpu_reader
     WDDM-paging signature (see `_run_oom_fraction`/`_classify_oom_outcome`
     for the full outcome vocabulary, fix rounds 1-2)."""
     _preflight_guard(docker)
+    _wait_until_idle(gpu_reader, sleep, clock)   # P37: never measure off a draining container
     fractions = sorted(params.get("fractions", [0.90, 0.95, 0.98, 1.00]))
     baseline_fraction = params.get("baseline_fraction", 0.85)
     n_requests = params.get("requests", 20)

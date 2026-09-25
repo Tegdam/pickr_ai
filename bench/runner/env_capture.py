@@ -125,9 +125,15 @@ def capture_env(cfg, docker, spec: EngineSpec, launch_args: list[str], client_im
         # see gpu_monitor.py's own view_diff_mb (the same difference, not
         # clamped) and probes._probe_host_reservation's views_track_each_other.
         "host_view_note": (
-            "used_host_mb = Windows view - WSL view; if the two views track "
-            "each other on this WSL2 build, host share is unobservable and "
-            "used_host_mb ~= 0 (see host_reservation probe)"
+            "used_host_mb = Windows view - WSL view, and on this WSL2 build it "
+            "is always 0: the host_reservation probe (2026-09-25) measured both "
+            "views reporting the identical device-wide figure (idle 0/0 MiB, "
+            "under load 4835/4835 MiB, views_track_each_other=true), so host "
+            "share is NOT observable through nvidia-smi. Separately, CUDA sees "
+            "only 4.95 of 6.0 GiB free at idle while both views report 0 MiB "
+            "used -- the ~1.05 GiB WSL2/WDDM reservation is visible only to "
+            "CUDA (vLLM's init check), never to nvidia-smi. Use the engine's "
+            "own memory lines, not used_host_mb, for the RQ4 memory table."
         ),
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
