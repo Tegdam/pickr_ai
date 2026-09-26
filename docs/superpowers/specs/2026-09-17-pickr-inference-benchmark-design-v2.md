@@ -56,8 +56,8 @@ Budget (GB), three residency conditions:
 
 | Item | Target only | + draft fp16 | + draft + embedder |
 |---|---|---|---|
-| Windows host / DWM reservation (WSL2 shares the GPU with the desktop) | ~0.5 **measured in P0b** | 0.5 | 0.5 |
-| CUDA context + engine workspace + CUDA graphs | ~0.6 **measured in P0b** with a pinned capture-size list | 0.6 | 0.6 |
+| Windows host / DWM reservation (WSL2 shares the GPU with the desktop) | ~0.5 → **1.05 measured** (P0b §3) | 0.5 → 1.05 | 0.5 → 1.05 |
+| CUDA context + engine workspace + CUDA graphs | ~0.6 → **0.22 measured** (0.15 non-torch + 0.07 graphs, pinned capture list; P0b §2, §5) | 0.6 → 0.22 | 0.6 → 0.22 |
 | Target weights | 2.1 | 2.1 | 2.1 |
 | Draft weights | — | 1.0 | 1.0 |
 | Embedder + second CUDA context | — | — | ~0.35 |
@@ -75,6 +75,12 @@ Budget (GB), three residency conditions:
 
 **P0a result (2026-09-18):** measured chat prompt median = **265 Qwen tokens** (p90 755, p99 877), far below the ~2k threshold → **prediction 1 stands**: 32 concurrent chat requests occupy ≈ 8.5k of ~70k KV tokens, so the P1 ladder to 32 is expected to be compute-bound, not KV-bound. First pre-registered prediction tested. See `bench/docs/p0a-writeup.md` §6.
 
+**P0b result (2026-09-25/26):** the engine's own reported breakdown at the resolved fraction 0.79, warm compile cache, gives KV **2.41 GiB = 70,240 tokens** — against the ~2.5 GB / ~70k predicted above. The headline matched, but **two rows of this table were wrong in opposite directions and cancelled**: the host reservation is 1.05 GiB, not ~0.5 (2.1×), and context+workspace+graphs is 0.22 GiB, not ~0.6 (~3× less). Measured KV per token is **35.98 KB**, independently confirming the 36 KB figure derived from `config.json`. Prediction 1 now rests on measured numbers at both ends: 8.5k of 70,240 tokens at c=32, an 8× margin. Two further measured facts change how this budget is applied:
+
+- **CUDA sees only 4.95 of 6.0 GiB free** while both `nvidia-smi` views report 0 MiB used; the ~1.05 GiB difference is invisible to every query we make. Fractions are therefore resolved from measured CUDA-visible free minus a per-engine headroom (`mem_headroom_mb_total` 1280 vLLM / 1536 SGLang → **0.79 / 0.74**), never from `nvidia-smi` free.
+- **The two engines do not size memory alike**, so equal fractions do not give equal KV: vLLM **70,240** vs SGLang **48,154** tokens (1.46×), because SGLang allocates its static pool and KV *before* CUDA-graph capture while vLLM sizes KV from what remains *after*. **Open decision before P1:** pin KV bytes directly (`--kv-cache-memory`) to equalise, or report each engine at its own default sizing with the asymmetry stated in every claim. See `bench/docs/p0b-writeup.md` §7.
+- **`torch.compile` cache warmth moves KV capacity by ~26,600 tokens** (cold 1.5 GiB KV, warm 2.41 GiB) and is invisible in the launch command, so `compile_cache_warm` is recorded per run and no comparison may straddle it (P0b §6).
+
 **Constraints on how the budget is applied:**
 
 - `--gpu-memory-utilization` (and SGLang's equivalent) is a fraction of *total* memory. It is set from the *measured free* amount at run start, recorded alongside that measurement in `config.yaml`, never 0.9 by reflex.
@@ -84,10 +90,10 @@ Budget (GB), three residency conditions:
 
 **P0b hardware probes this section requires:**
 
-- **OOM-signal probe.** WSL2 runs the WDDM driver model, which can page GPU allocations to host RAM instead of failing. Deliberately over-allocate past the budget and observe. If it fails cleanly, record that. If it spills, build a detector — bandwidth collapse without a memory error, allocated-vs-reserved divergence as the tripwire — and apply it to every later run. Either outcome is a reportable 6 GB / WSL2 finding.
-- **Host reservation** measured at idle and tracked during runs (§6).
-- **CUDA-graph and workspace cost** measured for the pinned capture list.
-- **`ignore_eos` × acceptance-rate probe.** `ignore_eos` (§3.2) forces generation past the natural stopping point, so the draft predicts in a region the target would never have produced. Measure acceptance rate on a small sample with and without `ignore_eos`. If they diverge, the pre-registered handling is to report acceptance over the natural-length prefix only (the runner records per-request natural stop position from the no-`ignore_eos` reference so the prefix is identifiable); the P2 writeup states which rule applied.
+- **OOM-signal probe.** WSL2 runs the WDDM driver model, which can page GPU allocations to host RAM instead of failing. Deliberately over-allocate past the budget and observe. If it fails cleanly, record that. If it spills, build a detector — bandwidth collapse without a memory error, allocated-vs-reserved divergence as the tripwire — and apply it to every later run. Either outcome is a reportable 6 GB / WSL2 finding. **DONE (2026-09-25): fails cleanly, does not page.** Throughput flat within 2 % at fractions 0.78/0.80/0.82 (181.8 / 178.0 / 179.8 tok/s), then an explicit startup memory error at 0.84; outcome `clean_oom_boundary`. The boundary *is* the CUDA-visible limit (0.82 asks 5036 MB and fits, 0.84 asks 5158 MB and does not, CUDA-visible free is 5069 MB). **The spill detector is therefore not built** — a negative result that removes a tripwire from every later run.
+- **Host reservation** measured at idle and tracked during runs (§6). **DONE: ~1.05 GiB, and the two-view host split is unobservable** — both `nvidia-smi` views report identically (0 MiB idle, 4835 MB under load), `views_track_each_other: true`, `drift_mb: 0.0`. `host_share_drift_mb` is retained as a diagnostic only; host contention is bounded by the quiet-machine checklist rather than measured.
+- **CUDA-graph and workspace cost** measured for the pinned capture list. **DONE: 0.07 GiB = 2,512 KV tokens** (3.6 % of capacity) for `[1,2,4,8,16,32,64]` versus a single capture size — cheap enough that the `--enforce-eager` prohibition stands. The first attempt re-resolved the memory fraction per launch and produced a non-monotone, therefore impossible, result (more graphs appearing to *buy* 13,600 KV tokens); the probe now pins one fraction across all capture lists.
+- **`ignore_eos` × acceptance-rate probe.** `ignore_eos` (§3.2) forces generation past the natural stopping point, so the draft predicts in a region the target would never have produced. Measure acceptance rate on a small sample with and without `ignore_eos`. If they diverge, the pre-registered handling is to report acceptance over the natural-length prefix only (the runner records per-request natural stop position from the no-`ignore_eos` reference so the prefix is identifiable); the P2 writeup states which rule applied. **DONE (2026-09-26): they do not diverge — −2.5 % (draft, 0.7494 vs 0.7689) and −2.9 % (ngram, 0.5561 vs 0.5726), both inside the 10 % band, so P2 reports acceptance over the full generation.** Caveat carried to P2: trace output lengths have a 14-token median, so the model rarely reaches a natural EOS in either arm (2964 vs 2961 total output tokens) — the rule is shown not to fire *at trace lengths*, and a long-output re-run is required before relying on this if P2 reports acceptance on long generations.
 
 ### 3.2 Trace capture
 
@@ -130,6 +136,20 @@ Budget (GB), three residency conditions:
 **Mechanical fallback:** if P1's unloaded batch=1 chat run violates a bound, that bound moves to the lowest rung of its pre-declared ladder that the unloaded run clears — TTFT 500 ms → 1 s → 2 s; TPOT 50 → 75 → 100 ms. The ladder is fixed here; the rung is determined by P1 data, not chosen. Any move is logged with the P1 measurement that triggered it.
 
 **Reporting:** headline goodput at the pre-registered SLO, plus a supplementary goodput-gap vs threshold sensitivity curve computed from stored per-request TTFT/TPOT, with the 2×-measured-batch=1-p50 point labelled on it. If the co-tenancy penalty appears at every threshold, the conclusion is threshold-independent. Consequence for §7: per-request TTFT and TPOT are stored raw, never only as percentiles.
+
+### 3.4 Materiality (pre-registered 2026-09-26, from the measured variance floor)
+
+P0b ran 10 identical runs (vLLM, workload A, c=8, spec off, 200 prompts) on a quiet machine and measured the harness's own run-to-run spread. That floor, not judgement, sets what counts as a real difference:
+
+| Metric family | Measured cv over 10 runs | **A difference is material only if >** |
+|---|---|---|
+| any p50 / p90 latency metric, req/s, tok/s | ≤ 1.73 % | **5 %** |
+| TPOT / ITL / e2e p99 | ≤ 3.44 % | **10 %** |
+| TTFT p99 | 7.33 % (range 22.2 %) | **25 %** |
+
+Anything smaller is reported as *within the noise floor*, in those words. A cell whose claim rests on a smaller difference needs more reps, not a softer adjective; the required count follows from cv/√n. **This ladder is fixed before P1 produces a single number** — choosing it after seeing results would forfeit the pre-registration the rest of this design depends on. Any later revision is logged with the measurement that forced it, as with the SLO ladder above.
+
+Two constraints on reading the floor: `goodput_pre_registered` was identical (0.960) across all ten runs, but with 200 prompts the metric is quantised at 0.005, so its cv of 0 means "stable to within one request"; and no run-order effect was detected, so the first run of a sweep is **not** discarded. Full numbers in `bench/docs/p0b-writeup.md` §10.
 
 ---
 
@@ -218,7 +238,7 @@ bench/
 8. `docker stop`; verify VRAM returned to the pre-run baseline (catches leaked contexts).
 9. **Cooldown** until GPU temperature ≤ threshold *and* a minimum wall-clock gap has elapsed.
 
-**Monitoring the shared GPU.** `gpu_monitor.py` samples total used VRAM and our container's usage separately; `used_host = total − ours`. The Windows compositor allocates from the same pool mid-run and is invisible to WSL as a process, so the runner flags any run where the host share moves by more than a configured threshold. It also samples **actual power draw** per run, not only the configured limit: laptop dynamic boost shifts budget between CPU and GPU at runtime, so sustained GPU power varies with client CPU load — which the co-located client directly affects. The per-run power distribution is stored so a correlation with concurrency is visible rather than absorbed.
+**Monitoring the shared GPU.** `gpu_monitor.py` samples total used VRAM and our container's usage separately; `used_host = total − ours`. The Windows compositor allocates from the same pool mid-run and is invisible to WSL as a process, so the runner flags any run where the host share moves by more than a configured threshold. **P0b measured this split and found it unobservable on this platform:** the two `nvidia-smi` views report identically (0 MiB at idle, 4835 MB under load), `views_track_each_other: true`, `drift_mb: 0.0`, so `used_host` is structurally ~0 and `host_share_drift_mb` was 0 in nine of ten variance runs (60 MB in one, flag never set). It is retained as a diagnostic, not evidence; **host contention is bounded by the quiet-machine checklist rather than measured**, and every writeup says so. P0b added a compensating signal that *is* observable — host CPU (`/proc/stat`, `/proc/loadavg`) sampled alongside the GPU views, so "was the machine in use during this run?" is answerable from the artifacts (12.4–14.4 % busy across the variance runs) instead of trusted. It also samples **actual power draw** per run, not only the configured limit: laptop dynamic boost shifts budget between CPU and GPU at runtime, so sustained GPU power varies with client CPU load — which the co-located client directly affects. The per-run power distribution is stored so a correlation with concurrency is visible rather than absorbed.
 
 **`check-env` (before any sweep):** model revisions on disk match the sweep config; client output schema validates on a probe run; clock-pin result; host reservation at sweep start; docker and driver versions. A mid-sweep re-download pulling a different revision would otherwise be nearly invisible afterwards.
 
@@ -244,7 +264,7 @@ One directory per run: `bench/results/<sweep_id>/<run_id>/`. Timestamps are mono
 | `gpu_samples.jsonl` | NVML at fixed interval: `used_total_mb`, `used_ours_mb`, `used_host_mb`, `sm_util`, `mem_util`, `sm_clock`, `mem_clock`, `temp_c`, `power_w`, `throttle_reasons` |
 | `engine_metrics.jsonl` | `/metrics` scrape at fixed interval, raw field names preserved per engine: acceptance counters, accepted tokens per step, KV usage, running/waiting queues, prefix-cache hit/query counters |
 | `client_raw.json` | The tool's own output, untouched |
-| `summary.json` | Computed once by the runner from the files above: p50/p90/p99 TTFT/TPOT/ITL/e2e; tok/s; req/s; mean acceptance rate and tokens/step; peak `used_ours_mb`; peak `used_host_mb` and `host_share_drift_mb`; `power_w` distribution; `clock_cv`; `throttled`; `host_drift_flag`; `valid` + `invalid_reason`; goodput at the pre-registered SLO and `goodput_by_threshold` grid |
+| `summary.json` | Computed once by the runner from the files above: p50/p90/p99 TTFT/TPOT/ITL/e2e; tok/s; req/s; mean acceptance rate and tokens/step; peak `used_ours_mb`; peak `used_host_mb` and `host_share_drift_mb`; `power_w` distribution; `clock_cv` **and `clock_cv_busy` + `busy_sample_fraction`** (§8 risk 3); `throttled`; `host_drift_flag`; `compile_cache_warm` (§3.1); `valid` + `invalid_reason`; goodput at the pre-registered SLO and `goodput_by_threshold` grid. **Open gap (fix before P2):** tokens/step is not yet recorded — vLLM reports only the accepted/draft ratio while SGLang reports `spec_accept_length_last`, which *is* tokens/step, so the two engines currently carry different quantities; derive vLLM's as `1 + k × acceptance_rate` and store both under one key |
 | `meta.json` | `run_id`, `sweep_id`, phase, RQ tag, `schedule_index`, `attempt`, `requeued_from`, wall-clock start/end, cooldown observed (seconds, start/end temperature), monotonic-to-wall anchor |
 | `log.txt` | Container stdout/stderr + runner log, for hang/crash forensics |
 
@@ -258,14 +278,14 @@ Sweep level, `bench/results/<sweep_id>/`: `sweep.yaml` (source, copied), `schedu
 
 Ordered by expected impact.
 
-1. **Results are "WSL2 on a laptop," not "Linux on a 4050."** Driver passthrough, WDDM paging, the DWM reservation, and OEM power limits (4050 TGP spans 35–115 W) all sit between us and bare-metal numbers. Framed as part of the differentiator; every writeup states the platform; `env.json` records power limit and power mode; the laptop is on mains, "Best performance," lid open — a checklist item.
+1. **Results are "WSL2 on a laptop," not "Linux on a 4050."** Driver passthrough, WDDM paging, the DWM reservation, and OEM power limits (4050 TGP spans 35–115 W) all sit between us and bare-metal numbers. Framed as part of the differentiator; every writeup states the platform; `env.json` records power limit and power mode; the laptop is on mains, lid open — a checklist item. **P0b amended the power-mode item:** all calibration ran under the Windows **Balanced** scheme at a 100 W driver limit, not "Best performance", and nothing throttled in any run (`throttled=False`, `sw_throttle_fraction=0.00`). Since the §9 variance floor was measured under Balanced, switching schemes would invalidate it, so **the checklist now specifies Balanced for the whole study** and every writeup states it. WDDM paging is settled as a risk — it does not page (§3.1).
 2. **This is a snapshot comparison, not an engine verdict.** Pinned vLLM vX vs SGLang vY on one date measures two fast-moving projects at a point in time. Every writeup states the versions *in the claim itself*, not only in an appendix, and disclaims generalisation to "vLLM vs SGLang" as products.
-3. **Clock pinning is probably unavailable under WSL2.** Contingency pre-registered in §6 step 1.
-4. **Docker Desktop is a layer we may not need.** Native `docker` inside the WSL2 distro puts fewer moving parts between container and GPU and removes one versioned component from the results. Evaluated in P0b; whichever stays is recorded in `env.json`.
+3. **Clock pinning is unavailable under WSL2 — confirmed.** `nvidia-smi --lock-gpu-clocks` returns code 4, "The current user does not have permission to change clocks for GPU 00000000:01:00.0", for both pin and reset. The §6 step 1 contingency applies: clocks are reported, not controlled, and `clock_cv` substitutes. P0b had to correct that statistic — over all client-phase samples it measures idle/boost transitions rather than thermal drift whenever load does not fill the sampling window (1.37 on a smoke where 11 of 17 samples read 210 MHz against 2685 MHz spikes), so `summary.json` also carries **`clock_cv_busy`** (`sm_util > 0`) and `busy_sample_fraction`. Under load the busy statistic is 0.000–0.060 in 9 of 10 variance runs: clocks are stable, and the raw statistic said the opposite.
+4. **Docker Desktop is a layer we may not need — decided.** Native `docker` inside the WSL2 distro is used throughout; Docker Desktop is not in the loop. Recorded in `env.json`.
 5. **The §3.2 measured chat median can invalidate the P1 compute-bound prediction** (§3.1 prediction 1).
 6. **Engine method availability** — verify first, do not pre-build for asymmetry. Current vLLM lists `draft_model` among its speculative methods alongside `ngram`, and current SGLang lists `STANDALONE` and `NGRAM` alongside the EAGLE family. If both hold at our pins, RQ3's speculation comparison is symmetric and neither arm needs a version workaround. P0b checks this *first*, against `--help` and a smoke run, before anything else is built on it. The brief's `bench_speculative.py` tip is an EAGLE tuner and does not apply with EAGLE dropped.
 7. **"Traffic imposed by the product"** is true of prompt construction, not of who sent the queries — handled by the validation-set framing in §3.2.
-8. **Client co-location** is low-risk at ≤ 64 concurrency; P0b's 3× ceiling test is the proof. If the client container competes with the engine for CPU, the ceiling test catches it before it corrupts timing.
+8. **Client co-location** is low-risk at ≤ 64 concurrency; P0b's 3× ceiling test is the proof. If the client container competes with the engine for CPU, the ceiling test catches it before it corrupts timing. **DONE: harness ceiling ≥ 1024 req/s** over 8 rungs with the offered rate within 1 % of requested and zero errors, host CPU ≤ 10.9 % — a ≥ 17× margin rather than 3×, and a lower bound since the ladder never found the client's limit (`bench/docs/p0b-writeup.md` §9).
 9. **HF cache must live on WSL2 ext4**, not `/mnt/c`: Docker Desktop bind-mounts from the Windows filesystem are slow enough to distort load and warmup time. Not a measurement risk after readiness, but a startup-time one.
 10. **Workload C's prompts were not written for schema output.** Re-issuing A's recommendation/comparison prompts under a schema overlay isolates the constraint's effect, but the model's natural output may fight the grammar in a way a purpose-written prompt would not — plausibly lowering acceptance and raising constraint overhead. **Known bias direction: toward finding a *larger* RQ2 effect.** The P3 writeup states this rather than leaving it to a reviewer.
 11. **Reference output lengths come from gpt-3.5-turbo**, a different model. Neutralised in P1/P2 by fixed `output_len`; in P3 natural termination makes output length a per-config observation.
@@ -277,7 +297,7 @@ Ordered by expected impact.
 | Phase | Work | Estimate |
 |---|---|---|
 | **P0a** | Capture generator + recorder, trace export, LangSmith export, validation check; writeup. **Exit (amended 2026-09-18):** traces v1 exist with per-workload, per-call-role length distributions measured in Qwen tokens, and §3.1 prediction 1 re-evaluated against the measured chat median; external validation deferred with the check script retained and the reason logged. **Met 2026-09-18** (`bench/traces/*_v1.*`, `bench/docs/p0a-writeup.md`) | 4–5 days (actual: 1 day) |
-| **P0b** | Runner, collection, env capture, engine-flag verification (first), calibration runs, OOM/pin/graph/host-reservation probes, docker-flavour decision; writeup. **Exit:** variance floor and harness ceiling (≥ 3× the study's peak rate) quantified; engine flags verified at pins; probes done | 1.5 weeks |
+| **P0b** | Runner, collection, env capture, engine-flag verification (first), calibration runs, OOM/pin/graph/host-reservation probes, docker-flavour decision; writeup. **Exit:** variance floor and harness ceiling (≥ 3× the study's peak rate) quantified; engine flags verified at pins; probes done. **Met 2026-09-26** — floor cv 0.62–7.33 % by metric (→ the §3.4 materiality ladder), ceiling ≥ 1024 req/s (≥ 17×), both engines parity-checked at 265 prompt tokens with Marlin, 4 probes plus an unplanned compile-cache finding, native Docker chosen (`bench/docs/p0b-writeup.md`) | 1.5 weeks (actual: 8 days) |
 | **P1** | 72 runs (~7 h GPU) + optional Int8 point; knee analysis; SLO fallback evaluated; writeup | 3 days |
 | **P2** | ~480 runs (~45 h GPU, 4–5 nights) + correctness pass; crossover analysis; writeup | 2 weeks |
 | **P3** | 216 runs (~20 h) + failure forensics; writeup | 1 week |
@@ -291,4 +311,11 @@ Ordered by expected impact.
 
 ## 10. Next step
 
-Write the implementation plan for **P0a and P0b only** (writing-plans skill). P1+ plans follow their predecessors' calibration numbers. The first P0b task is the engine method-availability check (§8 risk 6), because its outcome shapes the P2 configs and the engine tables in `engine.py`.
+*(Superseded 2026-09-26: P0a and P0b are both complete — `bench/docs/p0a-writeup.md`, `bench/docs/p0b-writeup.md`. The original instruction was to plan P0a and P0b only, starting with the engine method-availability check (§8 risk 6); that ordering held and its outcome shaped the P2 configs and the engine tables in `engine.py`.)*
+
+Write the implementation plan for **P1**, against P0b's calibration numbers. Two decisions must be settled in the plan, not during it:
+
+1. **KV equalisation across engines** (§3.1): pin KV bytes directly (`--kv-cache-memory`) so vLLM and SGLang share a KV budget, or report each at its own default sizing with the 70,240 / 48,154-token asymmetry stated in every claim. This changes what RQ1's knee comparison means.
+2. **The λ ladder's absolute rates** for P4a derive from P1's measured knee (§5); if that puts the top λ above ~340 req/s, the harness ceiling ladder is extended before P4a rather than after.
+
+Two harness fixes are also due before P2, neither blocking P1: record tokens/step under one key for both engines (§7 requires it and only SGLang reports a comparable quantity today), and either wire or delete the unplumbed `max_tokens_cap`. Both are listed in `bench/docs/p0b-writeup.md` §14.
