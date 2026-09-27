@@ -136,3 +136,68 @@ def test_host_lines_driver_survives_unparseable_power_value(monkeypatch):
     lines = ec._host_lines()
     assert lines["win_nvidia_smi"] == "Driver 610.88"
     assert lines["power_max_limit_w"] is None
+
+
+def test_power_overlay_parses_real_reg_output(monkeypatch):
+    """Windows 11's power-mode slider writes an overlay GUID, not a scheme, so
+    `powercfg /getactivescheme` reports Balanced under both Balanced and Best
+    performance. Verbatim `reg.exe query` output, CRLF included."""
+    import bench.runner.env_capture as ec
+
+    real = (
+        "\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Power\\User\\PowerSchemes\r\n"
+        "    ActiveOverlayAcPowerScheme    REG_SZ    ded574b5-45a0-4f42-8737-46345c09c238\r\n\r\n"
+    )
+
+    def fake_check_output(cmd, text=True, timeout=10, stderr=None):
+        assert cmd[0].endswith("reg.exe")
+        return real
+
+    monkeypatch.setattr(ec.subprocess, "check_output", fake_check_output)
+    got = ec._power_overlay("ActiveOverlayAcPowerScheme")
+    assert got == "ded574b5-45a0-4f42-8737-46345c09c238 (Best performance)"
+
+
+def test_power_overlay_names_the_efficiency_and_default_guids(monkeypatch):
+    import bench.runner.env_capture as ec
+
+    for guid, label in (
+        ("961cc777-2547-4f9d-8174-7d86181b8a7a", "Best power efficiency"),
+        ("00000000-0000-0000-0000-000000000000", "none (scheme default)"),
+        ("11111111-2222-3333-4444-555555555555", "unrecognised"),
+    ):
+        def fake_check_output(cmd, text=True, timeout=10, stderr=None, _g=guid):
+            return f"key\r\n    ActiveOverlayAcPowerScheme    REG_SZ    {_g}\r\n"
+
+        monkeypatch.setattr(ec.subprocess, "check_output", fake_check_output)
+        assert ec._power_overlay("ActiveOverlayAcPowerScheme") == f"{guid} ({label})"
+
+
+def test_power_overlay_missing_key_is_none_not_an_exception(monkeypatch):
+    """Older builds have no overlay key; reg.exe exits non-zero and writes to
+    stderr. Env capture must degrade to None, as it does for every other tool."""
+    import bench.runner.env_capture as ec
+    import subprocess as sp
+
+    def fake_check_output(cmd, text=True, timeout=10, stderr=None):
+        raise sp.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(ec.subprocess, "check_output", fake_check_output)
+    assert ec._power_overlay("ActiveOverlayAcPowerScheme") is None
+
+
+def test_host_lines_records_both_overlays(monkeypatch):
+    import bench.runner.env_capture as ec
+
+    def fake_check_output(cmd, text=True, timeout=10, stderr=None):
+        if cmd[0].endswith("reg.exe"):
+            name = cmd[-1]
+            guid = ("ded574b5-45a0-4f42-8737-46345c09c238" if name.startswith("ActiveOverlayAc")
+                    else "961cc777-2547-4f9d-8174-7d86181b8a7a")
+            return f"key\r\n    {name}    REG_SZ    {guid}\r\n"
+        raise FileNotFoundError(cmd[0])
+
+    monkeypatch.setattr(ec.subprocess, "check_output", fake_check_output)
+    lines = ec._host_lines()
+    assert lines["windows_power_overlay_ac"].endswith("(Best performance)")
+    assert lines["windows_power_overlay_dc"].endswith("(Best power efficiency)")

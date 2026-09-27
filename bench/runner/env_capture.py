@@ -23,6 +23,16 @@ from .gpu_monitor import WIN_SMI, WSL_SMI
 
 _CLOCK_PIN_NOTE_DEFAULT = "not attempted (requires Administrator; deferred to the user)"
 _POWERCFG = "/mnt/c/Windows/System32/powercfg.exe"
+_REG = "/mnt/c/Windows/System32/reg.exe"
+_POWER_SCHEMES_KEY = r"HKLM\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes"
+
+# The three overlay GUIDs Windows 11's power-mode slider writes. An absent or
+# all-zero value means no overlay, i.e. the scheme's own settings apply.
+_POWER_OVERLAYS = {
+    "961cc777-2547-4f9d-8174-7d86181b8a7a": "Best power efficiency",
+    "ded574b5-45a0-4f42-8737-46345c09c238": "Best performance",
+    "00000000-0000-0000-0000-000000000000": "none (scheme default)",
+}
 
 # pip_freeze shells into the image once and is identical for every run that
 # shares an image within a sweep -- cache it here rather than re-running it.
@@ -31,6 +41,27 @@ _PIP_FREEZE_CACHE: dict[str, str] = {}
 
 def _run(cmd: list[str]) -> str:
     return subprocess.check_output(cmd, text=True, timeout=10).strip()
+
+
+def _power_overlay(value_name: str) -> str | None:
+    """The power-mode overlay GUID plus its friendly name, or None if the
+    registry read fails. `reg.exe query` prints the value on an indented line
+    as `<name>    REG_SZ    <guid>`, with CRLF line endings."""
+    try:
+        # A missing key is an expected path on builds without the slider, and
+        # reg.exe writes "ERROR: ..." to stderr -- keep it out of log.txt.
+        raw = subprocess.check_output(
+            [_REG, "query", _POWER_SCHEMES_KEY, "/v", value_name],
+            text=True, timeout=10, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+    for line in raw.replace("\r", "").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == value_name:
+            guid = parts[-1].strip("{}").lower()
+            return f"{guid} ({_POWER_OVERLAYS.get(guid, 'unrecognised')})"
+    return None
 
 
 def _parse_power_w(raw: str | None) -> float | None:
@@ -80,6 +111,15 @@ def _host_lines() -> dict:
         out["windows_power_mode"] = _run([_POWERCFG, "/getactivescheme"])
     except Exception:
         out["windows_power_mode"] = None
+
+    # Windows 11's "Power mode" slider is an OVERLAY on the active scheme, not a
+    # scheme of its own: /getactivescheme reports Balanced whether the slider
+    # says Balanced or Best performance, so the field above cannot distinguish
+    # them. `powercfg /overlaylist` is unsupported on this build, so read the
+    # overlay GUID the slider actually writes. Without this, two runs under
+    # different power modes are indistinguishable in env.json.
+    out["windows_power_overlay_ac"] = _power_overlay("ActiveOverlayAcPowerScheme")
+    out["windows_power_overlay_dc"] = _power_overlay("ActiveOverlayDcPowerScheme")
 
     return out
 

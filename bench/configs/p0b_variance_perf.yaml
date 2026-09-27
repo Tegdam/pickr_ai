@@ -1,0 +1,24 @@
+# P0b variance floor, RE-MEASURED under the Windows "Best performance" power
+# mode (overlay ded574b5-45a0-4f42-8737-46345c09c238, set on both AC and DC,
+# plus the NVIDIA driver's "prefer maximum performance").
+#
+# Byte-identical to p0b_variance.yaml except sweep_id, so the two sweeps form an
+# A/B on one variable: the power mode. The Balanced arm measured clocks already
+# at boost (2670 of 2685 MHz under load), 73 W of a 100 W limit and 62 C peak
+# with no throttle bit ever set -- so the expectation is NO material difference.
+# It is re-measured anyway because that evidence came from 3-minute runs at
+# 62 C, while P2 is ~45 h of sustained load, and "Balanced is harmless" would be
+# an extrapolation from light thermal load to an overnight sweep.
+#
+# Whichever way it lands, the winning arm's floor is the one spec 3.4's
+# materiality ladder is keyed to, and P1 runs under that power mode.
+base: bench/configs/base.yaml
+sweep_id: p0b-variance-perf
+rq_tag: calibration
+schedule_seed: 20260919
+max_retries_total: 3
+reps: 10
+axes:
+  engine: [vllm]
+  workload: [A]
+  concurrency: [8]
