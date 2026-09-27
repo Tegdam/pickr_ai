@@ -1,0 +1,44 @@
+# P0b: INTERLEAVED A/B on the Windows power mode, replacing the sequential
+# comparison of p0b_variance.yaml (Balanced, 2026-09-26) against
+# p0b_variance_perf.yaml (Best performance, 2026-09-27).
+#
+# Why re-run something already measured: the first comparison found every
+# latency metric ~4-5% better and throughput +4.28% under Best performance, all
+# 13 informative metrics shifting coherently. But the two arms ran on different
+# days, so "the power mode caused it" is not separable from day-to-day drift
+# (ambient temperature, background Windows state, driver state). Making
+# power_overlay a sweep AXIS puts both arms in one sitting, and the runner's
+# existing seeded shuffle alternates them, so anything drifting over the hour
+# hits both arms rather than landing entirely on one.
+#
+# The runner sets the overlay itself in pre-flight and verifies it took effect,
+# failing the run rather than mislabelling it (bench/runner/power_overlay.py).
+# `powercfg` cannot do this on this Windows build -- it has no overlay verb at
+# all -- so the mode is set through the same powrprof.dll entry points the
+# Windows slider uses. No human has to flip anything, which is what makes this
+# runnable unattended.
+#
+# Settle time is not configured because it is structural: the engine launch that
+# follows pre-flight takes ~45 s, so the new power mode is in force well before
+# the first measured request.
+#
+# Otherwise identical to the two floor sweeps (vLLM, workload A, c=8, spec off,
+# 200 prompts), so all four sets of runs remain comparable.
+base: bench/configs/base.yaml
+sweep_id: p0b-power-ab
+phase: p0b
+rq_tag: calibration
+schedule_seed: 20260927
+max_retries_total: 3
+reps: 10
+# Randomised BLOCK design on the power mode, not a free shuffle. A free shuffle
+# balances the arms only on average: this seed produced a 5-run streak and left
+# one arm's mean position 1.6 slots earlier than the other's, which is the drift
+# confound a paired comparison exists to remove. Blocking caps any streak at 2
+# and equalises mean position by construction.
+block_axis: power_overlay
+axes:
+  engine: [vllm]
+  workload: [A]
+  concurrency: [8]
+  power_overlay: [balanced, performance]

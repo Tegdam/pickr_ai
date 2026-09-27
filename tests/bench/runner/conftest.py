@@ -108,6 +108,23 @@ class FakeHTTP:
         return SimpleNamespace(status_code=200, json=lambda: {}, text="")
 
 
+@pytest.fixture(autouse=True)
+def no_real_power_overlay_calls(monkeypatch):
+    """env_capture reads the Windows power-mode overlay, and power_overlay
+    shells out to powershell.exe with an Add-Type compile (~1 s a call). Tests
+    must neither touch the host nor pay that, so every `_ps` call fails here by
+    default -- `read()` swallows it and reports None, which is exactly the
+    degraded path a non-Windows host would take. A test that wants a specific
+    overlay patches `power_overlay._ps` (or `env_capture.read_power_overlay`)
+    itself."""
+    import bench.runner.power_overlay as po
+
+    def refuse(script, timeout=60):
+        raise AssertionError("test shelled out to powershell.exe; patch power_overlay._ps")
+
+    monkeypatch.setattr(po, "_ps", refuse)
+
+
 @pytest.fixture
 def fake_docker():
     return FakeDocker()

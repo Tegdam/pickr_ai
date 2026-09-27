@@ -40,7 +40,7 @@ WORKLOAD_TRACES = {
 # itself (see sweep_options), not through RunConfig (ruling P2).
 _NON_RUNCONFIG_KEYS = {
     "axes", "reps", "base", "sweep_id", "schedule_seed", "max_retries_total",
-    "traces_dir", "gpu_headroom_mb", "try_clock_pin", "_source",
+    "traces_dir", "gpu_headroom_mb", "try_clock_pin", "block_axis", "_source",
 }
 
 
@@ -84,6 +84,9 @@ def sweep_options(sweep: dict) -> dict:
         "try_clock_pin": sweep.get("try_clock_pin", False),
         "max_retries_total": sweep.get("max_retries_total", 0),
         "schedule_seed": sweep.get("schedule_seed", 0),
+        # Name a RunConfig field here to turn the free shuffle into a randomised
+        # block design on that axis (see schedule()).
+        "block_axis": sweep.get("block_axis"),
         "traces_dir": sweep.get("traces_dir", _DEFAULT_TRACES_DIR),
     }
 
@@ -123,8 +126,40 @@ def expand(sweep: dict, sweep_id: str) -> list[RunConfig]:
     return out
 
 
-def schedule(configs: list[RunConfig], seed: int) -> list[RunConfig]:
-    """A seeded permutation of `configs` (thermal randomization across the sweep)."""
-    order = list(configs)
-    random.Random(seed).shuffle(order)
-    return order
+def schedule(configs: list[RunConfig], seed: int, block_axis: str | None = None) -> list[RunConfig]:
+    """A seeded permutation of `configs` (thermal randomization across the sweep).
+
+    With `block_axis` set, this becomes a **randomised block design** instead of
+    a free shuffle: runs are grouped so each consecutive block holds one run per
+    value of that axis, with the order inside each block randomised. A free
+    shuffle balances the arms only on average and can still cluster badly --
+    seed 20260927 over 10+10 power-overlay runs produced a 5-run streak and left
+    one arm's mean position 1.6 slots earlier than the other's, which is exactly
+    the drift confound a paired comparison exists to remove. Blocking caps any
+    streak at 2 and equalises mean position by construction, so anything
+    drifting over the session (ambient temperature, background load, driver
+    state) hits both arms alike.
+
+    Unequal groups are allowed: the longer ones simply fill the later blocks on
+    their own, so nothing is dropped.
+    """
+    rng = random.Random(seed)
+    if block_axis is None:
+        order = list(configs)
+        rng.shuffle(order)
+        return order
+
+    groups: dict[object, list[RunConfig]] = {}
+    for cfg in configs:
+        if not hasattr(cfg, block_axis):
+            raise ValueError(f"block_axis {block_axis!r} is not a RunConfig field")
+        groups.setdefault(getattr(cfg, block_axis), []).append(cfg)
+    for members in groups.values():
+        rng.shuffle(members)
+
+    out: list[RunConfig] = []
+    for i in range(max(len(m) for m in groups.values())):
+        block = [m[i] for m in groups.values() if i < len(m)]
+        rng.shuffle(block)
+        out.extend(block)
+    return out

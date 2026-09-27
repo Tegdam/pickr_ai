@@ -1027,3 +1027,66 @@ def test_run_sweep_halts_after_three_consecutive_first_attempt_failures(tmp_path
     attempted_runs = [r for r in state_json["runs"].values() if r["attempts"] > 0]
     assert len(attempted_runs) == 3  # the sweep's 3 configs, never a requeued 4th attempt
     assert all(r["status"] == "invalid" for r in attempted_runs)
+
+
+def test_run_one_applies_the_power_overlay_before_launching(tmp_path, monkeypatch, client_json):
+    """A power_overlay in the config is applied in pre-flight, before the engine
+    starts, so the whole run happens under the mode it claims."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    cfg.power_overlay = "performance"
+    order = []
+
+    monkeypatch.setattr(
+        "bench.runner.lifecycle.apply_power_overlay",
+        lambda name: order.append(("overlay", name)) or "ded574b5-45a0-4f42-8737-46345c09c238 (performance)",
+    )
+    real_run = fake_docker.run
+
+    def tracking_run(*a, **k):
+        order.append(("docker_run", k.get("name") or a[1]))
+        return real_run(*a, **k)
+
+    monkeypatch.setattr(fake_docker, "run", tracking_run)
+
+    run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+            gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+            port_free=_free_port)
+
+    assert order[0] == ("overlay", "performance"), order
+    assert any(step[0] == "docker_run" for step in order)
+
+
+def test_run_one_preflight_fails_when_the_power_overlay_cannot_be_set(tmp_path, monkeypatch, client_json):
+    """A run under the wrong power mode is a silently mislabelled measurement,
+    not a slow one -- so a failed set stops the run instead of carrying on."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    cfg.power_overlay = "balanced"
+
+    def boom(name):
+        raise RuntimeError("did not take effect")
+
+    monkeypatch.setattr("bench.runner.lifecycle.apply_power_overlay", boom)
+
+    with pytest.raises(PreflightError, match="could not set power overlay"):
+        run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+                gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+                port_free=_free_port)
+
+    assert not any(c["op"] == "run" for c in fake_docker.calls)
+    assert "could not set power overlay" in (paths.run_dir / "preflight_error.txt").read_text()
+
+
+def test_run_one_leaves_the_power_mode_alone_when_unset(tmp_path, monkeypatch, client_json):
+    """None means "whatever the machine is already in" -- the behaviour of every
+    sweep before 2026-09-27, so no sweep is retroactively changed."""
+    cfg, paths, fake_docker, fake_http = _setup(tmp_path, monkeypatch, client_json)
+    assert cfg.power_overlay is None
+
+    def refuse(name):
+        raise AssertionError("must not touch the power mode when power_overlay is None")
+
+    monkeypatch.setattr("bench.runner.lifecycle.apply_power_overlay", refuse)
+
+    run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
+            gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
+            port_free=_free_port)

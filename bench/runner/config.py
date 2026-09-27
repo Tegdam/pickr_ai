@@ -64,6 +64,15 @@ class RunConfig:
     # knob. Default 0 so callers/tests that never set it (pre-C2) still
     # round-trip.
     mem_headroom_mb_total: int = 0
+    # Windows 11 power-mode overlay to force before the engine launches, or
+    # None to leave whatever the machine is already in (every sweep before
+    # 2026-09-27). Making it a RunConfig field is what lets it be a sweep
+    # AXIS, so the existing seeded shuffle interleaves the arms instead of
+    # running one power mode's runs after the other's -- the confound that
+    # made the first Balanced-vs-Performance comparison uninterpretable.
+    # Lifecycle applies it in pre-flight and fails the run if it did not take
+    # effect (power_overlay.py).
+    power_overlay: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -95,6 +104,13 @@ def validate(cfg: RunConfig) -> None:
         raise ValueError("ngram_lookup_max is required for spec_method=ngram")
     if not cfg.cudagraph_capture_sizes:
         raise ValueError("cudagraph_capture_sizes must be explicit (enforce-eager is prohibited)")
+    if cfg.power_overlay is not None:
+        from .power_overlay import OVERLAYS  # local import: keeps the Windows shell-out off this path
+
+        if cfg.power_overlay not in OVERLAYS:
+            raise ValueError(
+                f"unknown power_overlay {cfg.power_overlay!r}; expected one of {sorted(OVERLAYS)} or null"
+            )
     if cfg.load_mode == "concurrency" and not cfg.concurrency:
         raise ValueError("concurrency required for load_mode=concurrency")
     if cfg.load_mode == "poisson" and not cfg.request_rate:

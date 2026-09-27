@@ -40,6 +40,7 @@ from .env_capture import capture_env
 from .gpu_monitor import GpuSampler, WIN_SMI, WSL_SMI, read_gpu
 from .metrics_scraper import MetricsScraper
 from .paths import REPO_ROOT as _REPO_ROOT
+from .power_overlay import apply as apply_power_overlay
 from .readiness import reset_cache, wait_healthy, warmup
 from .schema import CLIENT_OUTPUT_SCHEMA_VERSION
 from .state import SweepState
@@ -536,6 +537,19 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
         spec.max_mem_fraction,
     )
 
+    # Power mode, before anything launches. A run under the wrong overlay is a
+    # silently mislabelled measurement, not a slow one -- so a failure to set
+    # it, or a set that does not take effect, is a PreflightError rather than
+    # something to note and carry on with. `None` leaves the machine as-is,
+    # which is what every sweep before 2026-09-27 did.
+    power_overlay_effective = None
+    if cfg.power_overlay is not None:
+        try:
+            power_overlay_effective = apply_power_overlay(cfg.power_overlay)
+        except Exception as e:
+            _preflight_fail(f"could not set power overlay to {cfg.power_overlay!r}: {e}", e)
+        log(f"pre-flight: power overlay -> {power_overlay_effective}")
+
     clocks_pinned = False
     if try_clock_pin:
         # Ruling P8 pins try_clock_pin False for every current sweep; when a
@@ -759,7 +773,8 @@ def _load_sweep_state(sweep_path, results_root: Path, *, resume: bool) -> tuple[
         )
     sweep_dir.mkdir(parents=True, exist_ok=True)
     opts = sweep_options(sweep_dict)
-    ordered = schedule_configs(expand(sweep_dict, sweep_id), opts["schedule_seed"])
+    ordered = schedule_configs(expand(sweep_dict, sweep_id), opts["schedule_seed"],
+                               block_axis=opts.get("block_axis"))
     original_order = [c.run_id for c in ordered]
     state = SweepState(state_path, original_order, max_retries_total=opts["max_retries_total"])
 

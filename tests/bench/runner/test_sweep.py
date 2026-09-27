@@ -1,5 +1,6 @@
 import json
 
+import pytest
 import yaml
 
 from bench.runner.engine import ENGINES
@@ -71,6 +72,7 @@ def test_sweep_options_defaults_and_overrides():
         "try_clock_pin": False,
         "max_retries_total": 0,
         "schedule_seed": 0,
+        "block_axis": None,
         "traces_dir": str(REPO_ROOT / "bench" / "traces"),
     }
     overrides = {
@@ -86,5 +88,98 @@ def test_sweep_options_defaults_and_overrides():
         "try_clock_pin": True,
         "max_retries_total": 5,
         "schedule_seed": 42,
+        "block_axis": None,
         "traces_dir": "/tmp/traces",
     }
+
+
+def _arm_cfgs(per_arm=10):
+    from tests.bench.runner.test_engine import _cfg
+    out = []
+    for arm in ("balanced", "performance"):
+        for i in range(per_arm):
+            c = _cfg(run_id=f"{arm}-{i}")
+            c.power_overlay = arm
+            out.append(c)
+    return out
+
+
+def test_block_schedule_caps_streaks_and_equalises_mean_position():
+    """A free shuffle balances two arms only on average and can still cluster --
+    seed 20260927 over 10+10 gave a 5-run streak with the arms' mean positions
+    1.6 slots apart. A randomised block design caps any streak at 2 and puts the
+    mean positions within half a slot, so drift over the session cannot land on
+    one arm."""
+    import statistics as st
+    cfgs = _arm_cfgs()
+
+    ordered = schedule(cfgs, seed=20260927, block_axis="power_overlay")
+    arms = [c.power_overlay for c in ordered]
+    assert len(ordered) == 20
+    assert sorted(c.run_id for c in ordered) == sorted(c.run_id for c in cfgs)
+
+    longest = cur = 1
+    for i in range(1, len(arms)):
+        cur = cur + 1 if arms[i] == arms[i - 1] else 1
+        longest = max(longest, cur)
+    assert longest <= 2, arms
+
+    means = {a: st.mean([i for i, x in enumerate(arms) if x == a]) for a in set(arms)}
+    assert abs(means["balanced"] - means["performance"]) <= 0.5, means
+    # Every consecutive pair holds one of each arm -- that is what blocked means.
+    for i in range(0, 20, 2):
+        assert set(arms[i:i + 2]) == {"balanced", "performance"}, (i, arms)
+
+
+def test_free_shuffle_is_still_the_default_and_can_cluster():
+    """Guards the contrast the block design was added for: with no block_axis the
+    same seed and inputs produce a streak longer than a blocked schedule allows."""
+    cfgs = _arm_cfgs()
+    arms = [c.power_overlay for c in schedule(cfgs, seed=20260927)]
+    longest = cur = 1
+    for i in range(1, len(arms)):
+        cur = cur + 1 if arms[i] == arms[i - 1] else 1
+        longest = max(longest, cur)
+    assert longest > 2, arms
+
+
+def test_block_schedule_is_deterministic_per_seed():
+    cfgs = _arm_cfgs()
+    a = schedule(cfgs, seed=5, block_axis="power_overlay")
+    b = schedule(cfgs, seed=5, block_axis="power_overlay")
+    c = schedule(cfgs, seed=6, block_axis="power_overlay")
+    assert [x.run_id for x in a] == [x.run_id for x in b]
+    assert [x.run_id for x in a] != [x.run_id for x in c]
+
+
+def test_block_schedule_keeps_unequal_groups():
+    """Unequal arms must not lose runs: the longer one fills later blocks alone."""
+    cfgs = [c for c in _arm_cfgs(per_arm=3)
+            if not (c.power_overlay == "balanced" and c.run_id.endswith("-2"))]
+    ordered = schedule(cfgs, seed=1, block_axis="power_overlay")
+    assert len(ordered) == 5
+    assert sorted(c.run_id for c in ordered) == sorted(c.run_id for c in cfgs)
+
+
+def test_block_schedule_rejects_a_non_field_axis():
+    with pytest.raises(ValueError, match="not a RunConfig field"):
+        schedule(_arm_cfgs(per_arm=2), seed=1, block_axis="no_such_field")
+
+
+def test_power_overlay_axis_expands_with_no_special_casing(tmp_path):
+    """power_overlay is a RunConfig field, so it works as an axis through the
+    ordinary expander -- that is what makes the interleave a normal sweep rather
+    than a bespoke script."""
+    _traces(tmp_path)
+    sweep_path = tmp_path / "ab.yaml"
+    sweep_path.write_text(yaml.safe_dump({
+        "base": str(REPO_ROOT / "bench" / "configs" / "base.yaml"),
+        "sweep_id": "ab", "rq_tag": "calibration", "traces_dir": str(tmp_path),
+        "axes": {"engine": ["vllm"], "workload": ["A"],
+                 "power_overlay": ["balanced", "performance"]},
+        "reps": 2,
+    }))
+    cfgs = expand(load_sweep(sweep_path), "ab")
+    assert len(cfgs) == 4
+    assert sorted({c.power_overlay for c in cfgs}) == ["balanced", "performance"]
+    assert sweep_options(load_sweep(sweep_path))["block_axis"] is None

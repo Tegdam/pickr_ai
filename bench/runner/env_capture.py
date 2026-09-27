@@ -20,6 +20,7 @@ from bench.capture.cli import git_sha
 
 from .engine import EngineSpec
 from .gpu_monitor import WIN_SMI, WSL_SMI
+from .power_overlay import read as read_power_overlay
 
 _CLOCK_PIN_NOTE_DEFAULT = "not attempted (requires Administrator; deferred to the user)"
 _POWERCFG = "/mnt/c/Windows/System32/powercfg.exe"
@@ -120,6 +121,15 @@ def _host_lines() -> dict:
     # different power modes are indistinguishable in env.json.
     out["windows_power_overlay_ac"] = _power_overlay("ActiveOverlayAcPowerScheme")
     out["windows_power_overlay_dc"] = _power_overlay("ActiveOverlayDcPowerScheme")
+
+    # The authoritative pair, read through the same powrprof.dll entry points
+    # the slider itself uses. The registry values above say what is CONFIGURED
+    # for each power source; `effective` says what the system is APPLYING right
+    # now, which is the one analysis should split arms on. Recorded for every
+    # run, whether or not this sweep set the overlay itself.
+    overlay = read_power_overlay()
+    out["windows_power_overlay_effective"] = overlay["effective"]
+    out["windows_power_overlay_actual"] = overlay["actual"]
 
     return out
 
