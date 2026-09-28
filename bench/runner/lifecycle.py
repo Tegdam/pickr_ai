@@ -408,7 +408,10 @@ def _record_run(cfg, spec, docker, handle, client, trace_rows, run_dir, kernel, 
     requests = write_requests(client, trace_rows, cfg, run_dir / "requests.jsonl")
     gpu_rows = _read_jsonl(run_dir / "gpu_samples.jsonl")
     metric_rows = _read_jsonl(run_dir / "engine_metrics.jsonl")
-    summary = build_summary(client, requests, gpu_rows, metric_rows, cfg, timing)
+    # engine_memory carries the engine's own reported KV pool size, which is what
+    # verifies a pinned kv_cache_tokens was actually honoured (assertions rule 3b).
+    summary = build_summary(client, requests, gpu_rows, metric_rows, cfg, timing,
+                            engine_memory=engine_memory)
 
     env = capture_env(cfg, docker, spec, handle.launch_args, CLIENT_IMAGE, extra={
         "quantization_kernel": kernel,

@@ -62,6 +62,24 @@ def _served_name(cfg: RunConfig) -> str:
     return cfg.model
 
 
+# KV bytes per token for the target model, from its own config.json:
+# 2 (K and V) x 36 layers x 2 KV heads x 128 head dim x 2 bytes (fp16) = 36,864.
+# Confirmed independently against BOTH engines' own reporting, which is why the
+# token<->byte conversion below is exact rather than an estimate: vLLM reported
+# 2.41 GiB for 70,240 tokens (35.98 KiB/token) and SGLang reported
+# kv_cache_memory_usage_gb 1.957 for max_total_num_tokens 57,014 (35.97 KiB/token).
+# See bench/docs/p0b-engine-verification.md §7 and the P0b writeup §2, §7.
+KV_BYTES_PER_TOKEN = 2 * 36 * 2 * 128 * 2
+
+# The draft model adds its own KV (2 x 24 x 2 x 64 x 2 = 12,288 B/token), so a
+# pinned token count does NOT convert to the same byte count once speculation is
+# on, and whether vLLM's --kv-cache-memory-bytes covers the draft pool as well as
+# the target's is NOT verified at our pin. validate() therefore refuses a pinned
+# kv_cache_tokens while spec_method != "off" rather than silently converting with
+# an unverified assumption; P2 verifies it before the equal-KV arms run.
+KV_BYTES_PER_TOKEN_DRAFT = 2 * 24 * 2 * 64 * 2
+
+
 def _vllm_args(cfg: RunConfig, mem: float) -> list[str]:
     args = [
         "--model", cfg.model, "--revision", cfg.model_revision,
@@ -78,6 +96,13 @@ def _vllm_args(cfg: RunConfig, mem: float) -> list[str]:
         "--cudagraph-capture-sizes", *[str(s) for s in cfg.cudagraph_capture_sizes],
         "--generation-config", "vllm",                                       # T1 P9: no model generation_config.json leakage
     ]
+    if cfg.kv_cache_tokens is not None:
+        # T1 (doc §7 vLLM flag list, verified at 0.29.0): the flag is
+        # --kv-cache-memory-bytes, an alternative to the fraction rather than a
+        # replacement for it -- --gpu-memory-utilization above still bounds the
+        # total, and this pins the KV slice inside it so both engines get the same
+        # number of token slots (config.kv_cache_tokens).
+        args += ["--kv-cache-memory-bytes", str(cfg.kv_cache_tokens * KV_BYTES_PER_TOKEN)]
     if cfg.quantization:
         args += ["--quantization", cfg.quantization]                          # T1 P10: literal stays "awq" on vLLM (resolves to Marlin)
     args += ["--enable-prefix-caching"] if cfg.prefix_caching else ["--no-enable-prefix-caching"]  # T1 (doc §3.1, §8)
@@ -154,6 +179,11 @@ def _sglang_args(cfg: RunConfig, mem: float) -> list[str]:
         "--enable-metrics",                                                 # T1: required for /metrics to exist (doc §4.1, §8)
         "--enable-cache-report",                                            # T1 (doc §8 "metrics names" row): per-request cached tokens for the runner's own prefix pass
     ]
+    if cfg.kv_cache_tokens is not None:
+        # T1 (doc §7 SGLang flag list, verified at v0.5.20): --max-total-tokens is
+        # the absolute KV pool size in TOKENS, so unlike vLLM no byte conversion is
+        # needed -- which is also why config.kv_cache_tokens is expressed in tokens.
+        args += ["--max-total-tokens", str(cfg.kv_cache_tokens)]
     if cfg.quantization:
         args += ["--quantization", _SGLANG_QUANT_MAP.get(cfg.quantization, cfg.quantization)]  # T1 P4/P10
     if not cfg.prefix_caching:

@@ -1,0 +1,52 @@
+# P0b: verify both engines honour a PINNED KV pool, before P1 relies on it.
+#
+# The problem it fixes. At equal memory-fraction flags the engines do not get
+# equal KV: vLLM 70,240 token slots against SGLang 48,154, a 1.46x gap in the
+# resource most likely to drive a concurrency knee. SGLang allocates its static
+# pool and KV *before* CUDA-graph capture while vLLM sizes KV from what remains
+# *after*, so matching the fractions does not match KV. Worse, ~0.30 of the
+# 0.76 GiB gap is the difference between our own per-engine headroom settings
+# (0.79 vs 0.74) rather than anything the engines did -- about 40% of the
+# asymmetry was ours. RQ1's knee comparison would have been measuring our
+# configuration as much as the engines (writeup §7).
+#
+# The fix. Pin the pool to the same number of token slots on both, via
+# --kv-cache-memory-bytes on vLLM (bytes) and --max-total-tokens on SGLang
+# (tokens). Both page KV at 36 KiB/token for this model, confirmed independently
+# from each engine's own reporting -- vLLM 2.41 GiB / 70,240 = 35.98 KiB, SGLang
+# 1.957 GiB / 57,014 = 35.97 KiB -- so the conversion is exact, not an estimate.
+#
+# Why 44,000 tokens:
+#   * 8.6% below SGLang's measured 48,154 ceiling, so a slightly heavier
+#     allocation on some other day does not tip it into OOM;
+#   * 1.6x the realistic worst case, c=64 x ~420 tokens/request (P0a's mixed
+#     trace: 265 median prompt, ~70 output) = ~27k slots;
+#   * comfortably above max_model_len, so any single request still fits.
+# It does mean 64 concurrent p99-length requests (~61k slots) would queue on BOTH
+# engines. That is the point: the equalised budget is the one under test, and
+# vLLM no longer gets a later knee merely for having been handed more KV.
+#
+# This sweep is the verification gate, not a measurement: 1 run per engine, and
+# assertions rule 3b fails the run unless the engine's OWN reported pool size
+# lands within 2% of 44,000. A pin that is silently ignored would leave the
+# engines unequal while the writeup claimed otherwise, which is worse than an
+# unequal comparison stated honestly -- so an unverifiable pin fails too.
+#
+# NOTE: kv_cache_tokens is deliberately NOT set in base.yaml. validate() refuses
+# it while speculation is on (the draft model adds 12,288 B/token of its own KV
+# and whether --kv-cache-memory-bytes covers the draft pool is unverified at our
+# pin), so a base-level default would break p0b_ignore_eos.yaml. Each phase that
+# wants equal KV sets it explicitly; P2 verifies the draft accounting first.
+base: bench/configs/base.yaml
+sweep_id: p0b-kv-parity
+phase: p0b
+rq_tag: calibration
+schedule_seed: 20260928
+max_retries_total: 1
+reps: 1
+kv_cache_tokens: 44000
+num_prompts: 50
+axes:
+  engine: [vllm, sglang]
+  workload: [A]
+  concurrency: [8]

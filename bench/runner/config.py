@@ -73,6 +73,22 @@ class RunConfig:
     # Lifecycle applies it in pre-flight and fails the run if it did not take
     # effect (power_overlay.py).
     power_overlay: str | None = None
+    # Equal-KV comparison (P1 decision, 2026-09-28). At equal memory-fraction
+    # flags the engines do NOT get equal KV -- vLLM 70,240 tokens vs SGLang
+    # 48,154 -- because SGLang allocates its static pool and KV before CUDA-graph
+    # capture while vLLM sizes KV from what remains after. Worse, ~40% of that gap
+    # is our own per-engine headroom rather than the engines. Setting this pins
+    # the KV pool to the SAME number of token slots on both, so RQ1's knee
+    # compares engines instead of our configuration.
+    #
+    # Expressed in TOKENS, not bytes, because tokens are the unit that drives
+    # concurrency and the unit both engines report (vLLM `kv_cache_tokens`,
+    # SGLang `max_total_num_tokens`). The engine builders convert: vLLM takes
+    # `--kv-cache-memory-bytes`, SGLang takes `--max-total-tokens` directly.
+    # Both page KV at 36 KiB/token for this model, measured independently from
+    # each engine's own reporting (writeup §7), so the conversion is exact.
+    # None keeps each engine's own fraction-derived sizing.
+    kv_cache_tokens: int | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -104,6 +120,29 @@ def validate(cfg: RunConfig) -> None:
         raise ValueError("ngram_lookup_max is required for spec_method=ngram")
     if not cfg.cudagraph_capture_sizes:
         raise ValueError("cudagraph_capture_sizes must be explicit (enforce-eager is prohibited)")
+    if cfg.kv_cache_tokens is not None:
+        if cfg.kv_cache_tokens <= 0:
+            raise ValueError(f"kv_cache_tokens must be positive, got {cfg.kv_cache_tokens}")
+        # A pool smaller than one full-length request cannot serve that request at
+        # all; a pool smaller than max_model_len x max_num_seqs merely queues,
+        # which is legitimate (and is the case for the equal-KV pin, since the
+        # realistic worst case is far below the synthetic one -- writeup §7).
+        if cfg.kv_cache_tokens < cfg.max_model_len:
+            raise ValueError(
+                f"kv_cache_tokens {cfg.kv_cache_tokens} is below max_model_len "
+                f"{cfg.max_model_len}: no single full-length request could be served"
+            )
+        if cfg.spec_method != "off":
+            # The draft model adds 12,288 B/token of its own KV, and whether
+            # vLLM's --kv-cache-memory-bytes covers the draft pool as well as the
+            # target's is not verified at our pin. Converting tokens to bytes here
+            # would be guessing, and an equal-KV claim built on a guess is worse
+            # than an unequal-KV comparison stated honestly.
+            raise ValueError(
+                "kv_cache_tokens is only supported with spec_method='off' until the draft "
+                "model's KV accounting under --kv-cache-memory-bytes is verified (engine.py "
+                "KV_BYTES_PER_TOKEN_DRAFT); P2 verifies it before the equal-KV spec arms run"
+            )
     if cfg.power_overlay is not None:
         from .power_overlay import OVERLAYS  # local import: keeps the Windows shell-out off this path
 

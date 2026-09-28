@@ -12,9 +12,16 @@ from dataclasses import dataclass
 class Thresholds:
     max_error_rate: float = 0.01
     max_host_drift_mb: int = 256
+    # An equal-KV comparison is only equal if both engines actually honoured the
+    # pin, so the engine's own reported pool size is checked against what was
+    # asked for. The tolerance is not zero because each engine rounds to its own
+    # block/page size (vLLM allocates in blocks of 16 tokens, SGLang in pages),
+    # and a pin landing a few hundred slots off is rounding, not a refused flag.
+    max_kv_pin_error: float = 0.02
 
 
-def check(cfg, summary: dict, spec_on: bool, thresholds: Thresholds) -> tuple[bool, str | None]:
+def check(cfg, summary: dict, spec_on: bool, thresholds: Thresholds,
+          engine_memory: dict | None = None) -> tuple[bool, str | None]:
     """Returns `(valid, invalid_reason)`. Rule order matches the controller
     ruling: attempted count, error rate, host-memory drift, then (when
     speculation is on) the acceptance tripwire appropriate to the engine's
@@ -48,6 +55,27 @@ def check(cfg, summary: dict, spec_on: bool, thresholds: Thresholds) -> tuple[bo
     drift = summary.get("host_share_drift_mb")
     if drift is not None and drift > thresholds.max_host_drift_mb:
         return False, f"host_share_drift_mb {drift} exceeds max_host_drift_mb {thresholds.max_host_drift_mb}"
+
+    # Rule (3b): when the KV pool is pinned for an equal-KV comparison, the
+    # engine's own reported pool size must match what was asked for. A silently
+    # ignored flag would leave the two engines unequal while the writeup claimed
+    # otherwise -- exactly the failure the pin exists to prevent, and invisible
+    # without this check. A pin that cannot be read back at all also fails: an
+    # unverifiable equal-KV claim is not worth making.
+    if getattr(cfg, "kv_cache_tokens", None):
+        got = (engine_memory or {}).get("kv_cache_tokens")
+        want = cfg.kv_cache_tokens
+        if got is None:
+            return False, (
+                f"kv_cache_tokens pinned at {want} but the engine reported no KV pool size, "
+                "so the pin cannot be verified"
+            )
+        if abs(got - want) / want > thresholds.max_kv_pin_error:
+            return False, (
+                f"KV pin not honoured: asked {want} tokens, engine reports {got} "
+                f"({100 * (got - want) / want:+.1f}%, tolerance "
+                f"±{100 * thresholds.max_kv_pin_error:.0f}%)"
+            )
 
     if spec_on:
         engine_metrics = summary.get("engine_metrics") or {}

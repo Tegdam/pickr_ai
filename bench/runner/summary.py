@@ -190,7 +190,8 @@ def _sw_throttle_fraction(values: list[int]):
 
 
 def build_summary(client: dict, requests: list[dict], gpu_rows: list[dict], metric_rows: list[dict],
-                   cfg, timing: dict, thresholds: Thresholds = Thresholds()) -> dict:
+                   cfg, timing: dict, thresholds: Thresholds = Thresholds(),
+                   engine_memory: dict | None = None) -> dict:
     """Computed once by the runner from the run's artifacts (spec §7
     summary.json). `valid`/`invalid_reason` are filled in-place by
     `assertions.check`, using `cfg.spec_method != "off"` for `spec_on` and
@@ -279,7 +280,8 @@ def build_summary(client: dict, requests: list[dict], gpu_rows: list[dict], metr
     )
 
     spec_on = cfg.spec_method != "off"
-    valid, invalid_reason = check_validity(cfg, summary, spec_on, thresholds)
+    valid, invalid_reason = check_validity(cfg, summary, spec_on, thresholds,
+                                          engine_memory=engine_memory)
     summary["valid"] = valid
     summary["invalid_reason"] = invalid_reason
 

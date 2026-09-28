@@ -115,9 +115,19 @@ The asymmetry that remains is the important one: **vLLM 70,240 vs SGLang 48,154 
 | vLLM | 0.79 (headroom 1280 MB) | 4.74 GiB | 70,240 | 2.41 GiB |
 | SGLang | 0.74 (headroom 1536 MB) | 4.44 GiB | 48,154 | 1.65 GiB |
 
-The KV gap is 0.76 GiB, of which **0.30 GiB is simply the 0.05 difference in fraction** — a consequence of the per-engine headroom *we* chose in ruling P36, not of engine behaviour. Only the residual **~0.46 GiB** is SGLang's genuinely larger non-KV footprint (static pool, prefill graphs, workspace). Assumes SGLang pages KV at the same 36 KiB/token as vLLM, which the shared model and dtype imply but which its `max_total_num_tokens` line does not state.
+The KV gap is 0.76 GiB, of which **0.30 GiB is simply the 0.05 difference in fraction** — a consequence of the per-engine headroom *we* chose in ruling P36, not of engine behaviour. Only the residual **~0.46 GiB** is SGLang's genuinely larger non-KV footprint (static pool, prefill graphs, workspace).
 
-That decomposition matters for the decision it feeds: a comparison in which ~40 % of the KV asymmetry traces to our own headroom setting is not measuring the engines. Whether to equalise by pinning KV bytes directly (`--kv-cache-memory`) or to report each engine at its own default sizing is an **open P1 decision** (§14) — but the split above argues for equalising, and for treating the headroom difference as a harness artifact to remove rather than a finding to report.
+Both engines page KV at the same **36 KiB/token**, and this is measured on each side rather than assumed from the shared model: vLLM reports 2.41 GiB for 70,240 slots (**35.98 KiB**), SGLang reports `kv_cache_memory_usage_gb 1.957` against `max_total_num_tokens 57,014` (**35.97 KiB**). Both match the 36,864 B computed from `config.json` (2 × 36 layers × 2 KV heads × 128 head dim × 2 bytes), so token counts are directly comparable between the engines and the token↔byte conversion below is exact.
+
+That decomposition decides it: a comparison in which ~40 % of the KV asymmetry traces to our own headroom setting is not measuring the engines, so the headroom difference is a harness artifact to remove rather than a finding to report.
+
+**Decision (2026-09-28): equalise, at 44,000 token slots.** From P1 onward every engine-comparison sweep pins the pool to the same size on both engines — `--kv-cache-memory-bytes` on vLLM (bytes), `--max-total-tokens` on SGLang (tokens) — through one `kv_cache_tokens` config field expressed in tokens, because tokens are the unit that drives concurrency and the unit both engines report back.
+
+Why 44,000: it is 8.6 % below SGLang's measured 48,154 ceiling, leaving margin against a heavier allocation on another day, and 1.6× above the realistic worst case — c=64 × ~420 tokens per request ≈ 27k slots, given P0a's 265-token median prompt and ~70-token output. The cost is explicit: 64 simultaneous p99-length requests (~61k slots) would queue on **both** engines. That is the intended consequence. The equalised budget is the resource under test, and vLLM no longer earns a later knee for having been handed more KV than SGLang. Every knee claim states the pinned value.
+
+**The pin is verified, not trusted.** Assertions rule 3b fails a run unless the engine's own reported pool size lands within 2 % of what was asked (each engine rounds to its own block or page size), and a pool size that cannot be read back fails too — an unverifiable equal-KV claim is not worth making, and a silently ignored flag would leave the engines unequal while this document claimed otherwise. `bench/configs/p0b_kv_parity.yaml` is the gate: one run per engine, before P1 depends on any of it.
+
+One boundary is deliberately left closed. `kv_cache_tokens` is **not** set in `base.yaml`, and `validate()` refuses it while speculation is on: the draft model adds 12,288 B/token of its own KV, and whether vLLM's byte flag covers the draft pool as well as the target's is unverified at our pin. Converting tokens to bytes there would be guessing, and an equal-KV claim built on a guess is worse than an unequal comparison stated honestly — so P2 verifies the draft accounting before its equal-KV spec arms run.
 
 Startup cost also differs sharply, which sets the wall-clock budget for every later sweep: vLLM `ready_s` **50.4 s**, SGLang **272.9 s** — 5.4×.
 
@@ -283,7 +293,7 @@ Artifacts: `bench/results/{probes,p0b-parity,p0b-ceiling,p0b-ceiling-hi,p0b-igno
 
 **Decisions needed before P1 runs:**
 
-1. **KV equalisation across engines** (§7): pin KV bytes directly (`--kv-cache-memory`) so both engines share a KV budget, or report each at its own default sizing with the 70,240 / 48,154 asymmetry stated in every claim. Affects RQ1's knee comparison directly, and §7's decomposition argues for equalising: ~40 % of the gap (0.30 of 0.76 GiB) comes from the per-engine headroom we chose, not from the engines.
+1. ~~**KV equalisation across engines**~~ **Decided (§7): equalise at 44,000 token slots**, pinned per engine and verified from each engine's own reported pool size. Remaining work is the gate run, `bench/configs/p0b_kv_parity.yaml` (1 run per engine), which must pass before P1 relies on the pin.
 2. ~~**Power mode**~~ **Settled (§10a).** P1 and everything after run under the Windows **Best performance** overlay, and `base.yaml` now pins `power_overlay: performance` so each run asserts its mode instead of inheriting the machine's state. The justification is that it is measurably never worse and matches the field's convention — **not** that it is worth the 4–5 % a sequential comparison appeared to show. The interleaved block design put the real effect at about **1 %**, below every §3.4 threshold, and resolved the rest into ~3 % session drift. §3.4's ladder is keyed to the Performance floor, whose cv values are equal or better, so the 5/10/25 % thresholds stand unchanged.
 
 **Fixes before P2:**

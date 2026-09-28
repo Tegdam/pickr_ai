@@ -1216,13 +1216,41 @@ def test_capture_env_has_the_spec_fields(fake_docker, monkeypatch):
 
 ---
 
-### Task 11: Run the calibration (runbook — GPU time ≈ 3–4 h)
+### Task 11: Run the calibration (runbook — GPU time ≈ 3–4 h) — **DONE, 62 runs**
 
-- [ ] **Step 1:** `python -m bench.runner check-env` → all green; `git status --porcelain` empty.
-- [ ] **Step 2:** probes in this order (each ≤ 20 min): `clock_pin`, `host_reservation`, `cudagraph_cost`, `oom_signal`, `parity`, `ignore_eos_acceptance`. Record outcomes; if `clock_pin` fails, set `try_clock_pin: false` in `base.yaml` and raise `cooldown_temp_c` to 50 / `cooldown_min_s` to 90 (the pre-registered contingency) **before** the variance sweep and commit that change.
-- [ ] **Step 3:** `python -m bench.runner run bench/configs/p0b_ceiling.yaml` (echo server; ~15 min).
-- [ ] **Step 4:** `python -m bench.runner run bench/configs/p0b_variance.yaml` (10 × ~6 min incl. cooldown ≈ 1 h). Re-run `resume` if interrupted.
-- [ ] **Step 5:** Copy `bench/results/p0b-variance/*/summary.json`, `bench/results/p0b-ceiling/*/summary.json`, and `bench/results/probes/*.json` are read by Task 12's analysis; nothing else is committed from `bench/results/`.
+**Step 0 — the session anchor. Run this FIRST in every session from now on, in this and every later phase:**
+
+```
+bash bench/scripts/anchor.sh          # ~4 min: one unchanged reference run, then the series
+```
+
+Not optional and not only for calibration. P0b found that a session can sit ~3 % off
+another for an unknown reason while runs *inside* a session agree to ~0.5 %
+(`bench/docs/p0b-writeup.md` §10a). The anchor is one fixed reference run
+(`bench/configs/anchor.yaml`, which **must never change**) whose value is, in order:
+
+1. **A go/no-go check on the session.** If the anchor deviates more than 1.5 % from the
+   running median, this session is anomalous — say so in the log and prefer comparisons
+   blocked inside it; do not quietly treat its numbers as interchangeable with other
+   sessions'.
+2. A growing sample of inter-session deltas at no extra cost (we hold only 2 so far, and
+   they disagree tenfold, so the magnitude is not established).
+3. A drift term for any comparison that genuinely cannot be blocked into one session
+   (spec §3.4 rule 2).
+
+If the anchor flags the session and the night's work is a headline comparison, the
+comparison is still valid *provided its axis is blocked* — that is the whole point of
+blocking. What is not valid is comparing tonight's numbers against another session's.
+
+**What actually ran (2026-09-25 → 2026-09-28), superseding the original step order:**
+
+- [x] **Step 1:** `check-env` green; tree clean.
+- [x] **Step 2:** probes — `host_reservation`, `oom_signal`, `clock_pin`, `cudagraph_cost` (twice; the first was confounded by a per-launch fraction re-resolve), then the parity smoke and the `ignore_eos` × acceptance sweep. `clock_pin` failed as predicted, so the pre-registered contingency applied: `try_clock_pin: false`, `cooldown_temp_c: 50`, `cooldown_min_s: 90`.
+- [x] **Step 3:** `p0b_ceiling.yaml` (12 echo runs) **plus** `p0b_ceiling_hi.yaml` (4 more rungs), because the 6-rung ladder passed every rung and so bounded the ceiling without locating it → ≥ 1024 req/s.
+- [x] **Step 4:** `p0b_variance.yaml` (10 runs) **and** `p0b_variance_perf.yaml` (10 more), the floor measured under both power modes, then `p0b_power_ab.yaml` (20 runs) to settle the power mode as an interleaved block design rather than a cross-day comparison.
+- [x] **Step 5:** summaries and probe JSON read by Task 12's analysis; nothing from `bench/results/` is committed (`.gitignore`).
+
+**Carried into every later phase's runbook:** step 0 above; `power_overlay` pinned in `base.yaml` rather than inherited; `block_axis` set on whichever axis carries the phase's headline comparison (spec §3.4 rule 1).
 
 ---
 
