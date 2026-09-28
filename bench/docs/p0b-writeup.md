@@ -11,10 +11,11 @@ P0b exists to answer two questions before any comparison is attempted: **what do
 | Engine-flag verification | Every flag, route, metric name and env value pinned in `bench/docs/p0b-engine-verification.md` (the binding contract, controller rulings P1–P15) |
 | Hardware probes | 4 — `host_reservation`, `oom_signal`, `clock_pin`, `cudagraph_cost` (2 runs; the first was confounded, §5) |
 | Parity smoke | 2 runs (1 per engine) — the gate before any sweep |
+| Power-mode A/B | 20 runs — `power_overlay` as an axis under a randomised block design (§10a) |
 | Harness ceiling | 16 runs — 8 request-rate rungs × 2 reps against the echo server |
 | `ignore_eos` × acceptance | 4 runs — vLLM, draft + ngram, `ignore_eos` true/false |
-| Variance floor | 10 identical runs — vLLM, workload A, c=8, spec off, 200 prompts |
-| Total | 32 recorded runs + 6 probe result files, all under `bench/results/` |
+| Variance floor | 10 identical runs — vLLM, workload A, c=8, spec off, 200 prompts, **twice** (once per power mode) |
+| Total | 62 recorded runs + 6 probe result files, all under `bench/results/` |
 
 Nothing failed silently: every recorded run is `valid=True`, every run returned its VRAM (`vram_leak_mb: 0`), and no run left a container behind.
 
@@ -172,7 +173,7 @@ Ten identical runs (vLLM, workload A, c=8, spec off, 200 prompts). All 10 `valid
 
 Central tendency is tight — every p50/p90 metric within 1.73 %. The tails are an order of magnitude noisier, and TTFT p99 is the noisiest real metric by a wide margin.
 
-**Pre-registered materiality ladder (new; carried into the spec as §3.4, beside the SLO).** A difference is reported as material only if it exceeds:
+**Pre-registered materiality ladder (new; carried into the spec as §3.4, beside the SLO).** These thresholds hold **within a session only** — §10a measures ~3 % of drift between sessions, which is why §3.4 also requires comparison axes to be blocked. A difference is reported as material only if it exceeds:
 
 | metric family | measured cv | **material if >** |
 |---|---|---|
@@ -186,6 +187,46 @@ Two readings to keep honest:
 
 - **`goodput_pre_registered` was exactly 0.960 on all ten runs** (sd 0) — the same 192/200 requests cleared the SLO every time. With 200 prompts the metric is quantised at 0.005, so cv = 0 means "stable to within one request", not infinite precision.
 - **No run-order effect, so the first run of a sweep is not discarded.** r0 has the only elevated `clock_cv_busy` (0.245 vs 0.000–0.060) *and* the worst TPOT p99 (33.83 ms), which looks like a first-launch clock ramp — but TTFT p99's worst run is r4 (801.7 ms) at `clock_cv_busy` 0.000, and r0's TTFT p99 is mid-pack. The tail noise is inherent jitter. n=1 on the clock observation; revisit only if it recurs.
+
+## 10a. Session drift, and how a sequential A/B overstated an effect by 4×
+
+The floor above was measured twice: under the Windows **Balanced** power mode (2026-09-26) and under **Best performance** (2026-09-27). Compared sequentially, Best performance looked clearly better — every latency metric 4–5 % faster, throughput **+4.28 %**, all 13 informative metrics shifting coherently in the same direction. The reading offered at the time was that metric-wide coherence is what a genuine system-wide change looks like rather than what noise looks like.
+
+That reading was wrong, and the way it was wrong is the most useful thing in this document.
+
+Because the two arms ran on different days, "the power mode caused it" was not separable from "the day was different". So the comparison was re-run as a **randomised block design** (`p0b_power_ab.yaml`, 20 runs): `power_overlay` became a sweep axis, the runner set the mode itself per run and verified it took effect, and the schedule paired the arms so each consecutive block held one of each. All 20 runs valid, and every run's configured arm was checked against its recorded effective overlay.
+
+**Paired within-block differences, which is what the design bought:**
+
+| metric | paired diff | 95 % CI | blocks favouring Performance |
+|---|---|---|---|
+| TTFT p50 | −1.20 % | [−2.59, +0.19] | 8/10 |
+| TTFT p90 | −0.38 % | [−0.85, +0.09] | 7/10 |
+| TPOT p50 | −0.89 % | [−1.75, −0.02] | 7/10 |
+| TPOT p90 | −0.78 % | [−1.43, −0.13] | **9/10** |
+| TPOT p99 | −1.12 % | [−2.24, −0.00] | 7/10 |
+| ITL p99 | −1.89 % | [−3.80, +0.02] | 7/10 |
+| e2e p50 | −0.88 % | [−1.76, −0.00] | 7/10 |
+| e2e p90 | −0.93 % | [−2.01, +0.15] | **9/10** |
+| req/s, tok/s | +0.58 % | [−0.09, +1.25] | 7/10 |
+| TTFT p99 | +1.76 % | [−9.03, +12.55] | 5/10 |
+
+**Best performance is worth about 1 %, not 4–5 %.** A small real effect survives — the direction favours it in 7–9 of 10 blocks and several intervals exclude zero — but every difference is far below its §3.4 threshold, so it is reported as *within the noise floor*.
+
+**Where the other 3 % was.** Comparing like arm to like arm across dates isolates it:
+
+| same config, same power mode, different day | req/s | e2e p50 |
+|---|---|---|
+| Balanced: 2026-09-26 → 2026-09-28 | **+0.32 %** | −0.19 % |
+| Performance: 2026-09-27 → 2026-09-28 | **−3.24 %** | +3.19 % |
+
+The Balanced arm reproduced to within 0.3 % two days apart. The **2026-09-27 session simply ran ~3 % fast**, and the sequential comparison charged that session effect to the power mode. It decomposes almost exactly: **4.28 % observed ≈ 0.6 % real + 3.2 % drift.** The drift's cause is unidentified — busy SM clock (2670 MHz), GPU power p90 (≈68 W), peak temperature (62–63 °C) and host CPU were indistinguishable between arms and between sessions.
+
+**Why the coherence argument failed, precisely.** A session-level drift moves every metric together *because they all derive from the same requests*. So coherence across metrics separates "something systematic" from "random noise", but it cannot separate "the treatment" from "the day". The correlation among metrics was noted at the time and then the opposite conclusion was drawn from it.
+
+**The consequence is much larger than the power mode.** Session drift of ~3 % is **3–5× the within-session cv of 0.6–1.7 %**, so §10's materiality ladder is only valid for comparisons whose arms sit in one session. P2 is ~480 runs across 4–5 nights, comparing engines: had vLLM and SGLang been split across nights, a 3 % session effect could have been read as an engine difference, and 3 % is comparable to real engine differences. Spec §3.4 therefore now requires any axis carrying a headline comparison — the engine axis above all — to be scheduled as a randomised block design, with results reported as within-block differences.
+
+A free shuffle is not sufficient for this, which is worth stating because it is the obvious thing to reach for: over these 10+10 runs it produced a 5-run single-arm streak and left one arm's mean position 1.6 of 20 slots ahead of the other's. Blocking caps the streak at 2 and equalises mean position by construction.
 
 ## 11. What WSL2 refuses, and what we substitute
 
@@ -230,14 +271,14 @@ These are also the study's first spec-decode numbers, and they preview RQ2's tra
 | Probes done | §3–§7, §11 — host reservation, OOM signal, clock pin, CUDA-graph cost, plus the unplanned compile-cache finding |
 | Docker flavour decided | Native `docker` inside WSL2 (Docker Desktop not used); recorded in `env.json` |
 
-Artifacts: `bench/results/{probes,p0b-parity,p0b-ceiling,p0b-ceiling-hi,p0b-ignore-eos,p0b-variance}/` — 32 runs, each reproducible from its own `config.yaml` plus the trace SHA-256.
+Artifacts: `bench/results/{probes,p0b-parity,p0b-ceiling,p0b-ceiling-hi,p0b-ignore-eos,p0b-variance,p0b-variance-perf,p0b-power-ab}/` — 62 runs, each reproducible from its own `config.yaml` plus the trace SHA-256, with `schedule.json` recording the seed and the blocked axis where one applies.
 
 ## 14. Carried forward
 
 **Decisions needed before P1 runs:**
 
 1. **KV equalisation across engines** (§7): pin KV bytes directly (`--kv-cache-memory`) so both engines share a KV budget, or report each at its own default sizing with the 70,240 / 48,154 asymmetry stated in every claim. Affects RQ1's knee comparison directly, and §7's decomposition argues for equalising: ~40 % of the gap (0.30 of 0.76 GiB) comes from the per-engine headroom we chose, not from the engines.
-2. **Power mode** (§11): **settled in favour of Best performance; the causal claim is still open.** The floor was re-measured under the Best performance overlay (`p0b-variance-perf`, 10/10 valid): every latency metric came out 4–5 % better and throughput +4.28 %, all 13 informative metrics shifting coherently. Only TTFT p90 crossed its §3.4 threshold, and exactly on the 5 % line — but coherence across every metric is what a genuine system-wide change looks like, not what noise looks like. Two limits: the mechanism is invisible in what we sample (busy SM clock identical at 2670 MHz, GPU power p90 identical at 67.6 W, host CPU identical at 5.7 vs 5.8 %; only GPU power *max* rose, 73.5 → 81.6 W), and the arms ran on different days, so day-to-day drift is not excluded. Neither affects the decision, since Performance is never slower and matches the field's convention. P1 runs under Best performance and §3.4 is keyed to that floor — its cv values are equal or better, so the 5/10/25 % thresholds survive unchanged. `bench/configs/p0b_power_ab.yaml` settles the causality properly: 20 runs with `power_overlay` as a sweep axis under a **randomised block design**, the runner setting the mode itself per run and failing the run if it did not take effect.
+2. ~~**Power mode**~~ **Settled (§10a).** P1 and everything after run under the Windows **Best performance** overlay, and `base.yaml` now pins `power_overlay: performance` so each run asserts its mode instead of inheriting the machine's state. The justification is that it is measurably never worse and matches the field's convention — **not** that it is worth the 4–5 % a sequential comparison appeared to show. The interleaved block design put the real effect at about **1 %**, below every §3.4 threshold, and resolved the rest into ~3 % session drift. §3.4's ladder is keyed to the Performance floor, whose cv values are equal or better, so the 5/10/25 % thresholds stand unchanged.
 
 **Fixes before P2:**
 
