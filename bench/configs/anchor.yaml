@@ -1,0 +1,36 @@
+# SESSION ANCHOR — one unchanged reference run at the start of every session.
+#
+# Why. P0b found that a session can sit ~3% off another session for an unknown
+# reason (writeup §10a), while runs *within* a session agree to ~0.5%. Two
+# like-for-like inter-session deltas exist and they disagree tenfold (+0.32% and
+# -3.24%), so the magnitude and frequency of that offset are NOT established, and
+# a week of dedicated re-measurement would still only yield ~6 deltas — a
+# standard deviation with a ±30% confidence interval. Measuring it as a byproduct
+# of the real work is both cheaper and contemporaneous with the data it qualifies.
+#
+# What it buys, in order of value:
+#   1. A per-session health check. If tonight's anchor sits well off the running
+#      median, this session is anomalous and its data is suspect BEFORE it is
+#      analysed, not months later.
+#   2. A growing sample of inter-session deltas at no extra cost — ~3 by the end
+#      of P1, ~10 by the end of P2.
+#   3. A drift term for any comparison that genuinely cannot be blocked into one
+#      session (§3.4 rule 2).
+#
+# THIS FILE MUST NOT CHANGE. It is the same config as the variance floor
+# (bench/configs/p0b_variance.yaml, one rep) precisely so every anchor is
+# comparable to every other anchor and to both floors. Changing the model, the
+# trace, the concurrency, the prompt count or the power mode breaks the series
+# and forfeits everything above. Run it with bench/scripts/anchor.sh, which
+# stamps the sweep_id with the date; the run costs ~4 minutes.
+base: bench/configs/base.yaml
+sweep_id: anchor
+phase: p0b
+rq_tag: anchor
+schedule_seed: 20260919
+max_retries_total: 1
+reps: 1
+axes:
+  engine: [vllm]
+  workload: [A]
+  concurrency: [8]

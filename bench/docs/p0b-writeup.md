@@ -173,7 +173,7 @@ Ten identical runs (vLLM, workload A, c=8, spec off, 200 prompts). All 10 `valid
 
 Central tendency is tight — every p50/p90 metric within 1.73 %. The tails are an order of magnitude noisier, and TTFT p99 is the noisiest real metric by a wide margin.
 
-**Pre-registered materiality ladder (new; carried into the spec as §3.4, beside the SLO).** These thresholds hold **within a session only** — §10a measures ~3 % of drift between sessions, which is why §3.4 also requires comparison axes to be blocked. A difference is reported as material only if it exceeds:
+**Pre-registered materiality ladder (new; carried into the spec as §3.4, beside the SLO).** These thresholds hold **within a session only** — §10a records an observed ~3 % offset between sessions against a 0.49 % block-to-block cv inside one, which is why §3.4 also requires comparison axes to be blocked. A difference is reported as material only if it exceeds:
 
 | metric family | measured cv | **material if >** |
 |---|---|---|
@@ -220,11 +220,17 @@ Because the two arms ran on different days, "the power mode caused it" was not s
 | Balanced: 2026-09-26 → 2026-09-28 | **+0.32 %** | −0.19 % |
 | Performance: 2026-09-27 → 2026-09-28 | **−3.24 %** | +3.19 % |
 
-The Balanced arm reproduced to within 0.3 % two days apart. The **2026-09-27 session simply ran ~3 % fast**, and the sequential comparison charged that session effect to the power mode. It decomposes almost exactly: **4.28 % observed ≈ 0.6 % real + 3.2 % drift.** The drift's cause is unidentified — busy SM clock (2670 MHz), GPU power p90 (≈68 W), peak temperature (62–63 °C) and host CPU were indistinguishable between arms and between sessions.
+The Balanced arm reproduced to within 0.3 % two days apart. The **2026-09-27 session simply ran ~3 % fast**, and the sequential comparison charged that session effect to the power mode. It decomposes almost exactly: **4.28 % observed ≈ 0.6 % real + 3.2 % session offset.**
+
+**How much this does and does not establish.** These are the only two like-for-like inter-session deltas we hold, and they disagree by a factor of ten (+0.32 % against −3.24 %). So a ~3 % excursion is an **observed possibility, not a measured typical magnitude**: n=2 supports an existence proof and no distribution, and a week of dedicated re-measurement would yield only ~6 deltas — a standard deviation with roughly a ±30 % confidence interval, still not a quotable number. It is therefore measured going forward instead, by an **anchor run**: one unchanged reference config at the start of every session, which accumulates deltas contemporaneously with the data they qualify and flags an odd session *before* its results are trusted.
+
+**Within a session, by contrast, the harness is very stable** — and this is what the blocking rule actually rests on. The A/B ran ~1 h as 10 time-ordered blocks: the first five blocks and the last five differed by **−0.11 %** in req/s, with a **0.49 % block-to-block cv**. So the Sep 27 anomaly was a *step* fixed for the whole session, not a drift accumulating with runtime, which is exactly why pairing arms inside a session removes it.
+
+The offset's cause is unidentified — busy SM clock (2670 MHz), GPU power p90 (≈68 W), peak temperature (62–63 °C) and host CPU were indistinguishable between arms and between sessions. Behaving as session-fixed rather than runtime-accumulating points at state constant across a session: driver or kernel state since boot, a background process, or thermal starting conditions.
 
 **Why the coherence argument failed, precisely.** A session-level drift moves every metric together *because they all derive from the same requests*. So coherence across metrics separates "something systematic" from "random noise", but it cannot separate "the treatment" from "the day". The correlation among metrics was noted at the time and then the opposite conclusion was drawn from it.
 
-**The consequence is much larger than the power mode.** Session drift of ~3 % is **3–5× the within-session cv of 0.6–1.7 %**, so §10's materiality ladder is only valid for comparisons whose arms sit in one session. P2 is ~480 runs across 4–5 nights, comparing engines: had vLLM and SGLang been split across nights, a 3 % session effect could have been read as an engine difference, and 3 % is comparable to real engine differences. Spec §3.4 therefore now requires any axis carrying a headline comparison — the engine axis above all — to be scheduled as a randomised block design, with results reported as within-block differences.
+**The consequence is much larger than the power mode.** An excursion of the size observed here dwarfs the 0.49 % within-session block-to-block cv, so §10's materiality ladder is only valid for comparisons whose arms sit in one session. P2 is ~480 runs across 4–5 nights, comparing engines: had vLLM and SGLang been split across nights, a 3 % session effect could have been read as an engine difference, and 3 % is comparable to real engine differences. Spec §3.4 therefore now requires any axis carrying a headline comparison — the engine axis above all — to be scheduled as a randomised block design, with results reported as within-block differences.
 
 A free shuffle is not sufficient for this, which is worth stating because it is the obvious thing to reach for: over these 10+10 runs it produced a 5-run single-arm streak and left one arm's mean position 1.6 of 20 slots ahead of the other's. Blocking caps the streak at 2 and equalises mean position by construction.
 
