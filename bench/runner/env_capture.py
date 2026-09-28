@@ -20,20 +20,12 @@ from bench.capture.cli import git_sha
 
 from .engine import EngineSpec
 from .gpu_monitor import WIN_SMI, WSL_SMI
-from .power_overlay import read as read_power_overlay
+from .power_overlay import label as power_overlay_label, read as read_power_overlay
 
 _CLOCK_PIN_NOTE_DEFAULT = "not attempted (requires Administrator; deferred to the user)"
 _POWERCFG = "/mnt/c/Windows/System32/powercfg.exe"
 _REG = "/mnt/c/Windows/System32/reg.exe"
 _POWER_SCHEMES_KEY = r"HKLM\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes"
-
-# The three overlay GUIDs Windows 11's power-mode slider writes. An absent or
-# all-zero value means no overlay, i.e. the scheme's own settings apply.
-_POWER_OVERLAYS = {
-    "961cc777-2547-4f9d-8174-7d86181b8a7a": "Best power efficiency",
-    "ded574b5-45a0-4f42-8737-46345c09c238": "Best performance",
-    "00000000-0000-0000-0000-000000000000": "none (scheme default)",
-}
 
 # pip_freeze shells into the image once and is identical for every run that
 # shares an image within a sweep -- cache it here rather than re-running it.
@@ -60,8 +52,10 @@ def _power_overlay(value_name: str) -> str | None:
     for line in raw.replace("\r", "").splitlines():
         parts = line.split()
         if len(parts) >= 3 and parts[0] == value_name:
-            guid = parts[-1].strip("{}").lower()
-            return f"{guid} ({_POWER_OVERLAYS.get(guid, 'unrecognised')})"
+            # Labelled through power_overlay.label so the registry and API
+            # fields in one env.json never name the same GUID two ways (the
+            # smoke caught this: "none (scheme default)" beside "(balanced)").
+            return power_overlay_label(parts[-1])
     return None
 
 

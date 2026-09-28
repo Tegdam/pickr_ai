@@ -30,6 +30,14 @@ warmup_requests: 8
 cooldown_temp_c: 50
 cooldown_min_s: 90
 try_clock_pin: false
+# Set explicitly rather than inherited from whatever state the machine happens
+# to be in. P0b measured the variance floor under both power modes and P1 onward
+# runs under "Best performance" (writeup §11); leaving this unset would make that
+# a hope about machine state rather than a property of the run, and the runner
+# restores the pre-sweep mode afterwards, so a previous sweep cannot hand the
+# next one the wrong mode either. A sweep that varies power mode overrides this
+# with an axis of the same name.
+power_overlay: performance
 gpu_headroom_mb: 256
 seed: 0
 extra_body: {}

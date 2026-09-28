@@ -40,7 +40,7 @@ from .env_capture import capture_env
 from .gpu_monitor import GpuSampler, WIN_SMI, WSL_SMI, read_gpu
 from .metrics_scraper import MetricsScraper
 from .paths import REPO_ROOT as _REPO_ROOT
-from .power_overlay import apply as apply_power_overlay
+from .power_overlay import NAMES_BY_GUID, apply as apply_power_overlay, read as read_power_overlay
 from .readiness import reset_cache, wait_healthy, warmup
 from .schema import CLIENT_OUTPUT_SCHEMA_VERSION
 from .state import SweepState
@@ -537,19 +537,6 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
         spec.max_mem_fraction,
     )
 
-    # Power mode, before anything launches. A run under the wrong overlay is a
-    # silently mislabelled measurement, not a slow one -- so a failure to set
-    # it, or a set that does not take effect, is a PreflightError rather than
-    # something to note and carry on with. `None` leaves the machine as-is,
-    # which is what every sweep before 2026-09-27 did.
-    power_overlay_effective = None
-    if cfg.power_overlay is not None:
-        try:
-            power_overlay_effective = apply_power_overlay(cfg.power_overlay)
-        except Exception as e:
-            _preflight_fail(f"could not set power overlay to {cfg.power_overlay!r}: {e}", e)
-        log(f"pre-flight: power overlay -> {power_overlay_effective}")
-
     clocks_pinned = False
     if try_clock_pin:
         # Ruling P8 pins try_clock_pin False for every current sweep; when a
@@ -569,6 +556,22 @@ def run_one(cfg: RunConfig, paths: RunPaths, *, docker, http, spec: EngineSpec,
         validate(cfg)
     except ValueError as e:
         _preflight_fail(f"validate failed: {e}", e)
+
+    # Power mode, after validate (so a config that was never going to run cannot
+    # change the machine's state) but before anything launches, so the whole run
+    # happens under the mode it claims. A run under the wrong overlay is a
+    # silently mislabelled measurement, not a slow one, so a failure to set it --
+    # or a set that does not take effect -- is a PreflightError rather than
+    # something to note and carry on with. `None` leaves the machine as-is,
+    # which is what every sweep before 2026-09-27 did. run_sweep restores the
+    # pre-sweep mode afterwards.
+    power_overlay_effective = None
+    if cfg.power_overlay is not None:
+        try:
+            power_overlay_effective = apply_power_overlay(cfg.power_overlay)
+        except Exception as e:
+            _preflight_fail(f"could not set power overlay to {cfg.power_overlay!r}: {e}", e)
+        log(f"pre-flight: power overlay -> {power_overlay_effective}")
 
     # Minor: written now (in addition to _record_run's later write, which
     # carries the resolved fraction too and wins) so a run that fails before
@@ -782,7 +785,11 @@ def _load_sweep_state(sweep_path, results_root: Path, *, resume: bool) -> tuple[
     frozen["traces_dir"] = str(Path(opts["traces_dir"]).expanduser().resolve())
     (sweep_dir / "sweep.yaml").write_text(yaml.safe_dump(frozen, sort_keys=False), encoding="utf-8")
     (sweep_dir / "schedule.json").write_text(
-        json.dumps({"order": original_order, "seed": opts["schedule_seed"]}, indent=2), encoding="utf-8")
+        # block_axis belongs here too: with it set, the order is a randomised
+        # block design rather than a free shuffle, so seed alone does not
+        # reproduce this order.
+        json.dumps({"order": original_order, "seed": opts["schedule_seed"],
+                    "block_axis": opts.get("block_axis")}, indent=2), encoding="utf-8")
     return sweep_dict, sweep_id, sweep_dir, state, original_order
 
 
@@ -832,8 +839,47 @@ def run_sweep(sweep_path, results_root, *, resume: bool = False,
     # seeded permutation never changes even after it is requeued to the end
     # of the live queue (state.order mutates on requeue; this does not).
     schedule_index_by_id = {rid: i for i, rid in enumerate(original_order)}
-    consecutive_first_attempt_failures = 0
 
+    # If any run in this sweep sets the power mode, the machine must be handed
+    # back the way it was found. Without this, a sweep whose schedule happens to
+    # end on the `balanced` arm silently leaves the machine in Balanced -- and a
+    # later sweep that does not set power_overlay would then run in Balanced
+    # while its writeup assumed Best performance. Captured before the first run
+    # and restored in the finally below, so an exception or Ctrl-C cannot leave
+    # the setting changed either.
+    changes_power = any(c.power_overlay is not None for c in configs_by_id.values())
+    power_overlay_at_start = read_power_overlay()["effective"] if changes_power else None
+
+    try:
+        return _run_sweep_loop(
+            state=state, configs_by_id=configs_by_id, results_root=results_root,
+            sweep_dir=sweep_dir, sweep_id=sweep_id, traces_dir=traces_dir,
+            hf_cache_dir=hf_cache_dir, compile_cache_root=compile_cache_root,
+            opts=opts, schedule_index_by_id=schedule_index_by_id, summaries=summaries,
+            docker=docker, http_factory=http_factory, spec_for=spec_for,
+            gpu_reader=gpu_reader, clock=clock, sleep=sleep, port_free=port_free,
+        )
+    finally:
+        if power_overlay_at_start:
+            guid = power_overlay_at_start.split()[0]
+            name = NAMES_BY_GUID.get(guid)
+            if name is None:
+                print(f"NOTE: power mode was {power_overlay_at_start} before this sweep and is "
+                      f"not one this runner can set -- restore it by hand if it matters")
+            else:
+                try:
+                    print(f"restoring power mode to {apply_power_overlay(name)}")
+                except Exception as e:  # noqa: BLE001 - never mask the sweep's own outcome
+                    print(f"WARNING: could not restore power mode to {name!r}: {e} -- "
+                          f"set it by hand before the next sweep")
+
+
+def _run_sweep_loop(*, state, configs_by_id, results_root, sweep_dir, sweep_id, traces_dir,
+                    hf_cache_dir, compile_cache_root, opts, schedule_index_by_id, summaries,
+                    docker, http_factory, spec_for, gpu_reader, clock, sleep, port_free):
+    """The sweep's run loop, split out so `run_sweep` can wrap it in the
+    power-mode restore above without indenting the whole body."""
+    consecutive_first_attempt_failures = 0
     while state.pending():
         run_id = state.pending()[0]
         cfg = configs_by_id[run_id]

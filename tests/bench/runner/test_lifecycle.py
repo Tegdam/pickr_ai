@@ -1090,3 +1090,128 @@ def test_run_one_leaves_the_power_mode_alone_when_unset(tmp_path, monkeypatch, c
     run_one(cfg, paths, docker=fake_docker, http=fake_http, spec=ENGINES["vllm"],
             gpu_reader=_make_gpu_reader(fake_docker), clock=_make_clock(), sleep=_no_sleep,
             port_free=_free_port)
+
+
+def _ok_http_factory():
+    """FakeHTTP that satisfies the prefix-cache reset, so runs actually pass."""
+    def factory():
+        h = FakeHTTP()
+        h.reset_responses = [{"status": 200, "json": {"success": True}}]
+        return h
+    return factory
+
+
+def _write_power_sweep_files(tmp_path, sweep_id="pw1"):
+    """A 2-run sweep whose only axis is the power overlay, blocked."""
+    traces_dir = tmp_path / "traces"
+    traces_dir.mkdir()
+    sha = _write_trace(traces_dir / "chat_v1.jsonl", n=4)
+    (traces_dir / "chat_v1.meta.json").write_text(json.dumps({"trace_sha256": sha}), encoding="utf-8")
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(yaml.safe_dump(_base_sweep_dict(traces_dir)), encoding="utf-8")
+    sweep_path = tmp_path / "sweep.yaml"
+    sweep_path.write_text(yaml.safe_dump({
+        "base": str(base_path), "sweep_id": sweep_id, "rq_tag": "x", "schedule_seed": 3,
+        "max_retries_total": 0, "reps": 1, "block_axis": "power_overlay",
+        "axes": {"engine": ["vllm"], "workload": ["A"], "concurrency": [1],
+                 "power_overlay": ["balanced", "performance"]},
+    }), encoding="utf-8")
+    return sweep_path
+
+
+def test_run_sweep_restores_the_power_mode_it_found(tmp_path, monkeypatch, client_json):
+    """The blocked schedule can end on either arm, so without a restore a sweep
+    silently leaves the machine in whatever its last run used -- and a later
+    sweep that sets no overlay would inherit it while assuming otherwise."""
+    monkeypatch.setattr(env_capture, "_host_lines", lambda: {})
+    sweep_path = _write_power_sweep_files(tmp_path)
+    fake_docker = FakeDocker()
+    fake_docker.keep_running = True
+    monkeypatch.setattr(lifecycle, "run_client",
+                        lambda docker, cfg, spec, run_dir, traces_dir, hf_cache_dir, **kw: client_json)
+
+    applied = []
+    PERF = "ded574b5-45a0-4f42-8737-46345c09c238"
+    monkeypatch.setattr(lifecycle, "read_power_overlay",
+                        lambda: {"effective": f"{PERF} (performance)", "actual": None})
+    monkeypatch.setattr(lifecycle, "apply_power_overlay",
+                        lambda name: applied.append(name) or f"guid ({name})")
+
+    report = lifecycle.run_sweep(sweep_path, tmp_path / "results",
+                                 **_sweep_kwargs(fake_docker, _ok_http_factory(), tmp_path))
+
+    # Two runs set their own arm; the final call restores what was found first.
+    assert sorted(applied[:2]) == ["balanced", "performance"], applied
+    assert applied[-1] == "performance", applied
+    assert len(applied) == 3, applied
+    # Guard against passing for the wrong reason: the restore also fires when
+    # every run fails, so assert the runs really did complete.
+    assert all(r["status"] == "done" for r in report.state.runs.values()), report.state.runs
+
+
+def test_run_sweep_restores_the_power_mode_even_when_it_raises(tmp_path, monkeypatch, client_json):
+    """A crash or Ctrl-C must not leave the machine in the wrong power mode."""
+    monkeypatch.setattr(env_capture, "_host_lines", lambda: {})
+    sweep_path = _write_power_sweep_files(tmp_path)
+    fake_docker = FakeDocker()
+    fake_docker.keep_running = True
+
+    applied = []
+    PERF = "ded574b5-45a0-4f42-8737-46345c09c238"
+    monkeypatch.setattr(lifecycle, "read_power_overlay",
+                        lambda: {"effective": f"{PERF} (performance)", "actual": None})
+    monkeypatch.setattr(lifecycle, "apply_power_overlay",
+                        lambda name: applied.append(name) or f"guid ({name})")
+
+    def boom(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(lifecycle, "run_client", boom)
+
+    with pytest.raises(KeyboardInterrupt):
+        lifecycle.run_sweep(sweep_path, tmp_path / "results",
+                            **_sweep_kwargs(fake_docker, _ok_http_factory(), tmp_path))
+
+    assert applied[-1] == "performance", applied
+
+
+def test_run_sweep_never_touches_the_power_mode_when_no_run_sets_it(tmp_path, monkeypatch, client_json):
+    """Every sweep before 2026-09-27 sets no overlay; none of them may acquire a
+    dependency on the Windows power API as a side effect of this feature."""
+    monkeypatch.setattr(env_capture, "_host_lines", lambda: {})
+    sweep_path = _write_sweep_files(tmp_path)
+    fake_docker = FakeDocker()
+    fake_docker.keep_running = True
+    monkeypatch.setattr(lifecycle, "run_client",
+                        lambda docker, cfg, spec, run_dir, traces_dir, hf_cache_dir, **kw: client_json)
+
+    def refuse(*a, **k):
+        raise AssertionError("power API touched by a sweep that sets no overlay")
+
+    monkeypatch.setattr(lifecycle, "read_power_overlay", refuse)
+    monkeypatch.setattr(lifecycle, "apply_power_overlay", refuse)
+
+    report = lifecycle.run_sweep(sweep_path, tmp_path / "results",
+                                 **_sweep_kwargs(fake_docker, _ok_http_factory(), tmp_path))
+    assert all(r["status"] == "done" for r in report.state.runs.values())
+
+
+def test_schedule_json_records_the_block_axis(tmp_path, monkeypatch, client_json):
+    """With a block_axis the order is a randomised block design, so the seed
+    alone does not reproduce it -- the artifact must say which axis was blocked."""
+    monkeypatch.setattr(env_capture, "_host_lines", lambda: {})
+    sweep_path = _write_power_sweep_files(tmp_path, sweep_id="pw2")
+    fake_docker = FakeDocker()
+    fake_docker.keep_running = True
+    monkeypatch.setattr(lifecycle, "run_client",
+                        lambda docker, cfg, spec, run_dir, traces_dir, hf_cache_dir, **kw: client_json)
+    monkeypatch.setattr(lifecycle, "read_power_overlay",
+                        lambda: {"effective": None, "actual": None})
+    monkeypatch.setattr(lifecycle, "apply_power_overlay", lambda name: f"guid ({name})")
+
+    lifecycle.run_sweep(sweep_path, tmp_path / "results",
+                        **_sweep_kwargs(fake_docker, _ok_http_factory(), tmp_path))
+
+    sched = json.loads((tmp_path / "results" / "pw2" / "schedule.json").read_text())
+    assert sched["block_axis"] == "power_overlay"
+    assert sched["seed"] == 3

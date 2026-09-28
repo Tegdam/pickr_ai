@@ -141,7 +141,9 @@ def test_host_lines_driver_survives_unparseable_power_value(monkeypatch):
 def test_power_overlay_parses_real_reg_output(monkeypatch):
     """Windows 11's power-mode slider writes an overlay GUID, not a scheme, so
     `powercfg /getactivescheme` reports Balanced under both Balanced and Best
-    performance. Verbatim `reg.exe query` output, CRLF included."""
+    performance. Verbatim `reg.exe query` output, CRLF included. Labels come from
+    power_overlay.label, so the registry and API fields in one env.json cannot
+    name the same GUID two different ways."""
     import bench.runner.env_capture as ec
 
     real = (
@@ -155,15 +157,15 @@ def test_power_overlay_parses_real_reg_output(monkeypatch):
 
     monkeypatch.setattr(ec.subprocess, "check_output", fake_check_output)
     got = ec._power_overlay("ActiveOverlayAcPowerScheme")
-    assert got == "ded574b5-45a0-4f42-8737-46345c09c238 (Best performance)"
+    assert got == "ded574b5-45a0-4f42-8737-46345c09c238 (performance)"
 
 
 def test_power_overlay_names_the_efficiency_and_default_guids(monkeypatch):
     import bench.runner.env_capture as ec
 
     for guid, label in (
-        ("961cc777-2547-4f9d-8174-7d86181b8a7a", "Best power efficiency"),
-        ("00000000-0000-0000-0000-000000000000", "none (scheme default)"),
+        ("961cc777-2547-4f9d-8174-7d86181b8a7a", "efficiency"),
+        ("00000000-0000-0000-0000-000000000000", "balanced"),
         ("11111111-2222-3333-4444-555555555555", "unrecognised"),
     ):
         def fake_check_output(cmd, text=True, timeout=10, stderr=None, _g=guid):
@@ -199,5 +201,8 @@ def test_host_lines_records_both_overlays(monkeypatch):
 
     monkeypatch.setattr(ec.subprocess, "check_output", fake_check_output)
     lines = ec._host_lines()
-    assert lines["windows_power_overlay_ac"].endswith("(Best performance)")
-    assert lines["windows_power_overlay_dc"].endswith("(Best power efficiency)")
+    assert lines["windows_power_overlay_ac"].endswith("(performance)")
+    assert lines["windows_power_overlay_dc"].endswith("(efficiency)")
+    # The API pair degrades to None here: the conftest fixture makes any
+    # unpatched powershell.exe call fail, which is the non-Windows path.
+    assert lines["windows_power_overlay_effective"] is None
