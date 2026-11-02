@@ -4,8 +4,9 @@ Online shopping tools tend to force a choice between generic, non-interactive pr
 
 ## Demo
 
-<!-- TODO: demo recording goes here (docs/demo.gif) -->
-*Demo recording coming soon.*
+![Pickr answering a recommendation, a comparison, a follow-up price question, a review summary, a store-policy lookup and a stock check](docs/demo.gif)
+
+*Recorded locally at 2× speed.*
 
 ## Architecture
 
