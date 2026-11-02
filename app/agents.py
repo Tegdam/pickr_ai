@@ -7,7 +7,7 @@ import logging  # Structured logging of CoordinatorAgent's routing decisions.
 import re  # Used to pull price constraints (e.g. "under $800") out of free-text queries.
 import time  # Used to time how long each routed agent takes to handle a query.
 
-from .openai_client import client
+from .openai_client import CHAT_MODEL, client
 from .guardrails import check_input, check_output
 
 # Import functions to load product details, customer reviews, and store policies from CSV files.
@@ -15,6 +15,10 @@ from .db import load_products, load_reviews, load_store_policies
 
 # Import the UserQuery model, which defines the structure of a user query.
 from .models import UserQuery
+
+# The frontend shows responses as plain text, so Markdown would appear as raw
+# "###" and "**". gpt-4o-mini formats answers as Markdown unless told not to.
+PLAIN_TEXT = " Reply in plain text without Markdown: no #, * or ** formatting; use simple dashes for lists."
 
 
 logger = logging.getLogger(__name__)
@@ -261,7 +265,7 @@ class CoordinatorAgent:
         """
         try:
             response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model=CHAT_MODEL,
                 response_format={"type": "json_object"},
                 temperature=0,
                 messages=[
@@ -314,16 +318,18 @@ class ReviewSummarizationAgent:
         ])
 
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=CHAT_MODEL,
             messages=[
-                {"role": "system", "content": "You are a helpful shopping assistant. Summarize customer reviews concisely, highlighting common praise and complaints."},
+                {"role": "system", "content": "You are a helpful shopping assistant. Summarize customer reviews concisely, highlighting common praise and complaints." + PLAIN_TEXT},
                 {"role": "user", "content": f"Summarize these reviews for {matched_product.name}:\n{reviews_text}"},
             ],
         )
 
         # Return the summary, unless the faithfulness/moderation guardrail flags it.
         response_text = response.choices[0].message.content
-        return _guarded_response(response_text, reviews_text)
+        # The product name goes into the checked context too: without it the
+        # faithfulness check treats the name in the summary as an invented fact.
+        return _guarded_response(response_text, f"Customer reviews for {matched_product.name}:\n{reviews_text}")
 
 
 # Implement the Product Recommendation Agent
@@ -364,10 +370,10 @@ class ProductRecommendationAgent:
             if has_constraints else
             "You are a helpful shopping assistant. The customer is browsing without a specific request, "
             "so give a brief, helpful overview of the shortlist below without inventing criteria they didn't mention."
-        )
+        ) + PLAIN_TEXT
 
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Customer request: {query.query}\n\nShortlist of matching products:\n{product_details}"},
@@ -493,9 +499,9 @@ class ProductComparisonAgent:
 
         # Ask OpenAI to produce a clear, structured comparison
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=CHAT_MODEL,
             messages=[
-                {"role": "system", "content": "You are a helpful shopping assistant. Compare products clearly and concisely."},
+                {"role": "system", "content": "You are a helpful shopping assistant. Compare products clearly and concisely." + PLAIN_TEXT},
                 {"role": "user", "content": f"Compare these products:\n{product_details}"},
             ],
         )
@@ -714,10 +720,10 @@ class FAQAgent:
         # that policy" refusal even when the right chunk was in context (e.g. hedging on
         # "over $1000" vs. a policy's literal "over $999" threshold).
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=CHAT_MODEL,
             temperature=0,
             messages=[
-                {"role": "system", "content": "You are a helpful shopping assistant. Answer the customer's question using only the store policies provided below. If none of the policies address the question, say so honestly rather than guessing."},
+                {"role": "system", "content": "You are a helpful shopping assistant. Answer the customer's question using only the store policies provided below. If none of the policies address the question, say so honestly rather than guessing." + PLAIN_TEXT},
                 {"role": "user", "content": f"Store policies:\n{policy_text}\n\nCustomer question: {query.query}"},
             ],
         )

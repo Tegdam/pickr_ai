@@ -99,7 +99,7 @@ LANGSMITH_PROJECT=<value>
 ## Stack
 
 - **API:** FastAPI + Uvicorn
-- **LLM:** OpenAI (`gpt-3.5-turbo`, `text-embedding-3-small`), traced via LangSmith
+- **LLM:** OpenAI (`gpt-4o-mini`, overridable via `OPENAI_CHAT_MODEL`; `text-embedding-3-small`), traced via LangSmith
 - **Data:** pandas-cleaned CSV catalog (products/reviews/policies), cached in-process
 - **RAG:** ChromaDB, for store-policy retrieval (`FAQAgent`)
 - **Chat history:** SQLAlchemy + PyMySQL against AWS RDS

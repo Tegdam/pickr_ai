@@ -22,3 +22,8 @@ from langsmith.wrappers import wrap_openai
 # the ceiling from the SDK's default of 2 to 3, since every agent's LLM call
 # is on the synchronous request path with no caller-side retry of its own.
 client = wrap_openai(OpenAI(api_key=os.getenv("OPENAI_API_KEY") or "not-set", max_retries=3))
+
+# One place for the chat model name, so a model retirement on OpenAI's side is a
+# one-line change (gpt-3.5-turbo was retired, which broke every agent's LLM call).
+# OPENAI_CHAT_MODEL overrides it without a code change.
+CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")

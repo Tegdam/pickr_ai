@@ -17,7 +17,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 from .agents import CoordinatorAgent
 from .models import UserQuery
-from .openai_client import client
+from .openai_client import CHAT_MODEL, client
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +224,7 @@ def condense_query(history: list, raw_query: str) -> str:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=CHAT_MODEL,
             temperature=0,
             messages=[
                 {"role": "system", "content": CONDENSE_SYSTEM_PROMPT},
