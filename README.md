@@ -1,16 +1,11 @@
----
-title: Pickr Ai
-emoji: 👁
-colorFrom: indigo
-colorTo: purple
-sdk: docker
-pinned: false
-license: mit
----
-
 # Pickr AI
 
 Online shopping tools tend to force a choice between generic, non-interactive product listings and a single chatbot trying to handle recommendations, comparisons, reviews, and policy questions all at once — with no specialization and no safeguards against making things up. Pickr AI's objective is to show that task-specialized AI agents, each grounded in the real catalog rather than a model's memory, can do meaningfully better. An AI shopping assistant that answers product, review, and store-policy questions — a coordinator routes each query to a specialized agent, rather than one do-everything prompt.
+
+## Demo
+
+<!-- TODO: demo recording goes here (docs/demo.gif) -->
+*Demo recording coming soon.*
 
 ## Architecture
 
@@ -130,8 +125,16 @@ tests/                pytest suite
 evals/                ragas evals against live OpenAI
 ```
 
-## Deployment
+## Run with Docker
 
-Deployed on [Hugging Face Spaces](https://huggingface.co/spaces) via the Docker SDK (port 7860) — see `Dockerfile`. Secrets (`OPENAI_API_KEY` and, optionally, the `DB_*`/`LANGSMITH_*` variables above) are set as Space secrets rather than baked into the image; `.dockerignore` keeps `.env` and the local virtual environment out of the build entirely.
+```bash
+docker build -t pickr-ai .
+docker run --env-file .env -p 7860:7860 pickr-ai
+```
 
-**Try it live:** https://huggingface.co/spaces/TegFace/pickr-ai
+Then open **http://localhost:7860**. Secrets come from `.env` at run time rather than being baked into the image; `.dockerignore` keeps `.env` and the local virtual environment out of the build entirely.
+
+## Inference benchmark
+
+<!-- TODO: link the published write-up -->
+*Coming soon:* a write-up of a pre-registered benchmark of serving Pickr's model on a 6 GB laptop GPU, comparing vLLM and SGLang on Pickr's own traffic: throughput, speculative decoding, constrained JSON decoding, prefix caching and co-tenancy.
