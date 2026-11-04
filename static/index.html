@@ -631,9 +631,14 @@
 
   newSessionButton.addEventListener("click", startNewSession);
 
+  // Completes the answer still being typed, if any. Without this, asking a new
+  // question mid-animation cleared the shared timer and left the previous
+  // answer cut off for good.
+  let finishTyping = null;
+
   function typeOut(responseBody, text, onDone) {
     responseBody.classList.remove("printing");
-    clearInterval(typewriterTimer);
+    if (finishTyping) finishTyping();
 
     if (reducedMotion) {
       responseBody.textContent = text;
@@ -643,11 +648,17 @@
 
     responseBody.textContent = "";
     let i = 0;
+    finishTyping = () => {
+      clearInterval(typewriterTimer);
+      responseBody.textContent = text;
+      finishTyping = null;
+    };
     typewriterTimer = setInterval(() => {
       responseBody.textContent += text[i];
       i += 1;
       if (i >= text.length) {
         clearInterval(typewriterTimer);
+        finishTyping = null;
         if (onDone) onDone();
       }
     }, 12);
